@@ -1,0 +1,165 @@
+from rest_framework import permissions, status, viewsets
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from .models import BankConnection, BankAccount, BankTransaction, FinancialAnalysisReport
+from .serializers import (
+    BankConnectionSerializer,
+    BankAccountSerializer,
+    BankTransactionSerializer,
+    FinancialAnalysisReportSerializer,
+    CustomerPortalBankingStatusSerializer,
+)
+from .tasks import fetch_flinks_accounts_only
+
+
+class StaffOnlyPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return bool(
+            request.user
+            and request.user.is_authenticated
+            and getattr(request.user, 'user_type', None) == 'staff'
+        )
+
+
+class CustomerPortalPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return bool(
+            request.user
+            and request.user.is_authenticated
+            and getattr(request.user, 'user_type', None) == 'customer'
+        )
+
+
+class CustomerPortalBaseView(APIView):
+    permission_classes = [CustomerPortalPermission]
+
+    def get_customer(self, request):
+        return request.user.customer_profile
+
+
+class ConnectBankView(CustomerPortalBaseView):
+    def post(self, request):
+        login_id = request.data.get('login_id')
+
+        if not login_id:
+            return Response({"error": "Login ID is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        customer = self.get_customer(request)
+
+        connection, created = BankConnection.objects.get_or_create(
+            customer=customer,
+            defaults={
+                'login_id': login_id,
+                'provider': 'flinks',
+                'is_active': True,
+                'sync_status': 'pending',
+            }
+        )
+
+        if not created:
+            connection.login_id = login_id
+            connection.is_active = True
+            connection.sync_status = 'pending'
+            connection.sync_error = None
+            connection.save(update_fields=['login_id', 'is_active', 'sync_status', 'sync_error', 'updated_at'])
+
+        fetch_flinks_accounts_only.delay(login_id)
+
+        return Response({
+            "message": "Bank connected successfully. Syncing data...",
+            "status": "SYNCING"
+        }, status=status.HTTP_200_OK)
+
+
+class CustomerPortalBankingStatusView(CustomerPortalBaseView):
+    def get(self, request):
+        customer = self.get_customer(request)
+        connection = customer.bank_connections.order_by('-created_at').first()
+
+        payload = {
+            'banking_verified': customer.banking_verified,
+            'onboarding_stage': customer.onboarding_stage,
+            'has_connection': connection is not None,
+            'connection_status': connection.sync_status if connection else None,
+            'last_synced_at': connection.last_synced_at if connection else None,
+            'account_count': customer.bank_accounts.count(),
+        }
+
+        serializer = CustomerPortalBankingStatusSerializer(payload)
+        return Response(serializer.data)
+
+
+class CustomerPortalBankAccountsView(CustomerPortalBaseView):
+    def get(self, request):
+        customer = self.get_customer(request)
+        accounts = customer.bank_accounts.prefetch_related('transactions').order_by('-is_primary', 'name')
+        serializer = BankAccountSerializer(accounts, many=True)
+        return Response(serializer.data)
+
+
+class BankConnectionViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = BankConnectionSerializer
+    permission_classes = [permissions.IsAuthenticated, StaffOnlyPermission]
+
+    def get_queryset(self):
+        queryset = BankConnection.objects.select_related('customer')
+
+        customer_id = self.request.query_params.get('customer_id')
+        if customer_id:
+            queryset = queryset.filter(customer_id=customer_id)
+
+        return queryset.order_by('-created_at')
+
+
+class BankAccountViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = BankAccountSerializer
+    permission_classes = [permissions.IsAuthenticated, StaffOnlyPermission]
+
+    def get_queryset(self):
+        queryset = BankAccount.objects.select_related('customer', 'connection')
+
+        customer_id = self.request.query_params.get('customer_id')
+        if customer_id:
+            queryset = queryset.filter(customer_id=customer_id)
+
+        return queryset.order_by('-is_primary', 'name')
+
+
+class BankTransactionViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = BankTransactionSerializer
+    permission_classes = [permissions.IsAuthenticated, StaffOnlyPermission]
+
+    def get_queryset(self):
+        queryset = BankTransaction.objects.select_related('customer', 'account')
+
+        customer_id = self.request.query_params.get('customer_id')
+        if customer_id:
+            queryset = queryset.filter(customer_id=customer_id)
+
+        account_id = self.request.query_params.get('account_id')
+        if account_id:
+            queryset = queryset.filter(account_id=account_id)
+
+        return queryset.order_by('-date', '-created_at')
+
+
+class FinancialAnalysisReportViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = FinancialAnalysisReportSerializer
+    permission_classes = [permissions.IsAuthenticated, StaffOnlyPermission]
+
+    def get_queryset(self):
+        queryset = FinancialAnalysisReport.objects.select_related('customer')
+
+        customer_id = self.request.query_params.get('customer_id')
+        if customer_id:
+            queryset = queryset.filter(customer_id=customer_id)
+
+        return queryset.order_by('-generated_at')
+
+
+class FlinksWebhookView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        return Response({"message": "Webhook received"}, status=status.HTTP_200_OK)
