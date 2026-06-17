@@ -84,17 +84,20 @@ def _poll_get_accounts_detail_async(instance, customer_id, request_id, headers):
 def _extract_holder_identity(accounts_data):
     flinks_email = None
     flinks_phone = None
+    flinks_name = None
 
     for acc in accounts_data:
         holder = acc.get('Holder') or {}
+        if not flinks_name and holder.get('Name'):
+            flinks_name = holder.get('Name')
         if not flinks_email and holder.get('Email'):
             flinks_email = holder.get('Email')
         if not flinks_phone and holder.get('PhoneNumber'):
             flinks_phone = holder.get('PhoneNumber')
-        if flinks_email and flinks_phone:
+        if flinks_email and flinks_phone and flinks_name:
             break
 
-    return flinks_email, flinks_phone
+    return flinks_email, flinks_phone, flinks_name
 
 
 def _count_transactions(accounts_data):
@@ -189,7 +192,7 @@ def _persist_accounts(connection, customer, accounts_data):
             )
 
 
-def _mark_banking_success(connection, customer, flinks_email=None, flinks_phone=None):
+def _mark_banking_success(connection, customer, flinks_email=None, flinks_phone=None, flinks_name=None):
     connection.last_synced_at = now()
     connection.sync_status = 'synced'
     connection.sync_error = None
@@ -209,6 +212,9 @@ def _mark_banking_success(connection, customer, flinks_email=None, flinks_phone=
         if flinks_phone:
             portal_user.flinks_phone = flinks_phone
             update_fields.append('flinks_phone')
+        if flinks_name:
+            portal_user.flinks_name = flinks_name
+            update_fields.append('flinks_name')
         if update_fields:
             update_fields.append('updated_at')
             portal_user.save(update_fields=update_fields)
@@ -337,6 +343,6 @@ def fetch_flinks_accounts_only(self, login_id):
     if total_transactions == 0:
         return _mark_banking_failed(connection, customer, ZERO_TRANSACTIONS_MESSAGE)
 
-    flinks_email, flinks_phone = _extract_holder_identity(accounts_data)
+    flinks_email, flinks_phone, flinks_name = _extract_holder_identity(accounts_data)
     _persist_accounts(connection, customer, accounts_data)
-    return _mark_banking_success(connection, customer, flinks_email, flinks_phone)
+    return _mark_banking_success(connection, customer, flinks_email, flinks_phone, flinks_name)

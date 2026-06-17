@@ -63,6 +63,8 @@ class CustomerSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     loan_count = serializers.IntegerField(read_only=True)
     onboarding_stage_display = serializers.CharField(source='get_onboarding_stage_display', read_only=True)
+    flinks_email = serializers.SerializerMethodField()
+    flinks_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Customer
@@ -73,6 +75,8 @@ class CustomerSerializer(serializers.ModelSerializer):
             'full_name',
             'email',
             'phone',
+            'flinks_email',
+            'flinks_name',
             'date_of_birth',
             'address_line_1',
             'address_line_2',
@@ -97,10 +101,22 @@ class CustomerSerializer(serializers.ModelSerializer):
             'id',
             'full_name',
             'full_address',
+            'flinks_email',
+            'flinks_name',
             'created_at',
             'updated_at',
             'loan_count',
         ]
+
+    def get_flinks_email(self, obj):
+        if obj.portal_user:
+            return obj.portal_user.flinks_email or ''
+        return ''
+
+    def get_flinks_name(self, obj):
+        if obj.portal_user:
+            return obj.portal_user.flinks_name or ''
+        return ''
 
 
 class CustomerListSerializer(serializers.ModelSerializer):
