@@ -862,6 +862,12 @@ class CustomerPortalJobReferencesView(CustomerPortalBaseView):
         if error_response:
             return error_response
 
+        if customer.references_completed:
+            return Response(
+                {'error': 'Job and reference information cannot be changed after submission.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         serializer = CustomerJobReferencesSerializer(data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         customer = serializer.save(customer)

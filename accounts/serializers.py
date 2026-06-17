@@ -713,10 +713,7 @@ class CustomerJobReferencesSerializer(serializers.Serializer):
                 value = self.validated_data[field_name]
                 setattr(customer, field_name, value.strip() if isinstance(value, str) and value else None)
 
-        customer.references_completed = all(
-            bool(getattr(customer, field_name))
-            for field_name in field_names
-        )
+        customer.references_completed = True
         customer.save()
         return customer
 
