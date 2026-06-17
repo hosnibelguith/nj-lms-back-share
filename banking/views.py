@@ -47,22 +47,21 @@ class ConnectBankView(CustomerPortalBaseView):
 
         customer = self.get_customer(request)
 
-        connection, created = BankConnection.objects.get_or_create(
-            customer=customer,
-            defaults={
-                'login_id': login_id,
-                'provider': 'flinks',
-                'is_active': True,
-                'sync_status': 'pending',
-            }
-        )
-
-        if not created:
+        connection = BankConnection.objects.filter(customer=customer).order_by('-created_at').first()
+        if connection:
             connection.login_id = login_id
             connection.is_active = True
             connection.sync_status = 'pending'
             connection.sync_error = None
             connection.save(update_fields=['login_id', 'is_active', 'sync_status', 'sync_error', 'updated_at'])
+        else:
+            connection = BankConnection.objects.create(
+                customer=customer,
+                login_id=login_id,
+                provider='flinks',
+                is_active=True,
+                sync_status='pending',
+            )
 
         fetch_flinks_accounts_only.delay(login_id)
 
@@ -84,6 +83,7 @@ class CustomerPortalBankingStatusView(CustomerPortalBaseView):
             'connection_status': connection.sync_status if connection else None,
             'last_synced_at': connection.last_synced_at if connection else None,
             'account_count': customer.bank_accounts.count(),
+            'failure_message': connection.sync_error if connection and connection.sync_status == 'failed' else None,
         }
 
         serializer = CustomerPortalBankingStatusSerializer(payload)

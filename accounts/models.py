@@ -55,6 +55,8 @@ class User(AbstractUser):
         null=True,
         db_index=True,
     )
+    flinks_email = models.EmailField(blank=True, null=True)
+    flinks_phone = models.CharField(max_length=20, blank=True, null=True)
     permission_level = models.PositiveSmallIntegerField(choices=PERMISSION_LEVELS, default=1)
     user_type = models.CharField(max_length=20, choices=USER_TYPE_CHOICES, default='staff', db_index=True)
     is_active = models.BooleanField(default=True)
@@ -99,6 +101,7 @@ class Customer(models.Model):
     ]
     
     STATUS_CHOICES = [
+        ('pending', 'Pending'),
         ('active', 'Active'),
         ('inactive', 'Inactive'),
         ('blocked', 'Blocked'),

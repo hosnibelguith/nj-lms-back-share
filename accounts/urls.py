@@ -57,6 +57,11 @@ urlpatterns = [
         name='customer-portal-sign-contract',
     ),
     path(
+        'portal/me/job-references/',
+        views.CustomerPortalJobReferencesView.as_view(),
+        name='customer-portal-job-references',
+    ),
+    path(
         'portal/me/run-analysis/',
         views.CustomerPortalRunAnalysisView.as_view(),
         name='customer-portal-run-analysis',

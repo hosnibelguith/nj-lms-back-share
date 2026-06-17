@@ -65,3 +65,4 @@ class CustomerPortalBankingStatusSerializer(serializers.Serializer):
     connection_status = serializers.CharField(allow_null=True)
     last_synced_at = serializers.DateTimeField(allow_null=True)
     account_count = serializers.IntegerField()
+    failure_message = serializers.CharField(allow_null=True, required=False)

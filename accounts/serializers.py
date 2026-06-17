@@ -154,16 +154,6 @@ class CustomerApplySerializer(serializers.Serializer):
         decimal_places=2,
     )
 
-    job_place_name = serializers.CharField(max_length=255)
-    supervisor_name = serializers.CharField(max_length=255)
-    supervisor_phone = serializers.CharField(max_length=20)
-
-    reference_1_name = serializers.CharField(max_length=255)
-    reference_1_phone = serializers.CharField(max_length=20)
-
-    reference_2_name = serializers.CharField(max_length=255)
-    reference_2_phone = serializers.CharField(max_length=20)
-
     password = serializers.CharField(write_only=True, min_length=8)
     confirm_password = serializers.CharField(write_only=True)
 
@@ -208,18 +198,11 @@ class CustomerApplySerializer(serializers.Serializer):
             province=validated_data['province'],
             date_of_birth=validated_data['date_of_birth'],
             requested_loan_amount=validated_data['requested_loan_amount'],
-            job_place_name=validated_data['job_place_name'],
-            supervisor_name=validated_data['supervisor_name'],
-            supervisor_phone=validated_data['supervisor_phone'],
-            reference_1_name=validated_data['reference_1_name'],
-            reference_1_phone=validated_data['reference_1_phone'],
-            reference_2_name=validated_data['reference_2_name'],
-            reference_2_phone=validated_data['reference_2_phone'],
             onboarding_stage='banking_verification',
-            status='active',
+            status='pending',
             phone_verified=True,
             phone_verified_at=timezone.now(),
-            references_completed=True,
+            references_completed=False,
         )
 
         from loans.services import LoanService
@@ -238,16 +221,6 @@ class CustomerSignupStartSerializer(serializers.Serializer):
         max_digits=10,
         decimal_places=2,
     )
-
-    job_place_name = serializers.CharField(max_length=255)
-    supervisor_name = serializers.CharField(max_length=255)
-    supervisor_phone = serializers.CharField(max_length=20)
-
-    reference_1_name = serializers.CharField(max_length=255)
-    reference_1_phone = serializers.CharField(max_length=20)
-
-    reference_2_name = serializers.CharField(max_length=255)
-    reference_2_phone = serializers.CharField(max_length=20)
 
     password = serializers.CharField(write_only=True, min_length=8)
     confirm_password = serializers.CharField(write_only=True)
@@ -303,13 +276,6 @@ class CustomerSignupStartSerializer(serializers.Serializer):
             'province': self.validated_data['province'],
             'date_of_birth': self.validated_data['date_of_birth'].isoformat(),
             'requested_loan_amount': str(self.validated_data['requested_loan_amount']),
-            'job_place_name': self.validated_data['job_place_name'],
-            'supervisor_name': self.validated_data['supervisor_name'],
-            'supervisor_phone': self.validated_data['supervisor_phone'],
-            'reference_1_name': self.validated_data['reference_1_name'],
-            'reference_1_phone': self.validated_data['reference_1_phone'],
-            'reference_2_name': self.validated_data['reference_2_name'],
-            'reference_2_phone': self.validated_data['reference_2_phone'],
             'password': self.validated_data['password'],
         }
 
@@ -390,18 +356,11 @@ class CustomerSignupVerifyPhoneSerializer(serializers.Serializer):
                     province=data['province'],
                     date_of_birth=date.fromisoformat(data['date_of_birth']),
                     requested_loan_amount=Decimal(data['requested_loan_amount']),
-                    job_place_name=data['job_place_name'],
-                    supervisor_name=data['supervisor_name'],
-                    supervisor_phone=data['supervisor_phone'],
-                    reference_1_name=data['reference_1_name'],
-                    reference_1_phone=data['reference_1_phone'],
-                    reference_2_name=data['reference_2_name'],
-                    reference_2_phone=data['reference_2_phone'],
                     onboarding_stage='banking_verification',
-                    status='active',
+                    status='pending',
                     phone_verified=True,
                     phone_verified_at=timezone.now(),
-                    references_completed=True,
+                    references_completed=False,
                 )
 
                 from loans.services import LoanService
@@ -727,6 +686,39 @@ class CustomerPortalDashboardSerializer(serializers.Serializer):
     can_refinance = serializers.BooleanField()
 
     banking = serializers.DictField()
+
+
+class CustomerJobReferencesSerializer(serializers.Serializer):
+    job_place_name = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    supervisor_name = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    supervisor_phone = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    reference_1_name = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    reference_1_phone = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    reference_2_name = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    reference_2_phone = serializers.CharField(max_length=20, required=False, allow_blank=True)
+
+    def save(self, customer):
+        field_names = [
+            'job_place_name',
+            'supervisor_name',
+            'supervisor_phone',
+            'reference_1_name',
+            'reference_1_phone',
+            'reference_2_name',
+            'reference_2_phone',
+        ]
+
+        for field_name in field_names:
+            if field_name in self.validated_data:
+                value = self.validated_data[field_name]
+                setattr(customer, field_name, value.strip() if isinstance(value, str) and value else None)
+
+        customer.references_completed = all(
+            bool(getattr(customer, field_name))
+            for field_name in field_names
+        )
+        customer.save()
+        return customer
 
 
 class CustomerPortalLoanSerializer(serializers.Serializer):

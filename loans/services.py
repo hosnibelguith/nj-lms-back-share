@@ -243,7 +243,7 @@ class LoanService:
         loan.mark_contract_signed()
 
         customer.contract_completed = True
-        customer.onboarding_stage = 'contract'
+        customer.onboarding_stage = 'portal_active'
         customer.save(update_fields=['contract_completed', 'onboarding_stage', 'updated_at'])
 
         return loan

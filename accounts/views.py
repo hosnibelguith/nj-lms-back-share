@@ -18,6 +18,7 @@ from .serializers import (
     CustomerPortalLoginSerializer, CustomerPortalMeSerializer,
     CustomerPortalLoanSerializer,
     CustomerPortalDashboardSerializer,
+    CustomerJobReferencesSerializer,
     CustomerSignupStartSerializer, CustomerSignupVerifyPhoneSerializer,
     CustomerPortalRequestOTPSerializer, CustomerPortalVerifyOTPSerializer,
     CustomerPasswordResetRequestSerializer,
@@ -32,6 +33,7 @@ from contracts.serializers import (
 from loans.models import Loan
 from loans.serializers import CurrentApplicationSerializer
 from loans.services import LoanService
+from .tasks import send_welcome_email
 
 
 class StaffOnlyPermission(permissions.BasePermission):
@@ -329,6 +331,8 @@ class CustomerApplyView(APIView):
         customer = serializer.save()
         mark_user_login(customer.portal_user)
 
+        send_welcome_email.delay(str(customer.id))
+
         refresh = RefreshToken.for_user(customer.portal_user)
         access_token = str(refresh.access_token)
         refresh_token = str(refresh)
@@ -383,6 +387,8 @@ class CustomerSignupVerifyPhoneView(APIView):
         serializer.is_valid(raise_exception=True)
         customer = serializer.save()
         mark_user_login(customer.portal_user)
+
+        send_welcome_email.delay(str(customer.id))
 
         refresh = RefreshToken.for_user(customer.portal_user)
 
@@ -669,7 +675,7 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
         elif loan.status == 'pending_signature':
             portal_state = 'contract_required'
             next_step = 'contract'
-            next_url = '/customer/loans'
+            next_url = '/customer/contracts'
 
         elif loan.status == 'review_required':
             portal_state = 'manual_review'
@@ -690,7 +696,7 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
             if not customer.contract_completed:
                 portal_state = 'contract_required'
                 next_step = 'contract'
-                next_url = '/customer/loans'
+                next_url = '/customer/contracts'
             else:
                 portal_state = 'ai_analyzing'
                 next_step = 'analysis'
@@ -722,6 +728,12 @@ class CustomerPortalContractPreviewView(CustomerPortalBaseView):
 
         if error_response:
             return error_response
+
+        if not customer.banking_verified:
+            return Response(
+                {'error': 'Banking verification must be completed before accessing the contract.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         loan = customer.loans.filter(
             status__in=[
@@ -762,6 +774,12 @@ class CustomerPortalSignContractView(CustomerPortalBaseView):
 
         if error_response:
             return error_response
+
+        if not customer.banking_verified:
+            return Response(
+                {'error': 'Banking verification must be completed before signing the contract.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         serializer = CustomerSignContractSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -806,6 +824,43 @@ class CustomerPortalSignContractView(CustomerPortalBaseView):
         return Response({
             'message': 'Agreement signed successfully.',
             'contract': ContractSerializer(contract).data,
+            'show_job_references_prompt': True,
+        })
+
+
+class CustomerPortalJobReferencesView(CustomerPortalBaseView):
+    """
+    Optional job and reference details collected after contract signing.
+    """
+
+    def get(self, request):
+        customer, error_response = self.get_customer(request)
+        if error_response:
+            return error_response
+
+        return Response({
+            'job_place_name': customer.job_place_name or '',
+            'supervisor_name': customer.supervisor_name or '',
+            'supervisor_phone': customer.supervisor_phone or '',
+            'reference_1_name': customer.reference_1_name or '',
+            'reference_1_phone': customer.reference_1_phone or '',
+            'reference_2_name': customer.reference_2_name or '',
+            'reference_2_phone': customer.reference_2_phone or '',
+            'references_completed': customer.references_completed,
+        })
+
+    def patch(self, request):
+        customer, error_response = self.get_customer(request)
+        if error_response:
+            return error_response
+
+        serializer = CustomerJobReferencesSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        customer = serializer.save(customer)
+
+        return Response({
+            'message': 'Job and reference information updated.',
+            'customer': CustomerPortalMeSerializer(customer).data,
         })
 
 

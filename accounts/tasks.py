@@ -4,34 +4,44 @@ Celery tasks for accounts app.
 """
 from celery import shared_task
 from django.utils import timezone
+from django.conf import settings
 from datetime import timedelta
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-@shared_task(bind=True, max_retries=3)
-def send_welcome_email(self, customer_id: str):
+@shared_task
+def send_welcome_email(customer_id: str):
     """Send welcome email to new customer."""
     try:
+        from django.core.mail import send_mail
+
         from .models import Customer
-        from communications.tasks import send_template_message
-        
+
         customer = Customer.objects.get(id=customer_id)
-        
-        # Trigger welcome email through communications app
-        send_template_message.delay(
-            customer_id=str(customer.id),
-            template_name='welcome_email'
+        frontend_url = settings.FRONTEND_URL.rstrip('/')
+
+        send_mail(
+            subject='Welcome to LendStack',
+            message=(
+                f'Hello {customer.first_name},\n\n'
+                f'Thank you for applying with LendStack.\n\n'
+                f'Your next step is to complete banking verification:\n'
+                f'{frontend_url}/customer/banking\n\n'
+                f'Thank you,\nLendStack'
+            ),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[customer.email],
+            fail_silently=False,
         )
-        
-        logger.info(f"Welcome email task triggered for customer {customer_id}")
-        
+
+        logger.info(f"Welcome email sent to customer {customer_id}")
+
     except Customer.DoesNotExist:
         logger.error(f"Customer {customer_id} not found")
     except Exception as e:
         logger.error(f"Error sending welcome email: {e}")
-        raise self.retry(exc=e, countdown=60)
 
 
 @shared_task
