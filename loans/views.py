@@ -276,6 +276,13 @@ class LoanViewSet(viewsets.ModelViewSet):
 
         return Response(LoanSerializer(loan).data)
 
+    @action(detail=True, methods=['get'], url_path='interest-breakdown')
+    def interest_breakdown(self, request, pk=None):
+        loan = self.get_object()
+        as_of_param = request.query_params.get('as_of')
+        as_of = parse_date(as_of_param) if as_of_param else None
+        return Response(LoanService.get_interest_breakdown(loan, as_of_date=as_of))
+
     @action(detail=True, methods=['get'])
     def state_events(self, request, pk=None):
         loan = self.get_object()

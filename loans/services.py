@@ -95,6 +95,115 @@ class LoanService:
         return LoanService.money(principal_balance + total_interest)
 
     @staticmethod
+    def get_interest_breakdown(loan: Loan, as_of_date=None) -> dict:
+        """
+        Decompose a loan's already-priced fee into brokerage + day-by-day
+        interest so staff can explain early-payoff savings or late-payoff
+        additions. This reads the values already stored on the loan/formula
+        and does NOT re-price the loan.
+
+        planned interest = fee - brokerage fee
+        planned duration = number_of_payments * frequency_days
+        daily interest   = planned interest / planned duration
+        actual interest  = daily interest * days the loan actually existed
+        """
+        money = LoanService.money
+        principal = loan.principal or Decimal('0.00')
+        formula = loan.formula
+
+        if formula and principal:
+            brokerage_fee = money(
+                principal * formula.brokerage_percent / Decimal('100')
+            )
+        else:
+            brokerage_fee = Decimal('0.00')
+
+        planned_interest = (loan.fee or Decimal('0.00')) - brokerage_fee
+        if planned_interest < 0:
+            planned_interest = Decimal('0.00')
+        planned_interest = money(planned_interest)
+
+        if formula:
+            planned_days = (
+                int(formula.default_number_of_payments)
+                * int(formula.default_frequency_days)
+            )
+        else:
+            # No formula attached: derive the planned duration from the
+            # loan's own payment schedule span so the timeline still works.
+            schedule_dates = list(
+                loan.payments.order_by('scheduled_date').values_list(
+                    'scheduled_date', flat=True
+                )
+            )
+            if len(schedule_dates) >= 2:
+                planned_days = max((schedule_dates[-1] - schedule_dates[0]).days, 0)
+            else:
+                planned_days = 0
+
+        daily_interest = (
+            planned_interest / Decimal(planned_days)
+            if planned_days > 0 else Decimal('0.00')
+        )
+
+        start_date = loan.funded_at.date() if loan.funded_at else None
+        today = as_of_date or timezone.localdate()
+
+        if start_date is None:
+            # Not funded yet: only the planned timeline is meaningful.
+            charged_days = planned_days
+            as_of = None
+        else:
+            if loan.status == 'paid_off':
+                last_payment = loan.payments.filter(
+                    status='completed'
+                ).order_by('-processed_at', '-scheduled_date').first()
+                end_date = (
+                    last_payment.processed_at.date()
+                    if last_payment and last_payment.processed_at
+                    else loan.updated_at.date()
+                )
+            else:
+                end_date = today
+            charged_days = max((end_date - start_date).days, 0)
+            as_of = end_date
+
+        actual_interest = money(daily_interest * Decimal(charged_days))
+        interest_adjustment = money(actual_interest - planned_interest)
+
+        rounded_daily = money(daily_interest)
+        base_balance = money(principal + brokerage_fee)
+        timeline = []
+        for day in range(1, charged_days + 1):
+            timeline.append({
+                'day': day,
+                'type': 'interest' if day <= planned_days else 'late_interest',
+                'amount': str(rounded_daily),
+                'balance': str(money(base_balance + rounded_daily * Decimal(day))),
+                'date': (
+                    (start_date + timedelta(days=day)).isoformat()
+                    if start_date else None
+                ),
+            })
+
+        return {
+            'capital': str(money(principal)),
+            'brokerage_fee': str(brokerage_fee),
+            'planned_interest': str(planned_interest),
+            'planned_days': planned_days,
+            'daily_interest': str(rounded_daily),
+            'total_amount': str(money(loan.total_amount or Decimal('0.00'))),
+            'funded_at': loan.funded_at.isoformat() if loan.funded_at else None,
+            'as_of_date': as_of.isoformat() if as_of else None,
+            'elapsed_days': charged_days,
+            'is_funded': start_date is not None,
+            'status': loan.status,
+            'actual_interest': str(actual_interest),
+            'interest_adjustment': str(interest_adjustment),
+            'timeline': timeline,
+        }
+
+    @staticmethod
     @transaction.atomic
     def create_initial_application(customer: Customer) -> Loan:
         """
