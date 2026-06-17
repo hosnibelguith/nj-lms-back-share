@@ -746,6 +746,14 @@ class CustomerPortalContractPreviewView(CustomerPortalBaseView):
         ).order_by('-created_at').first()
 
         if not loan:
+            signed_contract = Contract.objects.filter(
+                customer=customer,
+                status='signed',
+            ).order_by('-signed_date').first()
+            if signed_contract:
+                serializer = ContractSerializer(signed_contract)
+                return Response(serializer.data)
+
             return Response(
                 {'error': 'No application available.'},
                 status=status.HTTP_404_NOT_FOUND,
