@@ -9,9 +9,25 @@ from django.utils.dateparse import parse_date
 from django.db.models import Q, Sum, Count
 from django.db.models.functions import TruncDate
 
-from .models import Loan, Payment, LoanStateEvent, FundedPayment, LoanFormula
+from banking.models import BankAccount
+
+from .models import (
+    CollectionPayment,
+    FundingMethodRecommendation,
+    Loan,
+    Payment,
+    LoanStateEvent,
+    FundedPayment,
+    LoanFormula,
+)
 from .services import LoanService
+from .zumrails import CollectionService, FundingService, SettlementService
 from .serializers import (
+    CollectionInitiateSerializer,
+    CollectionPaymentSerializer,
+    CollectionsAccountChangeAuditSerializer,
+    CollectionsAccountUpdateSerializer,
+    FundingMethodRecommendationSerializer,
     LoanFormulaSerializer,
     LoanSerializer,
     LoanListSerializer,
@@ -58,6 +74,19 @@ class LoanFormulaViewSet(viewsets.ModelViewSet):
         if loan_type:
             qs = qs.filter(loan_type=loan_type)
 
+        return qs
+
+
+class FundingMethodRecommendationViewSet(viewsets.ModelViewSet):
+    queryset = FundingMethodRecommendation.objects.all()
+    serializer_class = FundingMethodRecommendationSerializer
+    permission_classes = [StaffOnlyPermission]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        is_active = self.request.query_params.get('is_active')
+        if is_active is not None:
+            qs = qs.filter(is_active=is_active.lower() == 'true')
         return qs
 
 class LoanViewSet(viewsets.ModelViewSet):
@@ -209,16 +238,115 @@ class LoanViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
 
         try:
-            loan = LoanService.fund_loan(
+            collections_account = None
+            collections_account_id = serializer.validated_data.get('collections_account_id')
+            if collections_account_id:
+                collections_account = BankAccount.objects.get(
+                    id=collections_account_id,
+                    customer=loan.customer,
+                )
+
+            funded_payment = FundingService.initiate(
                 loan=loan,
                 method=serializer.validated_data['method'],
-                reference=serializer.validated_data.get('reference', ''),
+                schedule_confirmed=serializer.validated_data['schedule_confirmed'],
+                user=request.user,
+                destination=serializer.validated_data.get('funding_destination') or None,
+                collections_account=collections_account,
+            )
+        except BankAccount.DoesNotExist:
+            return Response({'error': 'Collections account required'}, status=400)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
+
+        loan.refresh_from_db()
+        return Response({
+            'loan': LoanSerializer(loan).data,
+            'funded_payment': FundedPaymentSerializer(funded_payment).data,
+        })
+
+    @action(detail=True, methods=['post'], url_path='funding/initiate')
+    def initiate_funding(self, request, pk=None):
+        return self.fund(request, pk=pk)
+
+    @action(detail=True, methods=['get'], url_path='funding/options')
+    def funding_options(self, request, pk=None):
+        loan = self.get_object()
+        recommended_method = FundingMethodRecommendation.for_date()
+        collections_account = loan.collections_account or loan.bank_account
+        return Response({
+            'amount': loan.principal,
+            'recommended_method': recommended_method,
+            'selected_method': loan.funding_method,
+            'funding_destination': loan.funding_destination,
+            'collections_account': collections_account.id if collections_account else None,
+            'schedule_confirmed': False,
+        })
+
+    @action(detail=True, methods=['post'], url_path='collections/initiate')
+    def initiate_collection(self, request, pk=None):
+        loan = self.get_object()
+
+        serializer = CollectionInitiateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        payment = None
+        payment_id = serializer.validated_data.get('payment_id')
+        if payment_id:
+            payment = Payment.objects.filter(id=payment_id, loan=loan).first()
+            if not payment:
+                return Response({'error': 'Payment not found for this loan'}, status=404)
+
+        try:
+            collection = CollectionService.initiate(
+                loan=loan,
+                amount=serializer.validated_data['amount'],
+                payment=payment,
                 user=request.user,
             )
         except ValueError as exc:
             return Response({'error': str(exc)}, status=400)
 
-        return Response(LoanSerializer(loan).data)
+        return Response(CollectionPaymentSerializer(collection).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['patch'], url_path='collections-account')
+    def update_collections_account(self, request, pk=None):
+        loan = self.get_object()
+        serializer = CollectionsAccountUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            account = BankAccount.objects.get(
+                id=serializer.validated_data['bank_account_id'],
+                customer=loan.customer,
+            )
+        except BankAccount.DoesNotExist:
+            return Response({'error': 'Collections account must belong to this customer.'}, status=400)
+
+        failed_payment = None
+        failed_payment_id = serializer.validated_data.get('failed_payment_id')
+        if failed_payment_id:
+            failed_payment = CollectionPayment.objects.filter(id=failed_payment_id, loan=loan).first()
+            if not failed_payment:
+                return Response({'error': 'Failed payment not found for this loan'}, status=404)
+
+        try:
+            audit = CollectionService.change_account(
+                loan=loan,
+                new_account=account,
+                failed_payment=failed_payment,
+                user=request.user,
+            )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
+
+        return Response(CollectionsAccountChangeAuditSerializer(audit).data)
+
+    @action(detail=True, methods=['get'], url_path='collection-payments')
+    def collection_payments(self, request, pk=None):
+        loan = self.get_object()
+        payments = loan.collection_payments.all().order_by('-initiated_at', '-created_at')
+        return Response(CollectionPaymentSerializer(payments, many=True).data)
 
     @action(detail=True, methods=['post'])
     def record_payment(self, request, pk=None):
@@ -293,6 +421,11 @@ class LoanViewSet(viewsets.ModelViewSet):
         loan = self.get_object()
         funded_payments = loan.funded_payments.all().order_by('-initiated_at', '-created_at')
         return Response(FundedPaymentSerializer(funded_payments, many=True).data)
+
+    @action(detail=False, methods=['post'], url_path='settlement/process')
+    def process_settlement(self, request):
+        completed = SettlementService.process_due()
+        return Response({'completed': completed})
     # =====================================================
     # DASHBOARD ANALYTICS
     # =====================================================

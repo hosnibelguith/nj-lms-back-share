@@ -172,3 +172,12 @@ def create_payment_schedule(loan_id: str, schedule: list):
     
     logger.info(f"Created {len(schedule)} payments for loan {loan_id}")
     return True
+
+
+@shared_task
+def process_collection_settlements():
+    from .zumrails import SettlementService
+
+    completed = SettlementService.process_due()
+    logger.info("Completed %s collection settlements", completed)
+    return {"completed": completed}

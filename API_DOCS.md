@@ -129,13 +129,72 @@ Decline loan.
 Send contract to customer (triggers DocuSign).
 
 ### POST /api/loans/{id}/fund/
-Fund the loan after contract signed.
+### POST /api/loans/{id}/funding/initiate/
+Initiate processor funding for a signed loan. The loan remains `pending_funding` until a ZūmRails `Transaction.Completed` webhook is received.
 ```json
 {
-  "method": "etransfer",  // or "eft"
-  "reference": "TXN-12345"
+  "method": "etransfer",
+  "schedule_confirmed": true,
+  "funding_destination": {
+    "email": "customer@example.com"
+  },
+  "collections_account_id": "bank-account-uuid"
 }
 ```
+
+Validation:
+- `loan.status` must be `pending_funding`
+- funding destination is required
+- collections account is required
+- `schedule_confirmed` must be true
+- existing `processing` or `completed` funding blocks duplicate funding
+
+Retries are allowed after `failed` or `returned` funding attempts and create a new `FundedPayment`.
+
+### GET /api/loans/{id}/funded-payments/
+List funding attempts for a loan.
+
+### GET /api/loans/{id}/funding/options/
+Return funding modal data, including today's advisory funding method recommendation.
+
+### /api/funding-method-recommendations/
+Staff CRUD endpoint for weekday funding recommendations.
+```json
+{
+  "weekday": 0,
+  "method": "eft",
+  "is_active": true,
+  "notes": "Monday EFT recommendation"
+}
+```
+
+### POST /api/loans/{id}/collections/initiate/
+Initiate an EFT collection through ZūmRails.
+```json
+{
+  "amount": 100.00,
+  "payment_id": "scheduled-payment-uuid"
+}
+```
+
+Collections always use EFT. A ZūmRails `Transaction.Completed` webhook starts the 4-business-day settlement period but does not complete the payment.
+
+### GET /api/loans/{id}/collection-payments/
+List processor collection attempts for a loan.
+
+### PATCH /api/loans/{id}/collections-account/
+Change the future collections account after a failed EFT collection for the same loan.
+```json
+{
+  "bank_account_id": "new-bank-account-uuid",
+  "failed_payment_id": "failed-collection-payment-uuid"
+}
+```
+
+Creates an immutable collections account change audit record.
+
+### POST /api/loans/settlement/process/
+Run due collection settlement processing. Completed Zūm collections become internal completed payments only after 4 business days without failure/return/reject events.
 
 ### POST /api/loans/{id}/record_payment/
 Record a manual payment.
@@ -198,6 +257,33 @@ Mark payment as NSF.
 
 ### POST /api/payments/{id}/cancel/
 Cancel scheduled payment.
+
+---
+
+## ZūmRails Webhooks
+
+### POST /api/webhooks/zumrails/
+Processes signed ZūmRails webhook payloads.
+
+Required header:
+```
+zumrails-signature: <base64 hmac-sha256 signature>
+```
+
+Signature input is the raw request body and the secret is `ZUMRAILS_WEBHOOK_SECRET`.
+
+Supported webhook types:
+- `Transaction`
+- `TransactionEvent`
+
+Funding:
+- `Transaction.Status = Completed` marks `FundedPayment.completed` and moves the loan to `active`.
+- `Status` containing `Failed` marks funding failed.
+- `Status = Returned` marks funding returned.
+
+Collections:
+- `Transaction.Status = Completed` stores `zum_status=Completed` and starts settlement.
+- Failure, returned, and rejected events mark the collection failed immediately.
 
 ---
 

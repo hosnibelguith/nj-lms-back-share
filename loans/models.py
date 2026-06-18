@@ -79,6 +79,47 @@ class LoanFormula(models.Model):
         return self.subtotal
 
 
+class FundingMethodRecommendation(models.Model):
+    WEEKDAY_CHOICES = [
+        (0, 'Monday'),
+        (1, 'Tuesday'),
+        (2, 'Wednesday'),
+        (3, 'Thursday'),
+        (4, 'Friday'),
+        (5, 'Saturday'),
+        (6, 'Sunday'),
+    ]
+
+    METHOD_CHOICES = [
+        ('etransfer', 'Interac e-Transfer'),
+        ('eft', 'EFT / Direct Deposit'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    weekday = models.PositiveSmallIntegerField(choices=WEEKDAY_CHOICES, unique=True)
+    method = models.CharField(max_length=20, choices=METHOD_CHOICES)
+    is_active = models.BooleanField(default=True)
+    notes = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'loans_funding_method_recommendation'
+        ordering = ['weekday']
+
+    def __str__(self):
+        return f"{self.get_weekday_display()} - {self.get_method_display()}"
+
+    @classmethod
+    def for_date(cls, target_date=None):
+        target_date = target_date or timezone.localdate()
+        rec = cls.objects.filter(
+            weekday=target_date.weekday(),
+            is_active=True,
+        ).first()
+        return rec.method if rec else None
+
+
 class Loan(models.Model):
     """
     Main loan entity - handles entire loan lifecycle.
@@ -143,10 +184,21 @@ class Loan(models.Model):
         related_name='loans',
         help_text="Account used for funding and PAD collections"
     )
+    collections_account = models.ForeignKey(
+        BankAccount,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='collection_loans',
+        help_text="Current account used for EFT collections"
+    )
     
     # Funding Details
     funding_method = models.CharField(max_length=20, choices=FUNDING_METHOD_CHOICES, blank=True, null=True)
     funding_reference = models.CharField(max_length=100, blank=True, null=True)
+    funding_destination = models.JSONField(default=dict, blank=True)
+    funding_destination_locked_at = models.DateTimeField(null=True, blank=True)
+    collections_account_locked_at = models.DateTimeField(null=True, blank=True)
     funded_at = models.DateTimeField(null=True, blank=True)
     
     # Contract Details
@@ -285,6 +337,33 @@ class Loan(models.Model):
         self.funding_reference = reference
         self.funded_at = timezone.now()
         self.save()
+
+        self.log_state_event(
+            event_type='funded',
+            previous_status=previous_status,
+            new_status='active',
+            user=user,
+            notes=reference,
+        )
+
+    def mark_funding_completed(self, method='', reference='', user=None):
+        """Mark processor-confirmed funding as complete."""
+        previous_status = self.status
+        self.status = 'active'
+        self.is_active = True
+        if method:
+            self.funding_method = method
+        if reference:
+            self.funding_reference = reference
+        self.funded_at = timezone.now()
+        self.save(update_fields=[
+            'status',
+            'is_active',
+            'funding_method',
+            'funding_reference',
+            'funded_at',
+            'updated_at',
+        ])
 
         self.log_state_event(
             event_type='funded',
@@ -457,7 +536,18 @@ class FundedPayment(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
 
     reference = models.CharField(max_length=100, blank=True, null=True)
+    destination_snapshot = models.JSONField(default=dict, blank=True)
+    collections_account_snapshot = models.JSONField(default=dict, blank=True)
+    processor_transaction_id = models.CharField(max_length=255, blank=True, null=True, db_index=True)
+    zum_status = models.CharField(max_length=100, blank=True, null=True)
     initiated_at = models.DateTimeField(default=timezone.now)
+    initiated_by = models.ForeignKey(
+        'accounts.User',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='initiated_funded_payments'
+    )
     completed_at = models.DateTimeField(null=True, blank=True)
     failure_reason = models.TextField(blank=True, null=True)
     notes = models.TextField(blank=True, null=True)
@@ -476,12 +566,124 @@ class FundedPayment(models.Model):
         self.status = 'completed'
         if not self.completed_at:
             self.completed_at = timezone.now()
-        self.save(update_fields=['status', 'completed_at', 'updated_at'])
+        self.save(update_fields=['status', 'zum_status', 'completed_at', 'updated_at'])
 
     def mark_failed(self, reason=''):
         self.status = 'failed'
         self.failure_reason = reason
-        self.save(update_fields=['status', 'failure_reason', 'updated_at'])
+        self.save(update_fields=['status', 'zum_status', 'failure_reason', 'updated_at'])
+
+    def mark_returned(self, reason=''):
+        self.status = 'returned'
+        self.failure_reason = reason
+        self.save(update_fields=['status', 'zum_status', 'failure_reason', 'updated_at'])
+
+
+class CollectionPayment(models.Model):
+    """
+    Processor repayment attempt. Kept separate from scheduled Payment rows so
+    Zūm settlement and retry history remain immutable.
+    """
+
+    STATUS_CHOICES = [
+        ('processing', 'Processing'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+        ('returned', 'Returned'),
+        ('rejected', 'Rejected'),
+        ('cancelled', 'Cancelled'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    loan = models.ForeignKey(
+        Loan,
+        on_delete=models.CASCADE,
+        related_name='collection_payments'
+    )
+    payment = models.ForeignKey(
+        Payment,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='collection_attempts',
+        help_text='Optional scheduled payment this collection attempt is for'
+    )
+    processor_transaction_id = models.CharField(max_length=255, blank=True, null=True, db_index=True)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='processing', db_index=True)
+    zum_status = models.CharField(max_length=100, blank=True, null=True)
+    account_snapshot = models.JSONField(default=dict, blank=True)
+    initiated_at = models.DateTimeField(default=timezone.now, db_index=True)
+    initiated_by = models.ForeignKey(
+        'accounts.User',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='initiated_collection_payments'
+    )
+    settlement_due_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    settled_at = models.DateTimeField(null=True, blank=True)
+    failure_reason = models.TextField(blank=True, null=True)
+    event_history = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'loans_collection_payment'
+        ordering = ['-initiated_at', '-created_at']
+
+    def __str__(self):
+        return f"Collection ${self.amount} for Loan #{str(self.loan_id)[:8]}"
+
+
+class CollectionsAccountChangeAudit(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    loan = models.ForeignKey(
+        Loan,
+        on_delete=models.CASCADE,
+        related_name='collections_account_changes'
+    )
+    previous_account = models.JSONField(default=dict, blank=True)
+    new_account = models.JSONField(default=dict, blank=True)
+    changed_by = models.ForeignKey(
+        'accounts.User',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='collections_account_changes'
+    )
+    changed_at = models.DateTimeField(default=timezone.now)
+    failed_payment = models.ForeignKey(
+        CollectionPayment,
+        on_delete=models.PROTECT,
+        related_name='account_change_audits'
+    )
+    failure_reason = models.TextField(blank=True, null=True)
+
+    class Meta:
+        db_table = 'loans_collections_account_change_audit'
+        ordering = ['-changed_at']
+
+    def __str__(self):
+        return f"Collections account change for Loan #{str(self.loan_id)[:8]}"
+
+
+class WebhookEvent(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    processor_transaction_id = models.CharField(max_length=255, blank=True, null=True, db_index=True)
+    webhook_type = models.CharField(max_length=100, db_index=True)
+    event_name = models.CharField(max_length=150, blank=True, null=True, db_index=True)
+    payload = models.JSONField(default=dict, blank=True)
+    payload_hash = models.CharField(max_length=64, unique=True)
+    received_at = models.DateTimeField(default=timezone.now, db_index=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = 'loans_webhook_event'
+        ordering = ['-received_at']
+
+    def __str__(self):
+        return f"{self.webhook_type} {self.event_name or ''} {self.processor_transaction_id or ''}".strip()
 
 
 

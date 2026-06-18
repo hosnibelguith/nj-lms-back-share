@@ -14,7 +14,8 @@ from banking.views import (
     FinancialAnalysisReportViewSet, FlinksWebhookView, ConnectBankView,
     CustomerPortalBankingStatusView, CustomerPortalBankAccountsView
 )
-from loans.views import LoanViewSet, PaymentViewSet
+from loans.views import FundingMethodRecommendationViewSet, LoanViewSet, PaymentViewSet
+from loans.webhooks import ZumRailsWebhookView
 from contracts.views import ContractViewSet, ContractTemplateViewSet
 from communications.views import (
     CommunicationViewSet, CommunicationTemplateViewSet, TwilioWebhookView
@@ -37,6 +38,7 @@ router.register(r'financial-reports', FinancialAnalysisReportViewSet, basename='
 # Loan routes
 router.register(r'loans', LoanViewSet, basename='loan')
 router.register(r'payments', PaymentViewSet, basename='payment')
+router.register(r'funding-method-recommendations', FundingMethodRecommendationViewSet, basename='funding-method-recommendation')
 
 # Contract routes
 router.register(r'contracts', ContractViewSet, basename='contract')
@@ -65,6 +67,7 @@ urlpatterns = [
     # Webhook endpoints
     path('api/webhooks/flinks/', FlinksWebhookView.as_view(), name='flinks-webhook'),
     path('api/webhooks/twilio/', TwilioWebhookView.as_view(), name='twilio-webhook'),
+    path('api/webhooks/zumrails/', ZumRailsWebhookView.as_view(), name='zumrails-webhook'),
     
     # Health check for Heroku
     path('health/', lambda r: __import__('django.http', fromlist=['JsonResponse']).JsonResponse({'status': 'ok'}), name='health'),

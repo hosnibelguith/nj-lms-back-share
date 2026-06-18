@@ -308,6 +308,15 @@ FLINKS_SECRET_KEY_CA = os.environ.get("FLINKS_SECRET_KEY_CA", "")
 
 
 # -------------------------------------------------------------------
+# ZūmRails
+# -------------------------------------------------------------------
+ZUMRAILS_API_BASE_URL = os.environ.get("ZUMRAILS_API_BASE_URL", "")
+ZUMRAILS_API_KEY = os.environ.get("ZUMRAILS_API_KEY", "")
+ZUMRAILS_WEBHOOK_SECRET = os.environ.get("ZUMRAILS_WEBHOOK_SECRET", "")
+ZUMRAILS_DRY_RUN = os.environ.get("ZUMRAILS_DRY_RUN", "True" if DEBUG else "False").lower() == "true"
+
+
+# -------------------------------------------------------------------
 # AWS S3
 # -------------------------------------------------------------------
 AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "")
