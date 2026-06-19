@@ -1,4 +1,4 @@
-import base64
+``import base64
 import hashlib
 import hmac
 import json
@@ -12,7 +12,7 @@ from rest_framework.test import APITestCase
 from accounts.models import Customer, User
 from banking.models import BankAccount, BankConnection
 
-from .models import CollectionPayment, CollectionsAccountChangeAudit, FundedPayment, Loan
+from .models import CollectionPayment, CollectionsAccountChangeAudit, FundedPayment, FundingMethodRecommendation, Loan, Payment
 
 
 @override_settings(
@@ -88,6 +88,18 @@ class ZumRailsWorkflowTests(APITestCase):
             is_active=True,
         )
         self.client.force_authenticate(self.staff)
+        configure_response = self.client.patch(
+            f"/api/loans/{self.loan.id}/funding/configuration/",
+            {
+                "emt_email": self.customer.email,
+                "emt_source": "application",
+                "eft_bank_account_id": str(self.account.id),
+                "collections_account_id": str(self.account.id),
+            },
+            format="json",
+        )
+        self.assertEqual(configure_response.status_code, 200, configure_response.data)
+        self.loan.refresh_from_db()
 
     def sign(self, payload):
         raw = json.dumps(payload).encode("utf-8")
@@ -104,6 +116,84 @@ class ZumRailsWorkflowTests(APITestCase):
             content_type="application/json",
             HTTP_ZUMRAILS_SIGNATURE=signature or computed,
         )
+
+    def test_funding_requires_saved_configuration(self):
+        unconfigured = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("300.00"),
+            fee=Decimal("60.00"),
+            total_amount=Decimal("360.00"),
+            balance=Decimal("360.00"),
+            status="pending_funding",
+            is_active=True,
+        )
+
+        response = self.client.post(
+            f"/api/loans/{unconfigured.id}/funding/initiate/",
+            {"method": "eft", "schedule_confirmed": True},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["error"], "Funding destination required.")
+
+    def test_configure_funding_saves_destinations(self):
+        response = self.client.get(f"/api/loans/{self.loan.id}/funding/options/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["emt_configured"])
+        self.assertTrue(response.data["eft_configured"])
+        self.assertTrue(response.data["collections_account_configured"])
+        self.assertEqual(response.data["blockers"], [])
+
+    def test_funding_override_requires_confirmation(self):
+        FundingMethodRecommendation.objects.update_or_create(
+            weekday=timezone.localtime().weekday(),
+            defaults={"method": "eft", "is_active": True},
+        )
+
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/funding/initiate/",
+            {"method": "etransfer", "schedule_confirmed": True},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["error"], "Override confirmation required.")
+
+    def test_collection_failure_marks_linked_payment_failed(self):
+        self.loan.status = "active"
+        self.loan.save(update_fields=["status", "updated_at"])
+        payment = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate(),
+            status="pending",
+        )
+        collection = CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=payment,
+            amount=Decimal("100.00"),
+            status="processing",
+            processor_transaction_id="collection-fail-1",
+            account_snapshot={"id": str(self.account.id)},
+        )
+
+        response = self.post_webhook(
+            {
+                "Type": "TransactionEvent",
+                "Data": {
+                    "Id": collection.processor_transaction_id,
+                    "Event": "EftFailedInsufficientFunds",
+                },
+            }
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payment.refresh_from_db()
+        collection.refresh_from_db()
+        self.assertEqual(collection.status, "failed")
+        self.assertEqual(payment.status, "nsf")
 
     def test_funding_validation_requires_schedule_confirmation(self):
         response = self.client.post(
@@ -152,6 +242,21 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.loan.funded_payments.count(), 2)
         self.assertEqual(self.loan.funded_payments.order_by("-created_at").first().status, "processing")
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "active")
+        self.assertIsNotNone(self.loan.funded_at)
+
+    def test_funding_initiate_activates_loan_immediately(self):
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/funding/initiate/",
+            {"method": "eft", "schedule_confirmed": True, "override_confirmed": True},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "active")
+        self.assertIsNotNone(self.loan.funded_at)
 
     def test_invalid_webhook_signature_returns_401(self):
         response = self.post_webhook(
@@ -220,6 +325,7 @@ class ZumRailsWorkflowTests(APITestCase):
         )
 
         self.assertEqual(response.status_code, 400)
+        self.assertIn("failed_payment_id", response.data)
 
         failed = CollectionPayment.objects.create(
             loan=self.loan,
@@ -241,4 +347,74 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.loan.refresh_from_db()
         self.assertEqual(self.loan.collections_account_id, self.other_account.id)
-        self.assertEqual(CollectionsAccountChangeAudit.objects.filter(loan=self.loan).count(), 1)
+        audit = CollectionsAccountChangeAudit.objects.get(loan=self.loan)
+        self.assertEqual(audit.failed_payment_id, failed.id)
+        self.assertEqual(audit.failure_reason, "EftFailedInsufficientFunds")
+
+    def test_collections_account_change_allowed_for_any_eft_failure(self):
+        failure_codes = [
+            "EftFailedInsufficientFunds",
+            "EftFailedAccountClosed",
+            "EftFailedCannotLocateAccount",
+            "EftFailedStopPayment",
+            "EftFailedNoDebitAllowed",
+            "EftFailedFrozenAccount",
+            "EftFailedInvalidErrorAccountNumber",
+            "EftFailedRefusedNoAgreement",
+            "EftFailedAgreementRevoked",
+            "EftFailedPayorPayeeDeceased",
+            "EftFailedNotInAccountAgreementP",
+            "EftFailedNotInAccountAgreementE",
+            "EftFailedNoPrenotificationP1",
+            "EftFailedNoPrenotificationP2",
+            "EftFailedDefaultByAFinancialInstitution",
+            "EftFailedTransactionLimitExceeded",
+            "EftFailedValidationRejection",
+            "EftFailedTransactionNotAllowed",
+        ]
+
+        for index, failure_reason in enumerate(failure_codes):
+            with self.subTest(failure_reason=failure_reason):
+                failed = CollectionPayment.objects.create(
+                    loan=self.loan,
+                    amount=Decimal("10.00") + index,
+                    status="failed",
+                    processor_transaction_id=f"failed-collection-{index}",
+                    failure_reason=failure_reason,
+                    account_snapshot={"id": str(self.account.id)},
+                )
+                target_account = self.other_account if index % 2 else self.account
+                response = self.client.patch(
+                    f"/api/loans/{self.loan.id}/collections-account/",
+                    {
+                        "bank_account_id": str(target_account.id),
+                        "failed_payment_id": str(failed.id),
+                    },
+                    format="json",
+                )
+                self.assertEqual(response.status_code, 200, response.data)
+                audit = CollectionsAccountChangeAudit.objects.get(failed_payment=failed)
+                self.assertEqual(audit.failure_reason, failure_reason)
+
+    def test_process_collection_settlements_task(self):
+        from loans.tasks import process_collection_settlements
+
+        self.loan.status = "active"
+        self.loan.save(update_fields=["status", "updated_at"])
+        collection = CollectionPayment.objects.create(
+            loan=self.loan,
+            amount=Decimal("50.00"),
+            status="processing",
+            processor_transaction_id="settlement-task-1",
+            zum_status="Completed",
+            settlement_due_at=timezone.now() - timedelta(minutes=1),
+            account_snapshot={"id": str(self.account.id)},
+        )
+
+        result = process_collection_settlements()
+
+        collection.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(result["completed"], 1)
+        self.assertEqual(collection.status, "completed")
+        self.assertEqual(self.loan.balance, Decimal("550.00"))

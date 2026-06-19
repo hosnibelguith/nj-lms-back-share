@@ -42,50 +42,57 @@ def send_contract_task(loan_id: str):
 @shared_task
 def process_scheduled_payments():
     """
-    Process all scheduled payments due today.
-    Run daily via celery beat.
+    Initiate Zūm EFT collections for scheduled payments due today or earlier.
+    Completion is settlement-driven via webhook + process_collection_settlements.
     """
     from .models import Payment
-    
+    from .zumrails import CollectionService
+
     today = date.today()
-    
+
     payments = Payment.objects.filter(
         scheduled_date__lte=today,
-        status='scheduled'
-    ).select_related('loan', 'loan__customer')
-    
-    logger.info(f"Processing {payments.count()} scheduled payments")
-    
-    processed = 0
-    failed = 0
-    
+        status='scheduled',
+        loan__status='active',
+    ).select_related(
+        'loan',
+        'loan__customer',
+        'loan__collections_account',
+        'loan__bank_account',
+    )
+
+    logger.info("Queuing %s scheduled payments for Zūm collection", payments.count())
+
+    initiated = 0
+    skipped = 0
+    errors = 0
+
     for payment in payments:
+        if payment.collection_attempts.filter(status__in=['processing', 'completed']).exists():
+            skipped += 1
+            continue
+
         try:
-            # Mark as pending
+            CollectionService.initiate(
+                loan=payment.loan,
+                amount=payment.amount,
+                payment=payment,
+                user=None,
+            )
             payment.status = 'pending'
-            payment.save()
-            
-            # TODO: Call payment processor API (EFT/PAD)
-            # For now, simulate 95% success rate
-            import random
-            success = random.random() < 0.95
-            
-            if success:
-                payment.complete()
-                processed += 1
-                logger.info(f"Payment {payment.id} completed")
-            else:
-                payment.fail("Payment declined by bank")
-                failed += 1
-                logger.warning(f"Payment {payment.id} failed")
-                
-        except Exception as e:
-            logger.error(f"Error processing payment {payment.id}: {e}")
-            payment.fail(str(e))
-            failed += 1
-    
-    logger.info(f"Processed {processed} payments, {failed} failed")
-    return {'processed': processed, 'failed': failed}
+            payment.save(update_fields=['status'])
+            initiated += 1
+        except Exception as exc:
+            logger.error("Error initiating collection for payment %s: %s", payment.id, exc)
+            errors += 1
+
+    logger.info(
+        "Scheduled collections: initiated=%s skipped=%s errors=%s",
+        initiated,
+        skipped,
+        errors,
+    )
+    return {'initiated': initiated, 'skipped': skipped, 'errors': errors}
 
 
 @shared_task

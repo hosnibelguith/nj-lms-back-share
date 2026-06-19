@@ -21,7 +21,13 @@ from .models import (
     LoanFormula,
 )
 from .services import LoanService
-from .zumrails import CollectionService, FundingService, SettlementService
+from .zumrails import (
+    CollectionService,
+    FundingConfigurationService,
+    FundingService,
+    SettlementService,
+    funding_configuration_ready,
+)
 from .serializers import (
     CollectionInitiateSerializer,
     CollectionPaymentSerializer,
@@ -37,6 +43,7 @@ from .serializers import (
     LoanApproveSerializer,
     LoanDeclineSerializer,
     LoanFundSerializer,
+    LoanFundingConfigurationSerializer,
     RecordPaymentSerializer,
     LoanStateEventSerializer,
     LoanReactivateSerializer,
@@ -237,6 +244,12 @@ class LoanViewSet(viewsets.ModelViewSet):
         serializer = LoanFundSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        recommended_method = FundingMethodRecommendation.for_date()
+        selected_method = serializer.validated_data['method']
+        if recommended_method and recommended_method != selected_method:
+            if not serializer.validated_data.get('override_confirmed'):
+                return Response({'error': 'Override confirmation required.'}, status=400)
+
         try:
             collections_account = None
             collections_account_id = serializer.validated_data.get('collections_account_id')
@@ -274,6 +287,7 @@ class LoanViewSet(viewsets.ModelViewSet):
         loan = self.get_object()
         recommended_method = FundingMethodRecommendation.for_date()
         collections_account = loan.collections_account or loan.bank_account
+        readiness = funding_configuration_ready(loan)
         return Response({
             'amount': loan.principal,
             'recommended_method': recommended_method,
@@ -281,6 +295,36 @@ class LoanViewSet(viewsets.ModelViewSet):
             'funding_destination': loan.funding_destination,
             'collections_account': collections_account.id if collections_account else None,
             'schedule_confirmed': False,
+            **readiness,
+        })
+
+    @action(detail=True, methods=['patch'], url_path='funding/configuration')
+    def configure_funding(self, request, pk=None):
+        loan = self.get_object()
+        serializer = LoanFundingConfigurationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            loan = FundingConfigurationService.configure(
+                loan,
+                emt_email=serializer.validated_data.get('emt_email'),
+                emt_source=serializer.validated_data.get('emt_source'),
+                eft_bank_account_id=serializer.validated_data.get('eft_bank_account_id'),
+                collections_account_id=serializer.validated_data.get('collections_account_id'),
+                user=request.user,
+            )
+        except BankAccount.DoesNotExist:
+            return Response({'error': 'Selected account must belong to this customer.'}, status=400)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
+
+        readiness = funding_configuration_ready(loan)
+        collections_account = loan.collections_account or loan.bank_account
+        return Response({
+            'loan_id': str(loan.id),
+            'funding_destination': loan.funding_destination,
+            'collections_account': collections_account.id if collections_account else None,
+            **readiness,
         })
 
     @action(detail=True, methods=['post'], url_path='collections/initiate')
@@ -323,12 +367,10 @@ class LoanViewSet(viewsets.ModelViewSet):
         except BankAccount.DoesNotExist:
             return Response({'error': 'Collections account must belong to this customer.'}, status=400)
 
-        failed_payment = None
-        failed_payment_id = serializer.validated_data.get('failed_payment_id')
-        if failed_payment_id:
-            failed_payment = CollectionPayment.objects.filter(id=failed_payment_id, loan=loan).first()
-            if not failed_payment:
-                return Response({'error': 'Failed payment not found for this loan'}, status=404)
+        failed_payment_id = serializer.validated_data['failed_payment_id']
+        failed_payment = CollectionPayment.objects.filter(id=failed_payment_id, loan=loan).first()
+        if not failed_payment:
+            return Response({'error': 'Failed payment not found for this loan'}, status=404)
 
         try:
             audit = CollectionService.change_account(

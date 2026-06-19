@@ -6,6 +6,7 @@ from celery import shared_task
 from django.conf import settings
 from django.utils.timezone import now
 
+from .flinks import auth_headers, data_headers, generate_authorize_token
 from .models import BankConnection, BankAccount, BankTransaction
 
 logger = logging.getLogger(__name__)
@@ -43,13 +44,6 @@ def _normalize_account_type(raw_type):
         return value
     return 'other'
 
-
-def _flinks_headers(secret_key):
-    return {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'flinks-auth-key': secret_key,
-    }
 
 
 def _poll_get_accounts_detail_async(instance, customer_id, request_id, headers):
@@ -284,7 +278,10 @@ def fetch_flinks_accounts_only(self, login_id):
     secret_key = settings.FLINKS_SECRET_KEY_CA
     instance = settings.FLINKS_INSTANCE
 
-    headers = _flinks_headers(secret_key)
+    try:
+        authorize_token = generate_authorize_token()
+    except ValueError as exc:
+        return _mark_banking_failed(connection, customer, str(exc))
 
     auth_url = f'https://{instance}-api.private.fin.ag/v3/{customer_id}/BankingServices/Authorize'
 
@@ -292,7 +289,7 @@ def fetch_flinks_accounts_only(self, login_id):
         auth_resp = requests.post(
             auth_url,
             json={'LoginId': str(login_id), 'MostRecentCached': True},
-            headers=headers,
+            headers=auth_headers(authorize_token),
             timeout=30,
         )
     except requests.RequestException as exc:
@@ -306,12 +303,13 @@ def fetch_flinks_accounts_only(self, login_id):
         return _mark_banking_failed(connection, customer, 'No RequestId returned by Flinks')
 
     acct_url = f'https://{instance}-api.private.fin.ag/v3/{customer_id}/BankingServices/GetAccountsDetail'
+    detail_headers = data_headers() if secret_key else auth_headers(authorize_token)
 
     try:
         acct_resp = requests.post(
             acct_url,
             json={'RequestId': request_id, 'DaysOfTransactions': 'Days365'},
-            headers=headers,
+            headers=detail_headers,
             timeout=30,
         )
     except requests.RequestException as exc:
@@ -320,7 +318,7 @@ def fetch_flinks_accounts_only(self, login_id):
     if acct_resp.status_code == 200:
         accounts_json = acct_resp.json()
     elif acct_resp.status_code == 202:
-        accounts_json = _poll_get_accounts_detail_async(instance, customer_id, request_id, headers)
+        accounts_json = _poll_get_accounts_detail_async(instance, customer_id, request_id, detail_headers)
     else:
         return _mark_banking_failed(
             connection,

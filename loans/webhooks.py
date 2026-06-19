@@ -10,6 +10,7 @@ from .zumrails import (
     ALL_FAILURE_EVENTS,
     TERMINAL_FAILURE_STATUSES,
     add_business_days,
+    apply_collection_failure,
     log_activity,
     payload_hash,
     verify_zumrails_signature,
@@ -103,9 +104,9 @@ class ZumRailsWebhookView(APIView):
             collection.event_history = history
 
             if event_name in ALL_FAILURE_EVENTS:
-                collection.status = "failed"
-                collection.failure_reason = event_name
-                collection.save(update_fields=["status", "failure_reason", "event_history", "updated_at"])
+                apply_collection_failure(collection, reason=event_name, status="failed")
+                collection.event_history = history
+                collection.save(update_fields=["event_history", "updated_at"])
                 log_activity(
                     collection.loan,
                     "payment_failed",
@@ -148,12 +149,12 @@ class ZumRailsWebhookView(APIView):
 
             if _is_failed_status(status_value) or _is_returned_or_rejected(status_value):
                 reason = _failure_reason(event_data, status_value)
-                collection.status = "returned" if status_value == "Returned" else "failed"
+                failure_status = "returned" if status_value == "Returned" else "failed"
                 if status_value == "Rejected":
-                    collection.status = "rejected"
+                    failure_status = "rejected"
+                apply_collection_failure(collection, reason=reason, status=failure_status)
                 collection.zum_status = status_value
-                collection.failure_reason = reason
-                collection.save(update_fields=["status", "zum_status", "failure_reason", "updated_at"])
+                collection.save(update_fields=["zum_status", "updated_at"])
                 log_activity(
                     collection.loan,
                     "payment_failed",
@@ -174,10 +175,11 @@ class ZumRailsWebhookView(APIView):
             funding.zum_status = status_value
             if status_value == "Completed":
                 funding.mark_completed()
-                funding.loan.mark_funding_completed(
-                    method=funding.method,
-                    reference=funding.processor_transaction_id or "",
-                )
+                if funding.loan.status != "active":
+                    funding.loan.mark_funding_completed(
+                        method=funding.method,
+                        reference=funding.processor_transaction_id or "",
+                    )
                 log_activity(
                     funding.loan,
                     "loan_funded",

@@ -110,19 +110,73 @@ def public_account_snapshot(account: BankAccount | None) -> dict:
 
 
 def funding_destination_snapshot(loan: Loan, method: str, destination: dict | None = None) -> dict:
-    destination = destination or loan.funding_destination or {}
+    destination = destination or {}
+    configured = loan.funding_destination if isinstance(loan.funding_destination, dict) else {}
+
     if method == "etransfer":
+        emt = configured.get("emt") if isinstance(configured.get("emt"), dict) else {}
         email = (
             destination.get("email")
+            or emt.get("email")
             or loan.funding_reference
             or getattr(loan.customer.portal_user, "flinks_email", None)
             or loan.customer.email
         )
-        return {"method": "emt", "email": email}
+        snapshot = {"method": "emt", "email": email}
+        if emt.get("source"):
+            snapshot["source"] = emt["source"]
+        return snapshot
+
+    eft = configured.get("eft") if isinstance(configured.get("eft"), dict) else {}
+    account_dict = eft.get("account") if isinstance(eft.get("account"), dict) else None
+    bank_account_id = destination.get("bank_account_id") or eft.get("bank_account_id")
+    if bank_account_id:
+        account = BankAccount.objects.filter(id=bank_account_id, customer=loan.customer).first()
+        if account:
+            account_dict = account_snapshot(account)
+    elif not account_dict and loan.bank_account:
+        account_dict = account_snapshot(loan.bank_account)
+
+    return {"method": "eft", "account": account_dict or {}}
+
+
+def funding_configuration_ready(loan: Loan) -> dict:
+    configured = loan.funding_destination if isinstance(loan.funding_destination, dict) else {}
+    emt = configured.get("emt") if isinstance(configured.get("emt"), dict) else {}
+    eft = configured.get("eft") if isinstance(configured.get("eft"), dict) else {}
+    collections_account = loan.collections_account or loan.bank_account
+    emt_configured = bool(emt.get("email"))
+    eft_configured = bool(eft.get("account") or loan.bank_account)
+    collections_configured = bool(collections_account)
+    blockers = []
+    if loan.status != "pending_funding":
+        blockers.append("Loan is not pending funding.")
+    if loan.funded_payments.filter(status__in=["processing", "completed"]).exists():
+        blockers.append("Funding already exists for this loan.")
+    if not emt_configured or not eft_configured:
+        blockers.append("Funding destination required.")
+    if not collections_configured:
+        blockers.append("Collections account required.")
     return {
-        "method": "eft",
-        "account": account_snapshot(loan.bank_account),
+        "emt_configured": emt_configured,
+        "eft_configured": eft_configured,
+        "collections_account_configured": collections_configured,
+        "has_active_funding": loan.funded_payments.filter(status__in=["processing", "completed"]).exists(),
+        "blockers": blockers,
     }
+
+
+def apply_collection_failure(collection: CollectionPayment, *, reason: str, status: str = "failed"):
+    collection.status = status
+    collection.failure_reason = reason
+    collection.save(update_fields=["status", "failure_reason", "updated_at"])
+
+    payment = collection.payment
+    if payment and payment.status not in ("completed", "failed", "nsf", "cancelled"):
+        if "InsufficientFunds" in reason:
+            payment.mark_nsf()
+        else:
+            payment.fail(reason)
 
 
 def log_activity(loan: Loan, type_value: str, title: str, description: str, created_by="system", metadata=None):
@@ -201,12 +255,15 @@ class FundingService:
         if loan.funded_payments.filter(status__in=["processing", "completed"]).exists():
             raise ValueError("Funding already exists for this loan.")
 
+        readiness = funding_configuration_ready(loan)
+        if method == "etransfer" and not readiness["emt_configured"] and not (destination or {}).get("email"):
+            raise ValueError("Funding destination required.")
+        if method == "eft" and not readiness["eft_configured"] and not (destination or {}).get("bank_account_id"):
+            raise ValueError("Funding destination required.")
+
         collections_account = collections_account or loan.collections_account or loan.bank_account
         if not collections_account:
             raise ValueError("Collections account required")
-
-        if method == "eft" and not loan.bank_account:
-            raise ValueError("Funding destination required")
 
         destination_snapshot = funding_destination_snapshot(loan, method, destination)
         if not destination_snapshot or (method == "etransfer" and not destination_snapshot.get("email")):
@@ -250,6 +307,12 @@ class FundingService:
             "collections_account_locked_at",
             "updated_at",
         ])
+
+        loan.mark_funding_completed(
+            method=method,
+            reference=processor_id,
+            user=user,
+        )
 
         recommended_method = FundingMethodRecommendation.for_date()
         log_activity(
@@ -312,15 +375,15 @@ class CollectionService:
 
     @staticmethod
     @transaction.atomic
-    def change_account(loan: Loan, *, new_account: BankAccount, failed_payment: CollectionPayment | None, user):
+    def change_account(loan: Loan, *, new_account: BankAccount, failed_payment: CollectionPayment, user):
         loan = Loan.objects.select_for_update().select_related("collections_account", "bank_account").get(pk=loan.pk)
 
-        eligible = loan.collection_payments.filter(status__in=["failed", "returned", "rejected"])
-        if failed_payment:
-            eligible = eligible.filter(pk=failed_payment.pk)
-        failed = eligible.order_by("-initiated_at").first()
-        if not failed:
-            raise ValueError("A failed EFT collection is required before changing collections account.")
+        if failed_payment.loan_id != loan.pk:
+            raise ValueError("Failed payment not found for this loan.")
+        if failed_payment.status not in ("failed", "returned", "rejected"):
+            raise ValueError(
+                "Collections account cannot be changed until a collection payment has failed."
+            )
         if new_account.customer_id != loan.customer_id:
             raise ValueError("Collections account must belong to this customer.")
 
@@ -334,8 +397,8 @@ class CollectionService:
             previous_account=previous,
             new_account=new,
             changed_by=user,
-            failed_payment=failed,
-            failure_reason=failed.failure_reason or "",
+            failed_payment=failed_payment,
+            failure_reason=failed_payment.failure_reason or "",
         )
         log_activity(
             loan,
@@ -343,9 +406,66 @@ class CollectionService:
             "Collections Account Changed",
             "Collections account was changed after a failed EFT collection.",
             created_by=getattr(user, "id", "system"),
-            metadata={"audit_id": str(audit.id), "failed_payment_id": str(failed.id)},
+            metadata={"audit_id": str(audit.id), "failed_payment_id": str(failed_payment.id)},
         )
         return audit
+
+
+class FundingConfigurationService:
+    @staticmethod
+    @transaction.atomic
+    def configure(
+        loan: Loan,
+        *,
+        emt_email: str | None = None,
+        emt_source: str | None = None,
+        eft_bank_account_id=None,
+        collections_account_id=None,
+        user=None,
+    ):
+        loan = Loan.objects.select_for_update().select_related("customer", "customer__portal_user").get(pk=loan.pk)
+
+        if loan.status != "pending_funding":
+            raise ValueError("Only loans pending funding can be configured.")
+        if loan.funding_destination_locked_at:
+            raise ValueError("Funding configuration is locked.")
+
+        destination = dict(loan.funding_destination or {})
+        update_fields = ["funding_destination", "updated_at"]
+
+        if emt_email is not None:
+            destination["emt"] = {
+                "email": emt_email,
+                "source": emt_source or "application",
+            }
+
+        if eft_bank_account_id is not None:
+            account = BankAccount.objects.get(id=eft_bank_account_id, customer=loan.customer)
+            loan.bank_account = account
+            destination["eft"] = {
+                "bank_account_id": str(account.id),
+                "account": account_snapshot(account),
+            }
+            update_fields.append("bank_account")
+
+        if collections_account_id is not None:
+            loan.collections_account = BankAccount.objects.get(
+                id=collections_account_id,
+                customer=loan.customer,
+            )
+            update_fields.append("collections_account")
+
+        loan.funding_destination = destination
+        loan.save(update_fields=update_fields)
+
+        log_activity(
+            loan,
+            "system",
+            "Funding Configured",
+            "Funding destination and collections account selections were saved.",
+            created_by=getattr(user, "id", "system"),
+        )
+        return loan
 
 
 class SettlementService:

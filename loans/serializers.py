@@ -461,13 +461,24 @@ class LoanFundSerializer(serializers.Serializer):
     funding_destination = serializers.DictField(required=False)
     collections_account_id = serializers.UUIDField(required=False)
     schedule_confirmed = serializers.BooleanField(required=True)
+    override_confirmed = serializers.BooleanField(required=False, default=False)
 
     def validate_schedule_confirmed(self, value):
         if not value:
             raise serializers.ValidationError(
-                'Agent must confirm the payment schedule was reviewed before funding.'
+                'Schedule must be confirmed before funding.'
             )
         return value
+
+
+class LoanFundingConfigurationSerializer(serializers.Serializer):
+    emt_email = serializers.EmailField(required=False)
+    emt_source = serializers.ChoiceField(
+        choices=['application', 'flinks'],
+        required=False,
+    )
+    eft_bank_account_id = serializers.UUIDField(required=False)
+    collections_account_id = serializers.UUIDField(required=False)
 
 
 class RecordPaymentSerializer(serializers.Serializer):
@@ -485,4 +496,4 @@ class CollectionInitiateSerializer(serializers.Serializer):
 
 class CollectionsAccountUpdateSerializer(serializers.Serializer):
     bank_account_id = serializers.UUIDField(required=True)
-    failed_payment_id = serializers.UUIDField(required=False)
+    failed_payment_id = serializers.UUIDField(required=True)

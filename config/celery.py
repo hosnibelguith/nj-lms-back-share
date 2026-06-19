@@ -37,6 +37,12 @@ app.conf.beat_schedule = {
         'task': 'loans.tasks.check_defaulted_loans',
         'schedule': crontab(hour=10, minute=0),
     },
+
+    # Complete due Zūm collection settlements daily at 12 PM
+    'process-collection-settlements': {
+        'task': 'loans.tasks.process_collection_settlements',
+        'schedule': crontab(hour=12, minute=0),
+    },
     
     # Check for expired contracts daily at midnight
     'check-expired-contracts': {

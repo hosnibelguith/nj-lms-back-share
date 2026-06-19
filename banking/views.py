@@ -10,6 +10,7 @@ from .serializers import (
     FinancialAnalysisReportSerializer,
     CustomerPortalBankingStatusSerializer,
 )
+from .flinks import build_connect_iframe_url, generate_authorize_token
 from .tasks import fetch_flinks_accounts_only
 
 
@@ -69,6 +70,18 @@ class ConnectBankView(CustomerPortalBaseView):
             "message": "Bank connected successfully. Syncing data...",
             "status": "SYNCING"
         }, status=status.HTTP_200_OK)
+
+
+class FlinksConnectConfigView(CustomerPortalBaseView):
+    def get(self, request):
+        try:
+            authorize_token = generate_authorize_token()
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        return Response({
+            "iframe_url": build_connect_iframe_url(authorize_token),
+        })
 
 
 class CustomerPortalBankingStatusView(CustomerPortalBaseView):
