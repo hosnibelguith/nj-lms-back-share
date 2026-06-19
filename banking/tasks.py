@@ -10,13 +10,8 @@ from .models import BankConnection, BankAccount, BankTransaction
 
 logger = logging.getLogger(__name__)
 
-UNSUPPORTED_INSTITUTION_NUMBERS = {'621', '623'}
 FLINKS_ASYNC_POLL_INTERVAL_SECONDS = 10
 FLINKS_ASYNC_MAX_WAIT_SECONDS = 30 * 60
-UNSUPPORTED_INSTITUTION_MESSAGE = (
-    'We cannot accept accounts from this financial institution. '
-    'Please connect another bank account.'
-)
 ZERO_TRANSACTIONS_MESSAGE = (
     'We could not retrieve transaction history from your bank account. '
     'Please reconnect your bank account.'
@@ -24,13 +19,6 @@ ZERO_TRANSACTIONS_MESSAGE = (
 NO_ACCOUNTS_MESSAGE = (
     'No bank accounts were returned. Please reconnect your bank account.'
 )
-
-
-def _normalize_institution_number(value):
-    if value is None:
-        return ''
-    digits = ''.join(ch for ch in str(value) if ch.isdigit())
-    return digits[-3:] if len(digits) >= 3 else digits
 
 
 def _normalize_account_type(raw_type):
@@ -106,14 +94,6 @@ def _count_transactions(accounts_data):
         transactions = acc.get('Transactions') or []
         total += len(transactions)
     return total
-
-
-def _has_unsupported_institution(accounts_data):
-    for acc in accounts_data:
-        institution = _normalize_institution_number(acc.get('InstitutionNumber'))
-        if institution in UNSUPPORTED_INSTITUTION_NUMBERS:
-            return True
-    return False
 
 
 def _log_banking_failure(customer, title, description):
@@ -336,9 +316,6 @@ def fetch_flinks_accounts_only(self, connection_id):
 
     if not accounts_data:
         return _mark_banking_failed(connection, customer, NO_ACCOUNTS_MESSAGE)
-
-    if _has_unsupported_institution(accounts_data):
-        return _mark_banking_failed(connection, customer, UNSUPPORTED_INSTITUTION_MESSAGE)
 
     total_transactions = _count_transactions(accounts_data)
     if total_transactions == 0:

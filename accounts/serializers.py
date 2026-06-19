@@ -668,7 +668,6 @@ class CustomerPortalLoginSerializer(serializers.Serializer):
 class CustomerPortalMeSerializer(serializers.ModelSerializer):
     full_name = serializers.CharField(read_only=True)
     onboarding_stage_display = serializers.CharField(source='get_onboarding_stage_display', read_only=True)
-    banking_connection_status = serializers.SerializerMethodField()
 
     class Meta:
         model = Customer
@@ -682,17 +681,12 @@ class CustomerPortalMeSerializer(serializers.ModelSerializer):
             'onboarding_stage',
             'onboarding_stage_display',
             'banking_verified',
-            'banking_connection_status',
             'references_completed',
             'contract_completed',
             'status',
             'created_at',
             'updated_at',
         ]
-
-    def get_banking_connection_status(self, obj):
-        connection = obj.bank_connections.order_by('-created_at').first()
-        return connection.sync_status if connection else None
 
 
 class CustomerPortalDashboardSerializer(serializers.Serializer):
