@@ -21,7 +21,7 @@ class BankConnection(models.Model):
         on_delete=models.CASCADE,
         related_name='bank_connections'
     )
-    login_id = models.CharField(max_length=255, unique=True, help_text="Flinks Login ID")
+    login_id = models.CharField(max_length=255, db_index=True, help_text="Flinks Login ID")
     provider = models.CharField(max_length=50, choices=PROVIDER_CHOICES, default='flinks')
 
     is_active = models.BooleanField(default=True)

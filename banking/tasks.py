@@ -266,16 +266,17 @@ def send_banking_retry_email(customer_id, failure_reason=''):
 
 
 @shared_task(bind=True, autoretry_for=(Exception,), retry_kwargs={'max_retries': 3, 'countdown': 30})
-def fetch_flinks_accounts_only(self, login_id):
+def fetch_flinks_accounts_only(self, connection_id):
     """
     Fetch accounts and transactions from Flinks and sync them to DB.
     """
-    connection = BankConnection.objects.select_related('customer').filter(login_id=login_id).first()
+    connection = BankConnection.objects.select_related('customer').filter(id=connection_id).first()
     if not connection:
-        logger.error('No BankConnection found for login_id=%s', login_id)
+        logger.error('No BankConnection found for connection_id=%s', connection_id)
         return False
 
     customer = connection.customer
+    login_id = connection.login_id
     connection.sync_status = 'syncing'
     connection.sync_error = None
     connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])

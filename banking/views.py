@@ -63,7 +63,12 @@ class ConnectBankView(CustomerPortalBaseView):
                 sync_status='pending',
             )
 
-        fetch_flinks_accounts_only.delay(login_id)
+        customer.banking_verified = False
+        if customer.onboarding_stage != 'banking_verification':
+            customer.onboarding_stage = 'banking_verification'
+        customer.save(update_fields=['banking_verified', 'onboarding_stage', 'updated_at'])
+
+        fetch_flinks_accounts_only.delay(str(connection.id))
 
         return Response({
             "message": "Bank connected successfully. Syncing data...",

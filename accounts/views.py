@@ -510,6 +510,12 @@ class CustomerPortalBaseView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
+    def banking_sync_in_progress(self, customer):
+        connection = customer.bank_connections.order_by('-created_at').first()
+        return bool(
+            connection and connection.sync_status in ['pending', 'syncing']
+        )
+
 
 class CustomerPortalMeView(CustomerPortalBaseView):
     def get(self, request):
@@ -735,6 +741,12 @@ class CustomerPortalContractPreviewView(CustomerPortalBaseView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        if self.banking_sync_in_progress(customer):
+            return Response(
+                {'error': 'Banking verification is still in progress. Please wait for sync to finish.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         loan = customer.loans.filter(
             status__in=[
                 'pending_signature',
@@ -786,6 +798,12 @@ class CustomerPortalSignContractView(CustomerPortalBaseView):
         if not customer.banking_verified:
             return Response(
                 {'error': 'Banking verification must be completed before signing the contract.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if self.banking_sync_in_progress(customer):
+            return Response(
+                {'error': 'Banking verification is still in progress. Please wait for sync to finish.'},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
