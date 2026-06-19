@@ -302,7 +302,7 @@ TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")
 # -------------------------------------------------------------------
 # Flinks
 # -------------------------------------------------------------------
-FLINKS_INSTANCE = os.environ.get("FLINKS_INSTANCE", "alphaloans-ca")
+FLINKS_INSTANCE = os.environ.get("FLINKS_INSTANCE", "toolbox")
 FLINKS_CUSTOMER_ID = os.environ.get("FLINKS_CUSTOMER_ID", "855a21f3-976d-430f-9162-f5d2254b0bad")
 FLINKS_SECRET_KEY_CA = os.environ.get("FLINKS_SECRET_KEY_CA", "")
 
