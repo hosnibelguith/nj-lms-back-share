@@ -258,31 +258,18 @@ def send_banking_retry_email(customer_id, failure_reason=''):
             ),
             from_email=settings.DEFAULT_FROM_EMAIL,
             recipient_list=[customer.email],
-            fail_silently=True,
+            fail_silently=False,
         )
         logger.info('Banking retry email sent to customer=%s', customer.email)
     except Exception as exc:
         logger.error('Error sending banking retry email: %s', exc)
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, autoretry_for=(Exception,), retry_kwargs={'max_retries': 3, 'countdown': 30})
 def fetch_flinks_accounts_only(self, login_id):
     """
     Fetch accounts and transactions from Flinks and sync them to DB.
     """
-    try:
-        return _run_flinks_sync(login_id)
-    except Exception as exc:
-        logger.exception('Unexpected Flinks sync error for login_id=%s', login_id)
-        connection = BankConnection.objects.select_related('customer').filter(
-            login_id=login_id
-        ).first()
-        if connection:
-            return _mark_banking_failed(connection, connection.customer, str(exc))
-        return False
-
-
-def _run_flinks_sync(login_id):
     connection = BankConnection.objects.select_related('customer').filter(login_id=login_id).first()
     if not connection:
         logger.error('No BankConnection found for login_id=%s', login_id)
@@ -296,13 +283,6 @@ def _run_flinks_sync(login_id):
     customer_id = settings.FLINKS_CUSTOMER_ID
     secret_key = settings.FLINKS_SECRET_KEY_CA
     instance = settings.FLINKS_INSTANCE
-
-    if not secret_key or not customer_id or not instance:
-        return _mark_banking_failed(
-            connection,
-            customer,
-            'Banking verification is temporarily unavailable. Please try again later or contact support.',
-        )
 
     headers = _flinks_headers(secret_key)
 

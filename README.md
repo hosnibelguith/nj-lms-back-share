@@ -58,3 +58,9 @@ Frontend expects: `NEXT_PUBLIC_API_URL=http://localhost:8000/api` (default in fr
 1. Create app and Postgres add-on.
 2. Set config vars: `DJANGO_SECRET_KEY`, `DJANGO_DEBUG=False`, `DJANGO_ALLOWED_HOSTS`, `DATABASE_URL`, `CORS_ALLOWED_ORIGINS`, `CSRF_TRUSTED_ORIGINS`.
 3. Deploy — release phase runs migrations automatically.
+4. Create a production admin account:
+   ```bash
+   heroku config:set BOOTSTRAP_ADMIN_EMAIL=you@example.com BOOTSTRAP_ADMIN_PASSWORD='your-strong-password' -a nj-lms-back
+   heroku run python manage.py ensure_admin -a nj-lms-back
+   ```
+   Staff login: `POST /api/auth/login/` (frontend `/login`). Django admin: `/admin/`.

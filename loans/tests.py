@@ -243,10 +243,12 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(self.loan.funded_payments.count(), 2)
         self.assertEqual(self.loan.funded_payments.order_by("-created_at").first().status, "processing")
         self.loan.refresh_from_db()
-        self.assertEqual(self.loan.status, "active")
-        self.assertIsNotNone(self.loan.funded_at)
+        # Spec sections 8 & 17: loan stays pending_funding until the processor
+        # confirms via webhook. Initiating funding must not activate the loan.
+        self.assertEqual(self.loan.status, "pending_funding")
+        self.assertIsNone(self.loan.funded_at)
 
-    def test_funding_initiate_activates_loan_immediately(self):
+    def test_funding_initiate_keeps_loan_pending_until_webhook(self):
         response = self.client.post(
             f"/api/loans/{self.loan.id}/funding/initiate/",
             {"method": "eft", "schedule_confirmed": True, "override_confirmed": True},
@@ -255,6 +257,26 @@ class ZumRailsWorkflowTests(APITestCase):
 
         self.assertEqual(response.status_code, 200)
         self.loan.refresh_from_db()
+        funding = self.loan.funded_payments.order_by("-created_at").first()
+        self.assertEqual(funding.status, "processing")
+        self.assertEqual(self.loan.status, "pending_funding")
+        self.assertIsNone(self.loan.funded_at)
+        self.assertIsNotNone(self.loan.funding_destination_locked_at)
+        self.assertIsNotNone(self.loan.collections_account_locked_at)
+
+        response = self.post_webhook(
+            {
+                "Type": "Transaction",
+                "Data": {
+                    "Id": funding.processor_transaction_id,
+                    "TransactionStatus": "Completed",
+                },
+            }
+        )
+        self.assertEqual(response.status_code, 200)
+        self.loan.refresh_from_db()
+        funding.refresh_from_db()
+        self.assertEqual(funding.status, "completed")
         self.assertEqual(self.loan.status, "active")
         self.assertIsNotNone(self.loan.funded_at)
 

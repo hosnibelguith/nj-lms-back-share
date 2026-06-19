@@ -308,11 +308,9 @@ class FundingService:
             "updated_at",
         ])
 
-        loan.mark_funding_completed(
-            method=method,
-            reference=processor_id,
-            user=user,
-        )
+        # Spec sections 8 & 17: the processor is the source of truth. The loan
+        # stays in pending_funding until the ZumRails webhook confirms the
+        # funding transaction completed. Do NOT activate the loan here.
 
         recommended_method = FundingMethodRecommendation.for_date()
         log_activity(

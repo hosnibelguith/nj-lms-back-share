@@ -1,7 +1,3 @@
-import logging
-
-from django.db import transaction
-from django.db.utils import IntegrityError
 from rest_framework import permissions, status, viewsets
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -15,8 +11,6 @@ from .serializers import (
     CustomerPortalBankingStatusSerializer,
 )
 from .tasks import fetch_flinks_accounts_only
-
-logger = logging.getLogger(__name__)
 
 
 class StaffOnlyPermission(permissions.BasePermission):
@@ -52,54 +46,24 @@ class ConnectBankView(CustomerPortalBaseView):
             return Response({"error": "Login ID is required"}, status=status.HTTP_400_BAD_REQUEST)
 
         customer = self.get_customer(request)
-        login_id = str(login_id)
 
-        try:
-            with transaction.atomic():
-                BankConnection.objects.filter(login_id=login_id).exclude(
-                    customer=customer
-                ).delete()
-
-                connection = BankConnection.objects.filter(
-                    customer=customer
-                ).order_by('-created_at').first()
-                if connection:
-                    connection.login_id = login_id
-                    connection.is_active = True
-                    connection.sync_status = 'pending'
-                    connection.sync_error = None
-                    connection.save(
-                        update_fields=[
-                            'login_id',
-                            'is_active',
-                            'sync_status',
-                            'sync_error',
-                            'updated_at',
-                        ]
-                    )
-                else:
-                    BankConnection.objects.create(
-                        customer=customer,
-                        login_id=login_id,
-                        provider='flinks',
-                        is_active=True,
-                        sync_status='pending',
-                    )
-        except IntegrityError:
-            logger.exception(
-                'Bank connection login_id conflict for customer=%s login_id=%s',
-                customer.id,
-                login_id,
-            )
-            return Response(
-                {"error": "Unable to save bank connection. Please try again."},
-                status=status.HTTP_409_CONFLICT,
+        connection = BankConnection.objects.filter(customer=customer).order_by('-created_at').first()
+        if connection:
+            connection.login_id = login_id
+            connection.is_active = True
+            connection.sync_status = 'pending'
+            connection.sync_error = None
+            connection.save(update_fields=['login_id', 'is_active', 'sync_status', 'sync_error', 'updated_at'])
+        else:
+            connection = BankConnection.objects.create(
+                customer=customer,
+                login_id=login_id,
+                provider='flinks',
+                is_active=True,
+                sync_status='pending',
             )
 
-        try:
-            fetch_flinks_accounts_only.delay(login_id)
-        except Exception:
-            logger.exception('Failed to run banking sync for login_id=%s', login_id)
+        fetch_flinks_accounts_only.delay(login_id)
 
         return Response({
             "message": "Bank connected successfully. Syncing data...",
