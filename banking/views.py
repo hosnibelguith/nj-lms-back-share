@@ -47,21 +47,13 @@ class ConnectBankView(CustomerPortalBaseView):
 
         customer = self.get_customer(request)
 
-        connection = BankConnection.objects.filter(customer=customer).order_by('-created_at').first()
-        if connection:
-            connection.login_id = login_id
-            connection.is_active = True
-            connection.sync_status = 'pending'
-            connection.sync_error = None
-            connection.save(update_fields=['login_id', 'is_active', 'sync_status', 'sync_error', 'updated_at'])
-        else:
-            connection = BankConnection.objects.create(
-                customer=customer,
-                login_id=login_id,
-                provider='flinks',
-                is_active=True,
-                sync_status='pending',
-            )
+        connection = BankConnection.objects.create(
+            customer=customer,
+            login_id=login_id,
+            provider='flinks',
+            is_active=True,
+            sync_status='pending',
+        )
 
         fetch_flinks_accounts_only.delay(str(connection.id))
 

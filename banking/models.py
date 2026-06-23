@@ -80,7 +80,7 @@ class BankAccount(models.Model):
     class Meta:
         db_table = 'banking_bankaccount'
         ordering = ['-is_primary', 'name']
-        unique_together = ('customer', 'external_id')
+        unique_together = ('connection', 'external_id')
 
     def __str__(self):
         return f"{self.name} ({self.currency})"

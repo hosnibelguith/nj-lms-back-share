@@ -135,10 +135,10 @@ def _persist_accounts(connection, customer, accounts_data):
         normalized_type = _normalize_account_type(acc.get('Type'))
 
         account_obj, _created = BankAccount.objects.update_or_create(
-            customer=customer,
+            connection=connection,
             external_id=acc.get('Id'),
             defaults={
-                'connection': connection,
+                'customer': customer,
                 'name': acc.get('Title') or acc.get('AccountNumber') or 'Unknown account',
                 'type': normalized_type,
                 'currency': acc.get('Currency') or 'CAD',
