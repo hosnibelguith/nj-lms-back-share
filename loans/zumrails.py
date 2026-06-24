@@ -430,30 +430,39 @@ class FundingConfigurationService:
         if loan.funding_destination_locked_at:
             raise ValueError("Funding configuration is locked.")
 
-        destination = dict(loan.funding_destination or {})
+        destination = loan.funding_destination
+        if not isinstance(destination, dict):
+            destination = {}
+        else:
+            destination = dict(destination)
+
         update_fields = ["funding_destination", "updated_at"]
 
-        if emt_email is not None:
+        if emt_email:
             destination["emt"] = {
-                "email": emt_email,
+                "email": str(emt_email),
                 "source": emt_source or "application",
             }
 
-        if eft_bank_account_id is not None:
-            account = BankAccount.objects.get(id=eft_bank_account_id, customer=loan.customer)
-            loan.bank_account = account
-            destination["eft"] = {
-                "bank_account_id": str(account.id),
-                "account": account_snapshot(account),
-            }
-            update_fields.append("bank_account")
+        if eft_bank_account_id:
+            try:
+                account = BankAccount.objects.get(id=eft_bank_account_id, customer=loan.customer)
+                loan.bank_account = account
+                destination["eft"] = {
+                    "bank_account_id": str(account.id),
+                    "account": account_snapshot(account),
+                }
+                update_fields.append("bank_account")
+            except BankAccount.DoesNotExist:
+                raise ValueError("Selected EFT account must belong to this customer.")
 
-        if collections_account_id is not None:
-            loan.collections_account = BankAccount.objects.get(
-                id=collections_account_id,
-                customer=loan.customer,
-            )
-            update_fields.append("collections_account")
+        if collections_account_id:
+            try:
+                account = BankAccount.objects.get(id=collections_account_id, customer=loan.customer)
+                loan.collections_account = account
+                update_fields.append("collections_account")
+            except BankAccount.DoesNotExist:
+                raise ValueError("Selected collections account must belong to this customer.")
 
         loan.funding_destination = destination
         loan.save(update_fields=update_fields)
