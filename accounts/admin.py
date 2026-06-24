@@ -1,6 +1,13 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User, Customer
+from .models import User, Customer, GlobalSetting
+
+@admin.register(GlobalSetting)
+class GlobalSettingAdmin(admin.ModelAdmin):
+    list_display = ("key", "value", "is_secret", "updated_at")
+    search_fields = ("key", "value", "description")
+    list_filter = ("is_secret", "updated_at")
+    readonly_fields = ("created_at", "updated_at")
 
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):

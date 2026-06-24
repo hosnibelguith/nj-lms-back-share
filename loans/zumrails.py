@@ -62,7 +62,8 @@ COLLECTION_SETTLEMENT_BUSINESS_DAYS = 4
 
 
 def verify_zumrails_signature(payload: bytes, signature: str | None) -> bool:
-    secret = getattr(settings, "ZUMRAILS_WEBHOOK_SECRET", "")
+    from accounts.models import GlobalSetting
+    secret = GlobalSetting.get_value("ZUMRAILS_WEBHOOK_SECRET", getattr(settings, "ZUMRAILS_WEBHOOK_SECRET", ""))
     if not secret or not signature:
         return False
 
@@ -203,11 +204,15 @@ class ZumRailsService:
 
     @staticmethod
     def initiate_transaction(*, amount, transaction_type: str, method: str, memo: str, extra=None) -> str:
-        if getattr(settings, "ZUMRAILS_DRY_RUN", False):
+        from accounts.models import GlobalSetting
+        
+        dry_run = GlobalSetting.get_value("ZUMRAILS_DRY_RUN", str(getattr(settings, "ZUMRAILS_DRY_RUN", False))).lower() == 'true'
+        if dry_run:
             return f"dryrun-{transaction_type.lower()}-{uuid.uuid4().hex}"
 
-        api_url = getattr(settings, "ZUMRAILS_API_BASE_URL", "").rstrip("/")
-        api_key = getattr(settings, "ZUMRAILS_API_KEY", "")
+        api_url = GlobalSetting.get_value("ZUMRAILS_API_BASE_URL", getattr(settings, "ZUMRAILS_API_BASE_URL", "")).rstrip("/")
+        api_key = GlobalSetting.get_value("ZUMRAILS_API_KEY", getattr(settings, "ZUMRAILS_API_KEY", ""))
+        
         if not api_url or not api_key:
             raise ValueError("ZūmRails API settings are not configured.")
 

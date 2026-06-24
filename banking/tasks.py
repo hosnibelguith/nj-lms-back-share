@@ -261,9 +261,11 @@ def fetch_flinks_accounts_only(self, connection_id):
     connection.sync_error = None
     connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
 
-    customer_id = settings.FLINKS_CUSTOMER_ID
-    secret_key = settings.FLINKS_SECRET_KEY_CA
-    instance = settings.FLINKS_INSTANCE
+    from accounts.models import GlobalSetting
+
+    customer_id = GlobalSetting.get_value('FLINKS_CUSTOMER_ID', settings.FLINKS_CUSTOMER_ID)
+    secret_key = GlobalSetting.get_value('FLINKS_SECRET_KEY_CA', settings.FLINKS_SECRET_KEY_CA)
+    instance = GlobalSetting.get_value('FLINKS_INSTANCE', settings.FLINKS_INSTANCE)
 
     headers = _flinks_headers(secret_key)
 

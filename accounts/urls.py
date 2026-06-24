@@ -66,4 +66,6 @@ urlpatterns = [
         views.CustomerPortalRunAnalysisView.as_view(),
         name='customer-portal-run-analysis',
     ),
+    path('portal/me/integrations/', views.ApiIntegrationsView.as_view(), name='api-integrations'),
 ]
+

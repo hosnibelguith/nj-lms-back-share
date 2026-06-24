@@ -10,7 +10,7 @@ from django.conf import settings
 from django.db.models import Count, Q
 from django.middleware.csrf import get_token
 from django.utils import timezone
-from .models import User, Customer
+from .models import User, Customer, GlobalSetting
 from .serializers import (
     UserSerializer, UserCreateSerializer, LoginSerializer,
     CustomerSerializer, CustomerListSerializer, CustomerCreateSerializer,
@@ -24,7 +24,49 @@ from .serializers import (
     CustomerPasswordResetRequestSerializer,
     CustomerPasswordResetVerifySerializer,
     CustomerPasswordResetConfirmSerializer,
+    ApiIntegrationsSerializer,
 )
+
+
+class StaffOnlyPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return bool(
+            request.user
+            and request.user.is_authenticated
+            and request.user.user_type == 'staff'
+        )
+
+
+class ApiIntegrationsView(APIView):
+    permission_classes = [permissions.IsAuthenticated, StaffOnlyPermission]
+
+    def get(self, request):
+        keys = {
+            'FLINKS_IFRAME_URL': 'flinks_iframe_url',
+            'FLINKS_INSTANCE': 'flinks_instance',
+            'FLINKS_CUSTOMER_ID': 'flinks_customer_id',
+            'FLINKS_SECRET_KEY_CA': 'flinks_secret_key',
+            'ZUMRAILS_API_BASE_URL': 'zum_api_base_url',
+            'ZUMRAILS_API_KEY': 'zum_api_key',
+            'ZUMRAILS_WEBHOOK_SECRET': 'zum_webhook_secret',
+            'WEBHOOK_URL': 'webhook_url',
+        }
+        
+        data = {}
+        for db_key, ui_key in keys.items():
+            # Fallback to settings if not in DB
+            val = GlobalSetting.get_value(db_key)
+            if val is None:
+                val = getattr(settings, db_key, '')
+            data[ui_key] = val
+
+        return Response(data)
+
+    def patch(self, request):
+        serializer = ApiIntegrationsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response({'message': 'Integrations updated successfully'})
 from contracts.models import Contract
 from contracts.serializers import (
     ContractSerializer,
@@ -36,13 +78,7 @@ from loans.services import LoanService
 from .tasks import send_welcome_email
 
 
-class StaffOnlyPermission(permissions.BasePermission):
-    def has_permission(self, request, view):
-        return bool(
-            request.user
-            and request.user.is_authenticated
-            and request.user.user_type == 'staff'
-        )
+
 
 
 class CustomerPagination(PageNumberPagination):

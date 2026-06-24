@@ -2,7 +2,7 @@ from rest_framework import serializers
 from django.contrib.auth import authenticate
 from django.db import transaction, IntegrityError
 from django.db.models import Q
-from .models import User, Customer, AuthOTPChallenge
+from .models import User, Customer, AuthOTPChallenge, GlobalSetting
 from .utils.phone import normalize_ca_phone
 from .services.otp import create_otp_challenge, verify_otp_challenge
 from .tasks import send_sms_otp_task, send_email_otp_task
@@ -744,3 +744,41 @@ class CustomerPortalLoanSerializer(serializers.Serializer):
     balance = serializers.DecimalField(max_digits=10, decimal_places=2)
     collected_amount = serializers.DecimalField(max_digits=10, decimal_places=2)
     funded_at = serializers.DateTimeField(allow_null=True)
+
+
+class GlobalSettingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = GlobalSetting
+        fields = ['key', 'value', 'description', 'is_secret', 'updated_at']
+
+
+class ApiIntegrationsSerializer(serializers.Serializer):
+    flinks_iframe_url = serializers.CharField(required=False, allow_blank=True)
+    flinks_instance = serializers.CharField(required=False, allow_blank=True)
+    flinks_customer_id = serializers.CharField(required=False, allow_blank=True)
+    flinks_secret_key = serializers.CharField(required=False, allow_blank=True)
+    zum_api_base_url = serializers.CharField(required=False, allow_blank=True)
+    zum_api_key = serializers.CharField(required=False, allow_blank=True)
+    zum_webhook_secret = serializers.CharField(required=False, allow_blank=True)
+    webhook_url = serializers.CharField(required=False, allow_blank=True)
+
+    def save(self):
+        from .models import GlobalSetting
+        data = self.validated_data
+        mapping = {
+            'flinks_iframe_url': 'FLINKS_IFRAME_URL',
+            'flinks_instance': 'FLINKS_INSTANCE',
+            'flinks_customer_id': 'FLINKS_CUSTOMER_ID',
+            'flinks_secret_key': 'FLINKS_SECRET_KEY_CA',
+            'zum_api_base_url': 'ZUMRAILS_API_BASE_URL',
+            'zum_api_key': 'ZUMRAILS_API_KEY',
+            'zum_webhook_secret': 'ZUMRAILS_WEBHOOK_SECRET',
+            'webhook_url': 'WEBHOOK_URL',
+        }
+
+        for field, key in mapping.items():
+            if field in data:
+                GlobalSetting.objects.update_or_create(
+                    key=key,
+                    defaults={'value': data[field]}
+                )

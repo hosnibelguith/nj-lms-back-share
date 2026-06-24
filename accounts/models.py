@@ -255,3 +255,31 @@ class AuthOTPChallenge(models.Model):
     @property
     def is_expired(self):
         return timezone.now() >= self.expires_at
+
+
+class GlobalSetting(models.Model):
+    """
+    Store system-wide configuration keys and values.
+    Used for API credentials, integration toggles, and global defaults.
+    """
+    key = models.CharField(max_length=100, unique=True, db_index=True)
+    value = models.TextField(blank=True, null=True)
+    description = models.TextField(blank=True, null=True)
+    is_secret = models.BooleanField(default=False, help_text="If True, UI should mask this value.")
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'accounts_global_setting'
+        ordering = ['key']
+
+    def __str__(self):
+        return f"{self.key}: {self.value}"
+
+    @classmethod
+    def get_value(cls, key, default=None):
+        try:
+            return cls.objects.get(key=key).value
+        except cls.DoesNotExist:
+            return default
