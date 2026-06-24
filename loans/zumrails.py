@@ -241,12 +241,7 @@ class FundingService:
     @staticmethod
     @transaction.atomic
     def initiate(loan: Loan, *, method: str, schedule_confirmed: bool, user, destination=None, collections_account=None):
-        loan = Loan.objects.select_for_update().select_related(
-            "customer",
-            "customer__portal_user",
-            "bank_account",
-            "collections_account",
-        ).get(pk=loan.pk)
+        loan = Loan.objects.select_for_update().get(pk=loan.pk)
 
         if loan.status != "pending_funding":
             raise ValueError("Only loans pending funding can be funded.")
@@ -335,11 +330,7 @@ class CollectionService:
     @staticmethod
     @transaction.atomic
     def initiate(loan: Loan, *, amount, user, payment: Payment | None = None):
-        loan = Loan.objects.select_for_update().select_related(
-            "customer",
-            "collections_account",
-            "bank_account",
-        ).get(pk=loan.pk)
+        loan = Loan.objects.select_for_update().get(pk=loan.pk)
 
         account = loan.collections_account or loan.bank_account
         if not account:
@@ -376,7 +367,7 @@ class CollectionService:
     @staticmethod
     @transaction.atomic
     def change_account(loan: Loan, *, new_account: BankAccount, failed_payment: CollectionPayment, user):
-        loan = Loan.objects.select_for_update().select_related("collections_account", "bank_account").get(pk=loan.pk)
+        loan = Loan.objects.select_for_update().get(pk=loan.pk)
 
         if failed_payment.loan_id != loan.pk:
             raise ValueError("Failed payment not found for this loan.")
@@ -423,7 +414,7 @@ class FundingConfigurationService:
         collections_account_id=None,
         user=None,
     ):
-        loan = Loan.objects.select_for_update().select_related("customer", "customer__portal_user").get(pk=loan.pk)
+        loan = Loan.objects.select_for_update().get(pk=loan.pk)
 
         if loan.status != "pending_funding":
             raise ValueError("Only loans pending funding can be configured.")
