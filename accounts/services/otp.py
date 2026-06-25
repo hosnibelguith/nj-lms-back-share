@@ -18,6 +18,10 @@ def hash_otp(code: str) -> str:
 
 
 def generate_otp() -> str:
+    dev_code = getattr(settings, "DEV_OTP_CODE", "")
+    if settings.DEBUG and dev_code:
+        return dev_code
+
     return f"{secrets.randbelow(1_000_000):06d}"
 
 

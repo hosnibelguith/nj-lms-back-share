@@ -145,6 +145,10 @@ def send_sms_otp_task(self, phone_number: str, code: str):
         from django.conf import settings
         from twilio.rest import Client
 
+        if settings.DEBUG and getattr(settings, "DEV_OTP_CODE", ""):
+            logger.warning("DEV OTP for %s is %s", phone_number, code)
+            return
+
         client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
 
         client.messages.create(
@@ -157,6 +161,9 @@ def send_sms_otp_task(self, phone_number: str, code: str):
 
     except Exception as e:
         logger.error(f"Error sending OTP SMS: {e}")
+        if settings.DEBUG:
+            logger.warning("Skipping SMS retry in DEBUG. OTP for %s is %s", phone_number, code)
+            return
         raise self.retry(exc=e, countdown=60)
 
 
