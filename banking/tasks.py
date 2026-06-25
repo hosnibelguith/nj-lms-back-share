@@ -176,7 +176,8 @@ def _mark_banking_success(connection, customer, flinks_email=None, flinks_phone=
     connection.last_synced_at = now()
     connection.sync_status = 'synced'
     connection.sync_error = None
-    connection.save(update_fields=['last_synced_at', 'sync_status', 'sync_error', 'updated_at'])
+    connection.is_active = True
+    connection.save(update_fields=['last_synced_at', 'sync_status', 'sync_error', 'is_active', 'updated_at'])
 
     customer.banking_verified = True
     if customer.onboarding_stage == 'banking_verification':

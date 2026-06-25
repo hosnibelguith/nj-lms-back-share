@@ -46,6 +46,8 @@ class ConnectBankView(CustomerPortalBaseView):
             return Response({"error": "Login ID is required"}, status=status.HTTP_400_BAD_REQUEST)
 
         customer = self.get_customer(request)
+        
+        BankConnection.objects.filter(customer=customer, is_active=True).update(is_active=False)
 
         connection = BankConnection.objects.create(
             customer=customer,
@@ -66,7 +68,7 @@ class ConnectBankView(CustomerPortalBaseView):
 class CustomerPortalBankingStatusView(CustomerPortalBaseView):
     def get(self, request):
         customer = self.get_customer(request)
-        connection = customer.bank_connections.order_by('-created_at').first()
+        connection = customer.bank_connections.filter(is_active=True).order_by('-created_at').first()
 
         payload = {
             'banking_verified': customer.banking_verified,
@@ -74,7 +76,7 @@ class CustomerPortalBankingStatusView(CustomerPortalBaseView):
             'has_connection': connection is not None,
             'connection_status': connection.sync_status if connection else None,
             'last_synced_at': connection.last_synced_at if connection else None,
-            'account_count': customer.bank_accounts.count(),
+            'account_count': customer.bank_accounts.filter(connection__is_active=True).count(),
             'failure_message': connection.sync_error if connection and connection.sync_status == 'failed' else None,
         }
 
@@ -85,7 +87,9 @@ class CustomerPortalBankingStatusView(CustomerPortalBaseView):
 class CustomerPortalBankAccountsView(CustomerPortalBaseView):
     def get(self, request):
         customer = self.get_customer(request)
-        accounts = customer.bank_accounts.prefetch_related('transactions').order_by('-is_primary', 'name')
+        accounts = customer.bank_accounts.filter(
+            connection__is_active=True
+        ).prefetch_related('transactions').order_by('-is_primary', 'name')
         serializer = BankAccountSerializer(accounts, many=True)
         return Response(serializer.data)
 
@@ -95,7 +99,7 @@ class BankConnectionViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [permissions.IsAuthenticated, StaffOnlyPermission]
 
     def get_queryset(self):
-        queryset = BankConnection.objects.select_related('customer')
+        queryset = BankConnection.objects.select_related('customer').filter(is_active=True)
 
         customer_id = self.request.query_params.get('customer_id')
         if customer_id:
@@ -109,7 +113,9 @@ class BankAccountViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [permissions.IsAuthenticated, StaffOnlyPermission]
 
     def get_queryset(self):
-        queryset = BankAccount.objects.select_related('customer', 'connection')
+        queryset = BankAccount.objects.select_related('customer', 'connection').filter(
+            connection__is_active=True
+        )
 
         customer_id = self.request.query_params.get('customer_id')
         if customer_id:
@@ -123,7 +129,9 @@ class BankTransactionViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [permissions.IsAuthenticated, StaffOnlyPermission]
 
     def get_queryset(self):
-        queryset = BankTransaction.objects.select_related('customer', 'account')
+        queryset = BankTransaction.objects.select_related('customer', 'account').filter(
+            account__connection__is_active=True
+        )
 
         customer_id = self.request.query_params.get('customer_id')
         if customer_id:
