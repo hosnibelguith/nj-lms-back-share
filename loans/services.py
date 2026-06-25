@@ -152,7 +152,8 @@ class LoanService:
         if start_date is None:
             # Not funded yet: only the planned timeline is meaningful.
             charged_days = planned_days
-            as_of = None
+            as_of = today
+            projection_start = today
         else:
             if loan.status == 'paid_off':
                 last_payment = loan.payments.filter(
@@ -167,6 +168,7 @@ class LoanService:
                 end_date = today
             charged_days = max((end_date - start_date).days, 0)
             as_of = end_date
+            projection_start = start_date
 
         actual_interest = money(daily_interest * Decimal(charged_days))
         interest_adjustment = money(actual_interest - planned_interest)
@@ -180,10 +182,7 @@ class LoanService:
                 'type': 'interest' if day <= planned_days else 'late_interest',
                 'amount': str(rounded_daily),
                 'balance': str(money(base_balance + rounded_daily * Decimal(day))),
-                'date': (
-                    (start_date + timedelta(days=day)).isoformat()
-                    if start_date else None
-                ),
+                'date': (projection_start + timedelta(days=day)).isoformat(),
             })
 
         return {
