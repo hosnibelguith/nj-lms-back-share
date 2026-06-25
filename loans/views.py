@@ -6,7 +6,7 @@ from rest_framework.response import Response
 
 from django.utils import timezone
 from django.utils.dateparse import parse_date
-from django.db.models import Q, Sum, Count
+from django.db.models import Q, Sum, Count, F
 from django.db.models.functions import TruncDate
 
 from banking.models import BankAccount
@@ -493,21 +493,43 @@ class LoanViewSet(viewsets.ModelViewSet):
                 .order_by('date')
             )
 
-        funded_series = FundedPayment.objects.filter(status='completed') \
-            .annotate(date=TruncDate('completed_at')) \
+        funded_payments = FundedPayment.objects.all()
+        collected_payments = Payment.objects.all()
+        nsf_payments = Payment.objects.filter(
+            status='nsf',
+            processed_at__isnull=False,
+        )
+        sent_payments = Payment.objects.all()
+
+        if date_from:
+            funded_payments = funded_payments.filter(initiated_at__date__gte=date_from)
+            collected_payments = collected_payments.filter(scheduled_date__gte=date_from)
+            nsf_payments = nsf_payments.filter(processed_at__date__gte=date_from)
+            sent_payments = sent_payments.filter(created_at__date__gte=date_from)
+        if date_to:
+            funded_payments = funded_payments.filter(initiated_at__date__lte=date_to)
+            collected_payments = collected_payments.filter(scheduled_date__lte=date_to)
+            nsf_payments = nsf_payments.filter(processed_at__date__lte=date_to)
+            sent_payments = sent_payments.filter(created_at__date__lte=date_to)
+
+        sent_payments_count = sent_payments.count()
+        nsf_payments_count = nsf_payments.count()
+        nsf_ratio = round((nsf_payments_count / sent_payments_count) * 100, 2) if sent_payments_count else 0
+
+        funded_series = funded_payments \
+            .annotate(date=TruncDate('initiated_at')) \
             .values('date') \
             .annotate(value=Sum('amount')) \
             .order_by('date')
 
-        collected_series = Payment.objects.filter(status='completed') \
-            .annotate(date=TruncDate('processed_at')) \
-            .values('date') \
+        collected_series = collected_payments \
+            .values(date=F('scheduled_date')) \
             .annotate(value=Sum('amount')) \
             .order_by('date')
 
         totals = {
-            "funded_payments_amount": str(FundedPayment.objects.aggregate(total=Sum('amount'))['total'] or 0),
-            "collected_payments_amount": str(Payment.objects.aggregate(total=Sum('amount'))['total'] or 0),
+            "funded_payments_amount": str(funded_payments.aggregate(total=Sum('amount'))['total'] or 0),
+            "collected_payments_amount": str(collected_payments.aggregate(total=Sum('amount'))['total'] or 0),
             "approved_loans_count": events.filter(event_type__in=['ai_approved', 'human_approved']).count(),
             "declined_loans_count": events.filter(event_type__in=['ai_declined', 'human_declined']).count(),
             "funded_loans_count": events.filter(event_type='funded').count(),
@@ -516,9 +538,9 @@ class LoanViewSet(viewsets.ModelViewSet):
             "reactivated_loans_count": events.filter(event_type='reactivated').count(),
             "current_active_loans_count": Loan.objects.filter(is_active=True).count(),
             "current_defaulted_loans_count": Loan.objects.filter(is_active=False).count(),
-            "nsf_payments_count": Payment.objects.filter(status='nsf').count(),
-            "sent_payments_count": Payment.objects.count(),
-            "nsf_ratio": 0,
+            "nsf_payments_count": nsf_payments_count,
+            "sent_payments_count": sent_payments_count,
+            "nsf_ratio": nsf_ratio,
         }
 
         return Response({

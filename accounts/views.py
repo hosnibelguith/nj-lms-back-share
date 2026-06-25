@@ -341,20 +341,6 @@ class CustomerViewSet(viewsets.ModelViewSet):
         serializer = CustomerLoanDetailSerializer(loans, many=True)
         return Response(serializer.data)
 
-    @action(detail=True, methods=['post'])
-    def block(self, request, pk=None):
-        customer = self.get_object()
-        customer.status = 'blocked'
-        customer.save(update_fields=['status', 'updated_at'])
-        return Response({'message': 'Customer blocked'})
-    
-    @action(detail=True, methods=['post'])
-    def unblock(self, request, pk=None):
-        customer = self.get_object()
-        customer.status = 'active'
-        customer.save(update_fields=['status', 'updated_at'])
-        return Response({'message': 'Customer unblocked'})
-
 
 # --- Customer Portal Views ---
 

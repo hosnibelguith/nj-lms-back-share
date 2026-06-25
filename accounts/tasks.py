@@ -47,29 +47,13 @@ def send_welcome_email(customer_id: str):
 @shared_task
 def cleanup_inactive_customers():
     """
-    Mark customers as inactive if they have no active loans
-    and no activity in the last 2 years.
+    Legacy no-op.
+
+    Customer statuses no longer include an inactive state. Future business
+    rules should decide how customers move between business statuses.
     """
-    from .models import Customer
-    from django.db.models import Q, Max
-    
-    two_years_ago = timezone.now() - timedelta(days=730)
-    
-    # Find customers with no recent activity
-    inactive_customers = Customer.objects.filter(
-        status='active'
-    ).exclude(
-        loans__status__in=['active', 'funded', 'pending']
-    ).annotate(
-        last_activity=Max('activities__created_at')
-    ).filter(
-        Q(last_activity__lt=two_years_ago) | Q(last_activity__isnull=True)
-    )
-    
-    count = inactive_customers.update(status='inactive')
-    logger.info(f"Marked {count} customers as inactive")
-    
-    return count
+    logger.info("Skipped inactive customer cleanup; inactive status is no longer supported")
+    return 0
 
 
 @shared_task

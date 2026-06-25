@@ -222,7 +222,6 @@ class CustomerApplySerializer(serializers.Serializer):
             date_of_birth=validated_data['date_of_birth'],
             requested_loan_amount=validated_data['requested_loan_amount'],
             onboarding_stage='banking_verification',
-            status='pending',
             phone_verified=True,
             phone_verified_at=timezone.now(),
             references_completed=False,
@@ -380,7 +379,6 @@ class CustomerSignupVerifyPhoneSerializer(serializers.Serializer):
                     date_of_birth=date.fromisoformat(data['date_of_birth']),
                     requested_loan_amount=Decimal(data['requested_loan_amount']),
                     onboarding_stage='banking_verification',
-                    status='pending',
                     phone_verified=True,
                     phone_verified_at=timezone.now(),
                     references_completed=False,
@@ -788,4 +786,4 @@ class ApiIntegrationsSerializer(serializers.Serializer):
                 GlobalSetting.objects.update_or_create(
                     key=key,
                     defaults={'value': data[field]}
-                )
+                )

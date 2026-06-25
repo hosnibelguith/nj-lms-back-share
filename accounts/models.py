@@ -102,10 +102,10 @@ class Customer(models.Model):
     ]
     
     STATUS_CHOICES = [
-        ('pending', 'Pending'),
         ('active', 'Active'),
-        ('inactive', 'Inactive'),
-        ('blocked', 'Blocked'),
+        ('collections', 'Collections'),
+        ('renewals', 'Renewals'),
+        ('refinances', 'Refinances'),
     ]
 
     ONBOARDING_STAGE_CHOICES = [
@@ -282,4 +282,4 @@ class GlobalSetting(models.Model):
         try:
             return cls.objects.get(key=key).value
         except cls.DoesNotExist:
-            return default
+            return default
