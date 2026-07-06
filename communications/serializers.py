@@ -3,6 +3,31 @@ from rest_framework import serializers
 from .models import Communication, CommunicationTemplate
 
 
+class CommunicationHistorySerializer(serializers.ModelSerializer):
+    """PRD-shaped serializer for communication history."""
+    sender = serializers.SerializerMethodField()
+    recipient = serializers.SerializerMethodField()
+    timestamp = serializers.DateTimeField(source='created_at', read_only=True)
+    body = serializers.CharField(source='content', read_only=True)
+
+    class Meta:
+        model = Communication
+        fields = [
+            'id', 'type', 'subject', 'sender', 'recipient',
+            'status', 'timestamp', 'body'
+        ]
+
+    def get_sender(self, obj):
+        if obj.type == 'email':
+            return obj.from_address
+        return obj.from_phone
+
+    def get_recipient(self, obj):
+        if obj.type == 'email':
+            return obj.to_address
+        return obj.to_phone
+
+
 class CommunicationSerializer(serializers.ModelSerializer):
     """Serializer for communications."""
     type_display = serializers.CharField(source='get_type_display', read_only=True)
@@ -45,6 +70,15 @@ class SendEmailSerializer(serializers.Serializer):
     content = serializers.CharField()
     html_content = serializers.CharField(required=False)
     template_id = serializers.UUIDField(required=False)
+
+
+class SendCommunicationEmailSerializer(serializers.Serializer):
+    """PRD-shaped serializer for sending an email from the communications tab."""
+    customer_id = serializers.UUIDField(required=False)
+    recipient = serializers.EmailField()
+    subject = serializers.CharField(max_length=500)
+    body = serializers.CharField()
+    loan_id = serializers.UUIDField(required=False)
 
 
 class SendSMSSerializer(serializers.Serializer):

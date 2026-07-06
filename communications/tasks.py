@@ -52,37 +52,24 @@ def send_email(self, communication_id: str):
 
 def _send_email_via_provider(to: str, subject: str, content: str, html_content: str = None):
     """
-    Send email via the configured provider.
+    Send email via Django's configured email backend.
     Returns (success: bool, external_id: str, error: str)
-    
-    Note: This is a placeholder. Replace with actual email provider integration.
     """
-    # In production, integrate with SendGrid, SES, etc.
-    # Example with SendGrid:
-    """
-    from sendgrid import SendGridAPIClient
-    from sendgrid.helpers.mail import Mail
-    
-    message = Mail(
-        from_email=settings.DEFAULT_FROM_EMAIL,
-        to_emails=to,
-        subject=subject,
-        plain_text_content=content,
-        html_content=html_content
-    )
-    
+    from django.core.mail import EmailMultiAlternatives
+
     try:
-        sg = SendGridAPIClient(settings.SENDGRID_API_KEY)
-        response = sg.send(message)
-        return True, response.headers.get('X-Message-Id'), None
+        message = EmailMultiAlternatives(
+            subject=subject,
+            body=content,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[to],
+        )
+        if html_content:
+            message.attach_alternative(html_content, "text/html")
+        message.send(fail_silently=False)
+        return True, None, None
     except Exception as e:
         return False, None, str(e)
-    """
-    
-    # For now, simulate success
-    import uuid
-    logger.info(f"Would send email to {to}: {subject}")
-    return True, f"email-{uuid.uuid4()}", None
 
 
 @shared_task(bind=True, max_retries=3)

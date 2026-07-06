@@ -4,13 +4,16 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.db.models import Q
+from django.conf import settings
+from email.utils import parseaddr
 from .models import Communication, CommunicationTemplate
 from .serializers import (
     CommunicationSerializer, CommunicationListSerializer,
     SendEmailSerializer, SendSMSSerializer,
-    CommunicationTemplateSerializer, PreviewTemplateSerializer
+    CommunicationTemplateSerializer, PreviewTemplateSerializer,
+    CommunicationHistorySerializer, SendCommunicationEmailSerializer
 )
-from .tasks import send_email, send_sms
+from .tasks import send_email as send_email_task, send_sms
 
 
 class CommunicationViewSet(viewsets.ModelViewSet):
@@ -60,6 +63,86 @@ class CommunicationViewSet(viewsets.ModelViewSet):
             )
         
         return queryset
+
+    @action(detail=False, methods=['get'])
+    def history(self, request):
+        """Return latest communication history in the PRD response shape."""
+        queryset = self.get_queryset()
+        limit = request.query_params.get('limit')
+
+        if limit:
+            try:
+                limit = min(int(limit), 200)
+                queryset = queryset[:limit]
+            except ValueError:
+                pass
+
+        return Response(CommunicationHistorySerializer(queryset, many=True).data)
+
+    @action(detail=False, methods=['post'])
+    def send(self, request):
+        """Send an email using Django's configured SMTP backend."""
+        serializer = SendCommunicationEmailSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        from accounts.models import Customer
+
+        customer = None
+        customer_id = data.get('customer_id')
+        if customer_id:
+            customer = Customer.objects.filter(id=customer_id).first()
+        if customer is None:
+            customer = Customer.objects.filter(email__iexact=data['recipient']).first()
+        if customer is None:
+            return Response(
+                {'success': False, 'message': 'Customer not found.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        communication = Communication.objects.create(
+            customer=customer,
+            loan_id=data.get('loan_id'),
+            type='email',
+            direction='outbound',
+            subject=data['subject'],
+            from_address=parseaddr(settings.DEFAULT_FROM_EMAIL)[1] or settings.EMAIL_HOST_USER,
+            to_address=data['recipient'],
+            content=data['body'],
+            status='pending',
+            created_by=request.user
+        )
+
+        try:
+            send_email_task(str(communication.id))
+            communication.refresh_from_db()
+            if communication.status == 'sent':
+                from activity.models import ActivityHistory
+                ActivityHistory.objects.create(
+                    customer=customer,
+                    loan_id=data.get('loan_id'),
+                    type='email_sent',
+                    title='Email Sent',
+                    description=f'Email sent: {data["subject"]}',
+                    created_by=str(request.user.id)
+                )
+                return Response({
+                    'success': True,
+                    'message': 'Email sent successfully.'
+                })
+
+            return Response(
+                {'success': False, 'message': 'Unable to send email.'},
+                status=status.HTTP_502_BAD_GATEWAY
+            )
+        except Exception as exc:
+            communication.status = 'failed'
+            communication.error_message = str(exc)
+            communication.save(update_fields=['status', 'error_message'])
+            return Response(
+                {'success': False, 'message': 'Unable to send email.'},
+                status=status.HTTP_502_BAD_GATEWAY
+            )
     
     @action(detail=False, methods=['post'])
     def send_email(self, request):
@@ -96,7 +179,7 @@ class CommunicationViewSet(viewsets.ModelViewSet):
         )
         
         # Queue email task
-        send_email.delay(str(communication.id))
+        send_email_task.delay(str(communication.id))
         
         # Log activity
         from activity.models import ActivityHistory

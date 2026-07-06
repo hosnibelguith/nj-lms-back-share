@@ -10,6 +10,4 @@ router.register(r'templates', views.CommunicationTemplateViewSet, basename='comm
 urlpatterns = [
     path('', include(router.urls)),
     path('webhooks/twilio/', views.TwilioWebhookView.as_view(), name='twilio-webhook'),
-    path('send-email/', views.SendEmailView.as_view(), name='send-email'),
-    path('send-sms/', views.SendSMSView.as_view(), name='send-sms'),
 ]

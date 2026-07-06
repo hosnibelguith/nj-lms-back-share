@@ -12,6 +12,7 @@ class Communication(models.Model):
     TYPE_CHOICES = [
         ('email', 'Email'),
         ('sms', 'SMS'),
+        ('notification', 'Notification'),
     ]
     
     DIRECTION_CHOICES = [
@@ -26,6 +27,12 @@ class Communication(models.Model):
         ('read', 'Read'),
         ('failed', 'Failed'),
         ('bounced', 'Bounced'),
+    ]
+
+    INCOMING_STATUS_CHOICES = [
+        ('new', 'New'),
+        ('unanswered', 'Unanswered'),
+        ('read', 'Read'),
     ]
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -42,7 +49,7 @@ class Communication(models.Model):
         related_name='communications'
     )
     
-    type = models.CharField(max_length=10, choices=TYPE_CHOICES)
+    type = models.CharField(max_length=20, choices=TYPE_CHOICES)
     direction = models.CharField(max_length=10, choices=DIRECTION_CHOICES)
     
     # Email specific
@@ -62,12 +69,21 @@ class Communication(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     external_id = models.CharField(max_length=255, blank=True, null=True, help_text="Twilio/SendGrid message ID")
     error_message = models.TextField(blank=True, null=True)
+    incoming_status = models.CharField(
+        max_length=20,
+        choices=INCOMING_STATUS_CHOICES,
+        default='new',
+        db_index=True,
+    )
+    is_answered = models.BooleanField(default=False, db_index=True)
     
     # Timestamps
     sent_at = models.DateTimeField(null=True, blank=True)
     delivered_at = models.DateTimeField(null=True, blank=True)
     read_at = models.DateTimeField(null=True, blank=True)
+    opened_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    opened_by = models.EmailField(blank=True, null=True)
     
     # Metadata
     template_name = models.CharField(max_length=100, blank=True, null=True)
