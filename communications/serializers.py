@@ -13,19 +13,20 @@ class CommunicationHistorySerializer(serializers.ModelSerializer):
     class Meta:
         model = Communication
         fields = [
-            'id', 'type', 'subject', 'sender', 'recipient',
-            'status', 'timestamp', 'body'
+            'id', 'type', 'direction', 'subject', 'sender', 'recipient',
+            'status', 'incoming_status', 'is_answered', 'opened_at',
+            'opened_by', 'timestamp', 'body'
         ]
 
     def get_sender(self, obj):
         if obj.type == 'email':
             return obj.from_address
-        return obj.from_phone
+        return obj.from_phone or obj.from_address
 
     def get_recipient(self, obj):
         if obj.type == 'email':
             return obj.to_address
-        return obj.to_phone
+        return obj.to_phone or obj.to_address
 
 
 class CommunicationSerializer(serializers.ModelSerializer):
@@ -42,8 +43,8 @@ class CommunicationSerializer(serializers.ModelSerializer):
             'type', 'type_display', 'direction', 'direction_display',
             'subject', 'from_address', 'to_address', 'from_phone', 'to_phone',
             'content', 'html_content', 'status', 'status_display',
-            'external_id', 'error_message',
-            'sent_at', 'delivered_at', 'read_at', 'created_at',
+            'external_id', 'error_message', 'incoming_status', 'is_answered',
+            'sent_at', 'delivered_at', 'read_at', 'opened_at', 'opened_by', 'created_at',
             'template_name', 'created_by'
         ]
         read_only_fields = ['id', 'created_at']

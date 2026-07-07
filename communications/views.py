@@ -5,6 +5,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.db.models import Q
 from django.conf import settings
+from django.utils import timezone
 from email.utils import parseaddr
 from .models import Communication, CommunicationTemplate
 from .serializers import (
@@ -78,6 +79,51 @@ class CommunicationViewSet(viewsets.ModelViewSet):
                 pass
 
         return Response(CommunicationHistorySerializer(queryset, many=True).data)
+
+    @action(detail=False, methods=['get'])
+    def incoming(self, request):
+        """Return new/unanswered inbound emails and notifications."""
+        queryset = self.get_queryset().filter(
+            direction='inbound',
+            type__in=['email', 'notification'],
+            incoming_status__in=['new', 'unanswered'],
+            is_answered=False,
+        )
+        limit = request.query_params.get('limit')
+
+        if limit:
+            try:
+                limit = min(int(limit), 200)
+                queryset = queryset[:limit]
+            except ValueError:
+                pass
+
+        return Response(CommunicationHistorySerializer(queryset, many=True).data)
+
+    @action(detail=True, methods=['post'], url_path='mark-opened')
+    def mark_opened(self, request, pk=None):
+        """Mark an inbound communication as read/opened by the current user."""
+        communication = self.get_object()
+
+        if communication.direction != 'inbound':
+            return Response(
+                {'error': 'Only inbound communications can be marked opened.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        update_fields = []
+        if communication.incoming_status == 'new':
+            communication.incoming_status = 'unanswered'
+            update_fields.append('incoming_status')
+
+        if not communication.opened_at:
+            communication.opened_at = timezone.now()
+            communication.opened_by = getattr(request.user, 'email', '') or None
+            update_fields.extend(['opened_at', 'opened_by'])
+
+        if update_fields:
+            communication.save(update_fields=update_fields)
+        return Response(CommunicationHistorySerializer(communication).data)
 
     @action(detail=False, methods=['post'])
     def send(self, request):
