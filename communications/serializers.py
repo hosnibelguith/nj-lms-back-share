@@ -5,6 +5,7 @@ from .models import Communication, CommunicationTemplate
 
 class CommunicationHistorySerializer(serializers.ModelSerializer):
     """PRD-shaped serializer for communication history."""
+    customer_name = serializers.CharField(source='customer.full_name', read_only=True)
     sender = serializers.SerializerMethodField()
     recipient = serializers.SerializerMethodField()
     timestamp = serializers.DateTimeField(source='created_at', read_only=True)
@@ -13,9 +14,9 @@ class CommunicationHistorySerializer(serializers.ModelSerializer):
     class Meta:
         model = Communication
         fields = [
-            'id', 'type', 'direction', 'subject', 'sender', 'recipient',
-            'status', 'incoming_status', 'is_answered', 'opened_at',
-            'opened_by', 'timestamp', 'body'
+            'id', 'customer', 'customer_name', 'type', 'direction',
+            'subject', 'sender', 'recipient', 'status', 'incoming_status',
+            'is_answered', 'opened_at', 'opened_by', 'timestamp', 'body'
         ]
 
     def get_sender(self, obj):
@@ -80,6 +81,11 @@ class SendCommunicationEmailSerializer(serializers.Serializer):
     subject = serializers.CharField(max_length=500)
     body = serializers.CharField()
     loan_id = serializers.UUIDField(required=False)
+
+
+class ReplyCommunicationSerializer(serializers.Serializer):
+    """Serializer for replying to an inbound communication."""
+    body = serializers.CharField()
 
 
 class SendSMSSerializer(serializers.Serializer):

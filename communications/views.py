@@ -12,7 +12,8 @@ from .serializers import (
     CommunicationSerializer, CommunicationListSerializer,
     SendEmailSerializer, SendSMSSerializer,
     CommunicationTemplateSerializer, PreviewTemplateSerializer,
-    CommunicationHistorySerializer, SendCommunicationEmailSerializer
+    CommunicationHistorySerializer, SendCommunicationEmailSerializer,
+    ReplyCommunicationSerializer
 )
 from .tasks import send_email as send_email_task, send_sms
 
@@ -82,11 +83,31 @@ class CommunicationViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def incoming(self, request):
-        """Return new/unanswered inbound emails and notifications."""
+        """Return unanswered inbound emails for the Incoming Comms section."""
         queryset = self.get_queryset().filter(
             direction='inbound',
-            type__in=['email', 'notification'],
-            incoming_status__in=['new', 'unanswered'],
+            type='email',
+            incoming_status='unanswered',
+            is_answered=False,
+        )
+        limit = request.query_params.get('limit')
+
+        if limit:
+            try:
+                limit = min(int(limit), 200)
+                queryset = queryset[:limit]
+            except ValueError:
+                pass
+
+        return Response(CommunicationHistorySerializer(queryset, many=True).data)
+
+    @action(detail=False, methods=['get'], url_path='new-incoming')
+    def new_incoming(self, request):
+        """Return new inbound emails for the dashboard notification bar."""
+        queryset = self.get_queryset().filter(
+            direction='inbound',
+            type='email',
+            incoming_status='new',
             is_answered=False,
         )
         limit = request.query_params.get('limit')
@@ -124,6 +145,76 @@ class CommunicationViewSet(viewsets.ModelViewSet):
         if update_fields:
             communication.save(update_fields=update_fields)
         return Response(CommunicationHistorySerializer(communication).data)
+
+    @action(detail=True, methods=['post'])
+    def reply(self, request, pk=None):
+        """Reply to an unanswered inbound email and mark it answered on success."""
+        communication = self.get_object()
+        serializer = ReplyCommunicationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        if communication.direction != 'inbound' or communication.type != 'email':
+            return Response(
+                {'success': False, 'message': 'Only inbound emails can be replied to.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if communication.is_answered:
+            return Response(
+                {'success': False, 'message': 'This email has already been answered.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if not communication.from_address:
+            return Response(
+                {'success': False, 'message': 'Incoming email has no reply address.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        subject = communication.subject or ''
+        reply_subject = subject if subject.lower().startswith('re:') else f'Re: {subject or "No subject"}'
+
+        reply_communication = Communication.objects.create(
+            customer=communication.customer,
+            loan=communication.loan,
+            type='email',
+            direction='outbound',
+            subject=reply_subject,
+            from_address=parseaddr(settings.DEFAULT_FROM_EMAIL)[1] or settings.EMAIL_HOST_USER,
+            to_address=communication.from_address,
+            content=serializer.validated_data['body'],
+            status='pending',
+            created_by=request.user
+        )
+
+        try:
+            send_email_task(str(reply_communication.id))
+            reply_communication.refresh_from_db()
+            if reply_communication.status != 'sent':
+                return Response(
+                    {'success': False, 'message': 'Unable to send reply.'},
+                    status=status.HTTP_502_BAD_GATEWAY
+                )
+
+            update_fields = ['is_answered', 'incoming_status']
+            communication.is_answered = True
+            communication.incoming_status = 'read'
+            if not communication.opened_at:
+                communication.opened_at = timezone.now()
+                communication.opened_by = getattr(request.user, 'email', '') or None
+                update_fields.extend(['opened_at', 'opened_by'])
+            communication.save(update_fields=update_fields)
+
+            return Response({
+                'success': True,
+                'message': 'Reply sent successfully.'
+            })
+        except Exception as exc:
+            reply_communication.status = 'failed'
+            reply_communication.error_message = str(exc)
+            reply_communication.save(update_fields=['status', 'error_message'])
+            return Response(
+                {'success': False, 'message': 'Unable to send reply.'},
+                status=status.HTTP_502_BAD_GATEWAY
+            )
 
     @action(detail=False, methods=['post'])
     def send(self, request):
