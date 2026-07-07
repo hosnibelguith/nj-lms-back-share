@@ -16,7 +16,8 @@ class CommunicationHistorySerializer(serializers.ModelSerializer):
         fields = [
             'id', 'customer', 'customer_name', 'type', 'direction',
             'subject', 'sender', 'recipient', 'status', 'incoming_status',
-            'is_answered', 'opened_at', 'opened_by', 'timestamp', 'body'
+            'is_answered', 'opened_at', 'opened_by', 'error_message',
+            'timestamp', 'body'
         ]
 
     def get_sender(self, obj):
