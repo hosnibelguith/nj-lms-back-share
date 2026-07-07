@@ -101,6 +101,25 @@ class CommunicationViewSet(viewsets.ModelViewSet):
 
         return Response(CommunicationHistorySerializer(queryset, many=True).data)
 
+    @action(detail=False, methods=['get'], url_path='email-summary')
+    def email_summary(self, request):
+        """Return database-backed email counts for dashboard headers."""
+        queryset = self.get_queryset().filter(type='email')
+        inbound_unanswered = queryset.filter(
+            direction='inbound',
+            is_answered=False,
+            incoming_status__in=['new', 'unanswered'],
+        )
+
+        return Response({
+            'total_count': queryset.count(),
+            'unanswered_count': inbound_unanswered.count(),
+            'new_count': inbound_unanswered.filter(incoming_status='new').count(),
+            'opened_unanswered_count': inbound_unanswered.filter(
+                incoming_status='unanswered'
+            ).count(),
+        })
+
     @action(detail=False, methods=['get'], url_path='new-incoming')
     def new_incoming(self, request):
         """Return new inbound emails for the dashboard notification bar."""
@@ -133,7 +152,7 @@ class CommunicationViewSet(viewsets.ModelViewSet):
             )
 
         update_fields = []
-        if communication.incoming_status == 'new':
+        if not communication.is_answered and communication.incoming_status != 'unanswered':
             communication.incoming_status = 'unanswered'
             update_fields.append('incoming_status')
 
@@ -268,8 +287,13 @@ class CommunicationViewSet(viewsets.ModelViewSet):
                     'message': 'Email sent successfully.'
                 })
 
+            error_message = communication.error_message or 'SMTP provider did not accept the email.'
             return Response(
-                {'success': False, 'message': 'Unable to send email.'},
+                {
+                    'success': False,
+                    'message': 'Unable to send email.',
+                    'error': error_message,
+                },
                 status=status.HTTP_502_BAD_GATEWAY
             )
         except Exception as exc:
@@ -277,7 +301,11 @@ class CommunicationViewSet(viewsets.ModelViewSet):
             communication.error_message = str(exc)
             communication.save(update_fields=['status', 'error_message'])
             return Response(
-                {'success': False, 'message': 'Unable to send email.'},
+                {
+                    'success': False,
+                    'message': 'Unable to send email.',
+                    'error': str(exc),
+                },
                 status=status.HTTP_502_BAD_GATEWAY
             )
     
