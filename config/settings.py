@@ -291,6 +291,18 @@ EMAIL_USE_SSL = os.environ.get("EMAIL_USE_SSL", "False").lower() == "true"
 EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
 DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "noreply@lendstack.com")
+INBOUND_EMAIL_PROVIDER = os.environ.get("INBOUND_EMAIL_PROVIDER", "graph")
+INBOUND_EMAIL_HOST = os.environ.get("INBOUND_EMAIL_HOST", "outlook.office365.com")
+INBOUND_EMAIL_PORT = int(os.environ.get("INBOUND_EMAIL_PORT", "993"))
+INBOUND_EMAIL_USER = os.environ.get("INBOUND_EMAIL_USER", EMAIL_HOST_USER)
+INBOUND_EMAIL_PASSWORD = os.environ.get("INBOUND_EMAIL_PASSWORD", EMAIL_HOST_PASSWORD)
+INBOUND_EMAIL_MAILBOX = os.environ.get("INBOUND_EMAIL_MAILBOX", "INBOX")
+INBOUND_EMAIL_POLL_ENABLED = os.environ.get("INBOUND_EMAIL_POLL_ENABLED", "False").lower() == "true"
+INBOUND_EMAIL_POLL_LIMIT = int(os.environ.get("INBOUND_EMAIL_POLL_LIMIT", "50"))
+GRAPH_TENANT_ID = os.environ.get("GRAPH_TENANT_ID", "")
+GRAPH_CLIENT_ID = os.environ.get("GRAPH_CLIENT_ID", "")
+GRAPH_CLIENT_SECRET = os.environ.get("GRAPH_CLIENT_SECRET", "")
+GRAPH_MAILBOX = os.environ.get("GRAPH_MAILBOX", INBOUND_EMAIL_USER)
 # -------------------------------------------------------------------
 # Twilio
 # -------------------------------------------------------------------

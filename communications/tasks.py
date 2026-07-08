@@ -72,6 +72,25 @@ def _send_email_via_provider(to: str, subject: str, content: str, html_content: 
         return False, None, str(e)
 
 
+@shared_task
+def poll_inbound_email():
+    """
+    Poll configured inbound email inbox and store matched customer emails.
+    """
+    if not getattr(settings, "INBOUND_EMAIL_POLL_ENABLED", False):
+        logger.info("Inbound email polling disabled.")
+        return {
+            "skipped": True,
+            "reason": "INBOUND_EMAIL_POLL_ENABLED is false",
+        }
+
+    from .services.inbound_email import poll_configured_inbound_emails
+
+    result = poll_configured_inbound_emails(limit=settings.INBOUND_EMAIL_POLL_LIMIT)
+    logger.info("Inbound email poll result: %s", result.as_dict())
+    return result.as_dict()
+
+
 @shared_task(bind=True, max_retries=3)
 def send_sms(self, communication_id: str):
     """

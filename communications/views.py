@@ -208,8 +208,13 @@ class CommunicationViewSet(viewsets.ModelViewSet):
             send_email_task(str(reply_communication.id))
             reply_communication.refresh_from_db()
             if reply_communication.status != 'sent':
+                error_message = reply_communication.error_message or 'SMTP provider did not accept the reply.'
                 return Response(
-                    {'success': False, 'message': 'Unable to send reply.'},
+                    {
+                        'success': False,
+                        'message': 'Unable to send reply.',
+                        'error': error_message,
+                    },
                     status=status.HTTP_502_BAD_GATEWAY
                 )
 
@@ -231,7 +236,11 @@ class CommunicationViewSet(viewsets.ModelViewSet):
             reply_communication.error_message = str(exc)
             reply_communication.save(update_fields=['status', 'error_message'])
             return Response(
-                {'success': False, 'message': 'Unable to send reply.'},
+                {
+                    'success': False,
+                    'message': 'Unable to send reply.',
+                    'error': str(exc),
+                },
                 status=status.HTTP_502_BAD_GATEWAY
             )
 

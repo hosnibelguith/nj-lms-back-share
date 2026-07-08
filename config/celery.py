@@ -43,6 +43,12 @@ app.conf.beat_schedule = {
         'task': 'loans.tasks.process_collection_settlements',
         'schedule': crontab(hour=12, minute=0),
     },
+
+    # Poll inbound customer emails every 5 minutes when enabled
+    'poll-inbound-email': {
+        'task': 'communications.tasks.poll_inbound_email',
+        'schedule': crontab(minute='*/5'),
+    },
     
     # Check for expired contracts daily at midnight
     'check-expired-contracts': {
