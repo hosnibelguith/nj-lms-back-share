@@ -38,7 +38,9 @@ class Communication(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     customer = models.ForeignKey(
         Customer,
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name='communications'
     )
     loan = models.ForeignKey(
@@ -76,6 +78,7 @@ class Communication(models.Model):
         db_index=True,
     )
     is_answered = models.BooleanField(default=False, db_index=True)
+    is_unknown_sender = models.BooleanField(default=False, db_index=True)
     
     # Timestamps
     sent_at = models.DateTimeField(null=True, blank=True)
@@ -100,7 +103,8 @@ class Communication(models.Model):
         ordering = ['-created_at']
     
     def __str__(self):
-        return f"{self.type} to {self.customer} - {self.status}"
+        recipient = self.customer or self.to_address or self.to_phone or "unknown"
+        return f"{self.type} to {recipient} - {self.status}"
 
 
 class CommunicationTemplate(models.Model):

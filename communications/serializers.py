@@ -5,7 +5,7 @@ from .models import Communication, CommunicationTemplate
 
 class CommunicationHistorySerializer(serializers.ModelSerializer):
     """PRD-shaped serializer for communication history."""
-    customer_name = serializers.CharField(source='customer.full_name', read_only=True)
+    customer_name = serializers.SerializerMethodField()
     sender = serializers.SerializerMethodField()
     recipient = serializers.SerializerMethodField()
     timestamp = serializers.DateTimeField(source='created_at', read_only=True)
@@ -16,9 +16,16 @@ class CommunicationHistorySerializer(serializers.ModelSerializer):
         fields = [
             'id', 'customer', 'customer_name', 'type', 'direction',
             'subject', 'sender', 'recipient', 'status', 'incoming_status',
-            'is_answered', 'opened_at', 'opened_by', 'error_message',
+            'is_answered', 'is_unknown_sender', 'opened_at', 'opened_by', 'error_message',
             'timestamp', 'body'
         ]
+
+    def get_customer_name(self, obj):
+        if obj.customer:
+            return obj.customer.full_name
+        if obj.is_unknown_sender:
+            return 'User not found'
+        return None
 
     def get_sender(self, obj):
         if obj.type == 'email':
@@ -36,7 +43,7 @@ class CommunicationSerializer(serializers.ModelSerializer):
     type_display = serializers.CharField(source='get_type_display', read_only=True)
     direction_display = serializers.CharField(source='get_direction_display', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
-    customer_name = serializers.CharField(source='customer.full_name', read_only=True)
+    customer_name = serializers.SerializerMethodField()
     
     class Meta:
         model = Communication
@@ -45,23 +52,37 @@ class CommunicationSerializer(serializers.ModelSerializer):
             'type', 'type_display', 'direction', 'direction_display',
             'subject', 'from_address', 'to_address', 'from_phone', 'to_phone',
             'content', 'html_content', 'status', 'status_display',
-            'external_id', 'error_message', 'incoming_status', 'is_answered',
+            'external_id', 'error_message', 'incoming_status', 'is_answered', 'is_unknown_sender',
             'sent_at', 'delivered_at', 'read_at', 'opened_at', 'opened_by', 'created_at',
             'template_name', 'created_by'
         ]
         read_only_fields = ['id', 'created_at']
 
+    def get_customer_name(self, obj):
+        if obj.customer:
+            return obj.customer.full_name
+        if obj.is_unknown_sender:
+            return 'User not found'
+        return None
+
 
 class CommunicationListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for communication lists."""
-    customer_name = serializers.CharField(source='customer.full_name', read_only=True)
+    customer_name = serializers.SerializerMethodField()
     
     class Meta:
         model = Communication
         fields = [
             'id', 'customer', 'customer_name', 'loan',
-            'type', 'direction', 'subject', 'status', 'created_at'
+            'type', 'direction', 'subject', 'status', 'is_unknown_sender', 'created_at'
         ]
+
+    def get_customer_name(self, obj):
+        if obj.customer:
+            return obj.customer.full_name
+        if obj.is_unknown_sender:
+            return 'User not found'
+        return None
 
 
 class SendEmailSerializer(serializers.Serializer):

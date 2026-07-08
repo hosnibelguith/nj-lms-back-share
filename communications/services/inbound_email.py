@@ -40,6 +40,7 @@ class InboundEmailPollResult:
     created: int = 0
     duplicates: int = 0
     skipped_unknown_customer: int = 0
+    created_unknown_sender: int = 0
     skipped_missing_sender: int = 0
     errors: int = 0
 
@@ -49,6 +50,7 @@ class InboundEmailPollResult:
             "created": self.created,
             "duplicates": self.duplicates,
             "skipped_unknown_customer": self.skipped_unknown_customer,
+            "created_unknown_sender": self.created_unknown_sender,
             "skipped_missing_sender": self.skipped_missing_sender,
             "errors": self.errors,
         }
@@ -102,7 +104,7 @@ def _get_message_body(message):
             else:
                 text_body = decoded.strip()
 
-    return text_body or html_body or "(No message body)", html_body or None
+    return text_body or html_to_text(html_body) or "(No message body)", html_body or None
 
 
 def _message_external_id(message, uid):
@@ -126,9 +128,7 @@ def _create_inbound_communication(
         return "missing_sender"
 
     customer = Customer.objects.filter(email__iexact=sender_email).first()
-    if not customer:
-        logger.info("Skipping inbound email from unknown sender: %s", sender_email)
-        return "unknown_customer"
+    is_unknown_sender = customer is None
 
     if Communication.objects.filter(
         type="email",
@@ -151,15 +151,19 @@ def _create_inbound_communication(
             external_id=external_id,
             incoming_status="new",
             is_answered=False,
+            is_unknown_sender=is_unknown_sender,
         )
     except IntegrityError:
         return "duplicate"
 
-    return "created"
+    return "created_unknown_sender" if is_unknown_sender else "created"
 
 
 def _record_result(result, outcome):
     if outcome == "created":
+        result.created += 1
+    elif outcome == "created_unknown_sender":
+        result.created_unknown_sender += 1
         result.created += 1
     elif outcome == "duplicate":
         result.duplicates += 1
@@ -291,8 +295,8 @@ def poll_inbound_emails(limit=50, mailbox=None, mark_seen=True):
     """
     Poll unread IMAP emails and create inbound Communication rows.
 
-    Unknown senders are intentionally left unread so they can be handled once a
-    matching customer exists or a future unknown-sender workflow is added.
+    Unknown senders are saved with a flag so staff can still see and reply to
+    them from the global Emails page.
     """
     result = InboundEmailPollResult()
     mailbox_name = mailbox or settings.INBOUND_EMAIL_MAILBOX
