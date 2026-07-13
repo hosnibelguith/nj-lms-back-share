@@ -766,6 +766,8 @@ class ApiIntegrationsSerializer(serializers.Serializer):
     zum_api_key = serializers.CharField(required=False, allow_blank=True)
     zum_webhook_secret = serializers.CharField(required=False, allow_blank=True)
     webhook_url = serializers.CharField(required=False, allow_blank=True)
+    email = serializers.CharField(required=False, allow_blank=True)
+    password = serializers.CharField(required=False, allow_blank=True)
 
     def save(self):
         from .models import GlobalSetting
@@ -779,6 +781,8 @@ class ApiIntegrationsSerializer(serializers.Serializer):
             'zum_api_key': 'ZUMRAILS_API_KEY',
             'zum_webhook_secret': 'ZUMRAILS_WEBHOOK_SECRET',
             'webhook_url': 'WEBHOOK_URL',
+            'email': 'EMAIL_HOST_USER',
+            'password': 'EMAIL_HOST_PASSWORD',
         }
 
         for field, key in mapping.items():

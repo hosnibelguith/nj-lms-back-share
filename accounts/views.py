@@ -50,6 +50,8 @@ class ApiIntegrationsView(APIView):
             'ZUMRAILS_API_KEY': 'zum_api_key',
             'ZUMRAILS_WEBHOOK_SECRET': 'zum_webhook_secret',
             'WEBHOOK_URL': 'webhook_url',
+            'EMAIL_HOST_USER': 'email',
+            'EMAIL_HOST_PASSWORD': 'password',
         }
         
         data = {}

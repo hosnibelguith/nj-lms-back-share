@@ -55,14 +55,19 @@ def _send_email_via_provider(to: str, subject: str, content: str, html_content: 
     Send email via Django's configured email backend.
     Returns (success: bool, external_id: str, error: str)
     """
-    from django.core.mail import EmailMultiAlternatives
+    from django.core.mail import EmailMultiAlternatives, get_connection
+    from accounts.models import GlobalSetting
 
     try:
+        username = GlobalSetting.get_value("EMAIL_HOST_USER", settings.EMAIL_HOST_USER) or None
+        password = GlobalSetting.get_value("EMAIL_HOST_PASSWORD", settings.EMAIL_HOST_PASSWORD) or None
+        connection = get_connection(username=username, password=password)
         message = EmailMultiAlternatives(
             subject=subject,
             body=content,
-            from_email=settings.DEFAULT_FROM_EMAIL,
+            from_email=settings.DEFAULT_FROM_EMAIL or username,
             to=[to],
+            connection=connection,
         )
         if html_content:
             message.attach_alternative(html_content, "text/html")
