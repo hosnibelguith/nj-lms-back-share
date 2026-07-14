@@ -315,6 +315,10 @@ DEV_OTP_CODE = os.environ.get("DEV_OTP_CODE", "123456" if DEBUG else "")
 # -------------------------------------------------------------------
 # Flinks
 # -------------------------------------------------------------------
+FLINKS_IFRAME_URL = os.environ.get(
+    "FLINKS_IFRAME_URL",
+    "https://alphaloans-ca-iframe.private.fin.ag/v2/?demo=false&tag=mohawk",
+)
 FLINKS_INSTANCE = os.environ.get("FLINKS_INSTANCE", "alphaloans-ca")
 FLINKS_CUSTOMER_ID = os.environ.get("FLINKS_CUSTOMER_ID", "855a21f3-976d-430f-9162-f5d2254b0bad")
 FLINKS_SECRET_KEY_CA = os.environ.get("FLINKS_SECRET_KEY_CA", "")
