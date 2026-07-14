@@ -73,6 +73,8 @@ class BankAccount(models.Model):
     account_number = models.CharField(max_length=20, blank=True, null=True)
 
     is_primary = models.BooleanField(default=False)
+    use_for_eft_funding = models.BooleanField(default=False)
+    use_for_eft_collections = models.BooleanField(default=False)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -138,3 +140,64 @@ class FinancialAnalysisReport(models.Model):
 
     def __str__(self):
         return f"Financial Report - {self.customer.full_name}"
+
+
+class BankingAnalysisEvent(models.Model):
+    """Idempotent Mohawk banking-analysis webhook receipt (schema v1.0)."""
+
+    STATUS_CHOICES = [
+        ('accepted', 'Accepted'),
+        ('exception', 'Exception'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    event_id = models.CharField(max_length=255, unique=True, db_index=True)
+    event = models.CharField(max_length=100)
+    schema_version = models.CharField(max_length=20, blank=True, default='')
+    report_id = models.BigIntegerField(null=True, blank=True)
+    login_id = models.CharField(max_length=255, db_index=True, blank=True, default='')
+    tag = models.CharField(max_length=100, blank=True, default='')
+
+    connection = models.ForeignKey(
+        BankConnection,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='analysis_events',
+    )
+    customer = models.ForeignKey(
+        Customer,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='banking_analysis_events',
+    )
+    primary_account = models.ForeignKey(
+        BankAccount,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='analysis_events',
+    )
+
+    decision_1 = models.JSONField(default=dict, blank=True)
+    decision_2 = models.JSONField(default=dict, blank=True)
+    primary_bank_account = models.JSONField(default=dict, blank=True)
+    report = models.JSONField(default=dict, blank=True)
+    final_report_text = models.TextField(blank=True, default='')
+    source_transactions = models.JSONField(default=list, blank=True)
+    raw_payload = models.JSONField(default=dict, blank=True)
+
+    analysis_created_at = models.DateTimeField(null=True, blank=True)
+    generated_at = models.DateTimeField(null=True, blank=True)
+    processing_status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='accepted')
+    eft_setup_incomplete = models.BooleanField(default=False)
+    exception_note = models.TextField(blank=True, default='')
+    received_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'banking_bankinganalysisevent'
+        ordering = ['-received_at']
+
+    def __str__(self):
+        return f"{self.event_id} ({self.login_id})"

@@ -171,3 +171,112 @@ class BankingConnectTests(TestCase):
         self.customer_a.refresh_from_db()
         self.assertEqual(connection.sync_status, 'synced')
         self.assertTrue(self.customer_a.banking_verified)
+
+
+@override_settings(
+    MOHAWK_BANKING_ANALYSIS_API_KEY='test-mohawk-key',
+)
+class MohawkBankingAnalysisWebhookTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.login_id = 'full-stack-test-login'
+        self.user = User.objects.create_user(
+            email='mohawk-webhook@example.com',
+            password='password123',
+            full_name='Mohawk Customer',
+            user_type='customer',
+        )
+        self.customer = Customer.objects.create(
+            portal_user=self.user,
+            first_name='Mohawk',
+            last_name='Customer',
+            email='mohawk-webhook@example.com',
+            phone='4165550099',
+            phone_normalized='4165550099',
+            province='ON',
+            status='pending',
+            onboarding_stage='banking_verification',
+        )
+        self.connection = BankConnection.objects.create(
+            customer=self.customer,
+            login_id=self.login_id,
+            provider='flinks',
+            is_active=True,
+            sync_status='synced',
+        )
+        self.first_account = BankAccount.objects.create(
+            connection=self.connection,
+            customer=self.customer,
+            external_id='acct-621',
+            name='Unsupported 621',
+            type='checking',
+            institution_number='621',
+            transit_number='11111',
+            account_number='1111111',
+            is_primary=True,
+        )
+        self.second_account = BankAccount.objects.create(
+            connection=self.connection,
+            customer=self.customer,
+            external_id='acct-primary',
+            name='Operational Chequing',
+            type='checking',
+            institution_number='001',
+            transit_number='12345',
+            account_number='1234567',
+            is_primary=False,
+        )
+
+    def _payload(self, event_id='lendstack-mohawk-analysis-test-1'):
+        return {
+            'schema_version': '1.0',
+            'event': 'banking_analysis.completed',
+            'event_id': event_id,
+            'report_id': 4821,
+            'login_id': self.login_id,
+            'tag': 'Mohawk',
+            'decision_1': {'decision': 'APPROVE', 'reason': 'ok', 'approved_terms': 'N/A', 'repayment_suggestions': 'N/A'},
+            'decision_2': {'decision': 'APPROVE', 'reason': None},
+            'primary_bank_account': {
+                'institution_number': '001',
+                'transit_number': '12345',
+                'account_number': '1234567',
+            },
+            'report': {'affordability': {'status': 'PASS'}},
+            'final_report_text': '**FINAL DECISION: APPROVE**',
+            'source_transactions': [],
+        }
+
+    def _post(self, payload, api_key='test-mohawk-key'):
+        return self.client.post(
+            '/api/integrations/mohawk/banking-analysis/',
+            payload,
+            format='json',
+            HTTP_AUTHORIZATION=f'Token {api_key}',
+            HTTP_X_EVENT_ID=payload.get('event_id', ''),
+        )
+
+    def test_rejects_invalid_api_key(self):
+        response = self._post(self._payload(), api_key='bad-key')
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.data['error'], 'invalid_api_key')
+
+    def test_sets_primary_eft_account_and_is_idempotent(self):
+        payload = self._payload()
+        first = self._post(payload)
+        self.assertEqual(first.status_code, 201, first.data)
+        self.assertFalse(first.data['duplicate'])
+
+        self.first_account.refresh_from_db()
+        self.second_account.refresh_from_db()
+        self.assertFalse(self.first_account.is_primary)
+        self.assertFalse(self.first_account.use_for_eft_funding)
+        self.assertTrue(self.second_account.is_primary)
+        self.assertTrue(self.second_account.use_for_eft_funding)
+        self.assertTrue(self.second_account.use_for_eft_collections)
+
+        second = self._post(payload)
+        self.assertEqual(second.status_code, 200, second.data)
+        self.assertTrue(second.data['duplicate'])
+        from banking.models import BankingAnalysisEvent
+        self.assertEqual(BankingAnalysisEvent.objects.filter(event_id=payload['event_id']).count(), 1)

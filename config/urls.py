@@ -14,6 +14,7 @@ from banking.views import (
     FinancialAnalysisReportViewSet, FlinksWebhookView, ConnectBankView,
     CustomerPortalBankingStatusView, CustomerPortalBankAccountsView
 )
+from banking.webhooks import MohawkBankingAnalysisWebhookView
 from loans.views import FundingMethodRecommendationViewSet, LoanViewSet, PaymentViewSet
 from loans.webhooks import ZumRailsWebhookView
 from contracts.views import ContractViewSet, ContractTemplateViewSet
@@ -68,6 +69,11 @@ urlpatterns = [
     path('api/webhooks/flinks/', FlinksWebhookView.as_view(), name='flinks-webhook'),
     path('api/webhooks/twilio/', TwilioWebhookView.as_view(), name='twilio-webhook'),
     path('api/webhooks/zumrails/', ZumRailsWebhookView.as_view(), name='zumrails-webhook'),
+    path(
+        'api/integrations/mohawk/banking-analysis/',
+        MohawkBankingAnalysisWebhookView.as_view(),
+        name='mohawk-banking-analysis-webhook',
+    ),
     
     # Health check for Heroku
     path('health/', lambda r: __import__('django.http', fromlist=['JsonResponse']).JsonResponse({'status': 'ok'}), name='health'),

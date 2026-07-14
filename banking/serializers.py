@@ -31,6 +31,8 @@ class BankAccountSerializer(serializers.ModelSerializer):
             'institution_number',
             'account_number',
             'is_primary',
+            'use_for_eft_funding',
+            'use_for_eft_collections',
             'connection',
             'transactions',
         ]
