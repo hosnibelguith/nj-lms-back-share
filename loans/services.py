@@ -431,6 +431,38 @@ class LoanService:
         # Apply payment to loan balance
         loan.apply_payment(amount)
         return payment
+
+    @staticmethod
+    @transaction.atomic
+    def rebuild_payment_schedule(loan: Loan) -> list:
+        """
+        Replace unprocessed scheduled payments so the calendar matches
+        the loan's current total_amount (e.g. after a partial approve).
+        """
+        Payment.objects.filter(loan=loan, status='scheduled').delete()
+
+        total = LoanService.money(loan.total_amount or loan.principal or Decimal('0.00'))
+        if total <= 0:
+            return []
+
+        formula = loan.formula or LoanService.get_formula_for_amount(loan.principal or total)
+        first_date = LoanService.get_demo_first_payment_date()
+
+        if formula:
+            num_payments = max(1, int(formula.default_number_of_payments or 1))
+            frequency_days = int(formula.default_frequency_days or 14)
+        else:
+            num_payments = 1
+            frequency_days = 14
+
+        payment_amount = LoanService.money(total / Decimal(num_payments))
+        return LoanService.generate_payment_schedule(
+            loan=loan,
+            num_payments=num_payments,
+            payment_amount=payment_amount,
+            start_date=first_date,
+            frequency_days=frequency_days,
+        )
     
     @staticmethod
     @transaction.atomic
