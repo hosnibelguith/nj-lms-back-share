@@ -142,8 +142,8 @@ def consume_handoff_token(raw_token: str) -> tuple[Customer, dict[str, str]]:
         raise ValueError("Invalid handoff token.") from exc
 
     handoff = (
-        ArriveHandoffToken.objects.select_related("customer", "customer__portal_user")
-        .select_for_update()
+        ArriveHandoffToken.objects.select_for_update()
+        .select_related("customer")
         .filter(token=token_uuid)
         .first()
     )
