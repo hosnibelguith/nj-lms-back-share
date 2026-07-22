@@ -343,6 +343,23 @@ AWS_STORAGE_BUCKET_NAME = os.environ.get("AWS_STORAGE_BUCKET_NAME", "lendstack-f
 AWS_S3_REGION_NAME = os.environ.get("AWS_S3_REGION_NAME", "ca-central-1")
 
 
+ARRIVE_API_KEY = os.environ.get("ARRIVE_API_KEY", "")
+ARRIVE_WEBHOOK_URL = os.environ.get(
+    "ARRIVE_WEBHOOK_URL",
+    "https://app.arrivecard.ca/api/webhooks/lendstack/decision/",
+)
+ARRIVE_WEBHOOK_SECRET = os.environ.get("ARRIVE_WEBHOOK_SECRET", "")
+ARRIVE_PORTAL_BASE_URL = os.environ.get(
+    "ARRIVE_PORTAL_BASE_URL",
+    os.environ.get("FRONTEND_URL", "http://localhost:3000"),
+)
+ARRIVE_FRAME_ANCESTORS = env_list(
+    "ARRIVE_FRAME_ANCESTORS",
+    "https://app.arrivecard.ca",
+)
+ARRIVE_HANDOFF_TOKEN_TTL_SECONDS = int(os.environ.get("ARRIVE_HANDOFF_TOKEN_TTL_SECONDS", "1800"))
+
+
 # -------------------------------------------------------------------
 # Frontend URL
 # -------------------------------------------------------------------

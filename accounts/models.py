@@ -168,6 +168,35 @@ class Customer(models.Model):
         blank=True,
     )
 
+    SOURCE_ORGANIC = 'organic'
+    SOURCE_ARRIVE = 'arrive'
+    SOURCE_CHOICES = [
+        (SOURCE_ORGANIC, 'Organic'),
+        (SOURCE_ARRIVE, 'Arrive'),
+    ]
+    source = models.CharField(
+        max_length=20,
+        choices=SOURCE_CHOICES,
+        default=SOURCE_ORGANIC,
+        db_index=True,
+    )
+    arrive_application_id = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        unique=True,
+        db_index=True,
+    )
+    arrive_zum_user_id = models.CharField(max_length=100, blank=True, null=True, db_index=True)
+    arrive_zum_user_card_id = models.CharField(max_length=100, blank=True, null=True)
+    arrive_event_id = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        unique=True,
+        db_index=True,
+    )
+
     job_place_name = models.CharField(max_length=255, blank=True, null=True)
     supervisor_name = models.CharField(max_length=255, blank=True, null=True)
     supervisor_phone = models.CharField(max_length=20, blank=True, null=True)
@@ -283,3 +312,34 @@ class GlobalSetting(models.Model):
             return cls.objects.get(key=key).value
         except cls.DoesNotExist:
             return default
+
+
+class ArriveHandoffToken(models.Model):
+    """One-time SSO token for Arrive iframe handoff into the customer portal."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    customer = models.ForeignKey(
+        Customer,
+        on_delete=models.CASCADE,
+        related_name='arrive_handoff_tokens',
+    )
+    token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False, db_index=True)
+    expires_at = models.DateTimeField(db_index=True)
+    consumed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'accounts_arrive_handoff_token'
+        ordering = ['-created_at']
+
+    @property
+    def is_expired(self):
+        return timezone.now() >= self.expires_at
+
+    @property
+    def is_consumed(self):
+        return self.consumed_at is not None
+
+    def mark_consumed(self):
+        self.consumed_at = timezone.now()
+        self.save(update_fields=['consumed_at'])

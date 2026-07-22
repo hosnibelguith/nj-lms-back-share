@@ -227,6 +227,8 @@ class LoanService:
             return existing_loan
 
         principal = customer.requested_loan_amount or Decimal('0.00')
+        if not isinstance(principal, Decimal):
+            principal = Decimal(str(principal))
         formula = LoanService.get_formula_for_amount(principal)
 
         if formula:
@@ -289,6 +291,9 @@ class LoanService:
             loan.notes = ((loan.notes or '') + f"\n{notes}").strip()
             loan.save(update_fields=['notes', 'updated_at'])
 
+        from accounts.arrive_integration import queue_decision_webhook
+        queue_decision_webhook(loan, 'approved')
+
         return loan
     
     @staticmethod
@@ -298,6 +303,10 @@ class LoanService:
             raise ValueError(f"Cannot decline loan in status: {loan.status}")
 
         loan.decline(reason=reason, user=declined_by, source=source)
+
+        from accounts.arrive_integration import queue_decision_webhook
+        queue_decision_webhook(loan, 'declined')
+
         return loan
     
     @staticmethod

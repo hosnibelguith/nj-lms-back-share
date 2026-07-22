@@ -170,3 +170,22 @@ def send_email_otp_task(self, email: str, code: str):
     except Exception as e:
         logger.error(f"Error sending OTP email: {e}")
         raise self.retry(exc=e, countdown=60)
+
+
+@shared_task(bind=True, max_retries=5, default_retry_delay=30)
+def send_arrive_decision_webhook_task(self, loan_id: str, decision: str):
+    from accounts.arrive_integration import deliver_decision_webhook
+
+    try:
+        ok = deliver_decision_webhook(loan_id, decision)
+        if not ok:
+            raise RuntimeError(f"Arrive webhook delivery failed for loan {loan_id}")
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Arrive webhook attempt failed loan=%s decision=%s retry=%s",
+            loan_id,
+            decision,
+            self.request.retries,
+        )
+        raise self.retry(exc=exc, countdown=min(300, 30 * (2 ** self.request.retries)))

@@ -50,6 +50,10 @@ class ApiIntegrationsView(APIView):
             'ZUMRAILS_API_KEY': 'zum_api_key',
             'ZUMRAILS_WEBHOOK_SECRET': 'zum_webhook_secret',
             'WEBHOOK_URL': 'webhook_url',
+            'ARRIVE_API_KEY': 'arrive_api_key',
+            'ARRIVE_WEBHOOK_URL': 'arrive_webhook_url',
+            'ARRIVE_WEBHOOK_SECRET': 'arrive_webhook_secret',
+            'ARRIVE_PORTAL_BASE_URL': 'arrive_portal_base_url',
             'EMAIL_HOST_USER': 'email',
             'EMAIL_HOST_PASSWORD': 'password',
         }
@@ -205,6 +209,14 @@ class RefreshTokenView(APIView):
     
     def post(self, request):
         refresh_token = request.COOKIES.get(settings.AUTH_COOKIE_REFRESH)
+        if not refresh_token and isinstance(request.data, dict):
+            refresh_token = request.data.get('refresh')
+        if not refresh_token:
+            auth_header = request.headers.get('Authorization') or ''
+            parts = auth_header.split(None, 1)
+            if len(parts) == 2 and parts[0].lower() == 'bearer':
+                refresh_token = parts[1].strip()
+
         if not refresh_token:
             return Response(
                 {'error': 'Refresh token required'},
@@ -218,8 +230,12 @@ class RefreshTokenView(APIView):
             access_token = serializer.validated_data['access']
             new_refresh_token = serializer.validated_data.get('refresh', refresh_token)
 
-            response = Response({'message': 'Token refreshed'})
-            return set_auth_cookies(request, response, access_token, new_refresh_token)
+            response = Response({
+                'message': 'Token refreshed',
+                'access': access_token,
+                'refresh': str(new_refresh_token),
+            })
+            return set_auth_cookies(request, response, access_token, str(new_refresh_token))
         except Exception:
             response = Response(
                 {'error': 'Invalid refresh token'},

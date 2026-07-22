@@ -2,6 +2,11 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from . import views
+from .arrive_views import (
+    ArriveCreateLeadView,
+    ArriveHandoffExchangeView,
+    ArrivePortalSessionView,
+)
 
 router = DefaultRouter()
 router.register(r'users', views.UserViewSet, basename='user')
@@ -67,5 +72,11 @@ urlpatterns = [
         name='customer-portal-run-analysis',
     ),
     path('portal/me/integrations/', views.ApiIntegrationsView.as_view(), name='api-integrations'),
+    path('portal/arrive/handoff/', ArriveHandoffExchangeView.as_view(), name='arrive-handoff-exchange'),
+    path('integrations/arrive/leads/', ArriveCreateLeadView.as_view(), name='arrive-create-lead'),
+    path(
+        'integrations/arrive/portal-session/',
+        ArrivePortalSessionView.as_view(),
+        name='arrive-portal-session',
+    ),
 ]
-

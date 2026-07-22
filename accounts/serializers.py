@@ -88,6 +88,11 @@ class CustomerSerializer(serializers.ModelSerializer):
             'full_address',
             'status',
             'status_display',
+            'source',
+            'arrive_application_id',
+            'arrive_zum_user_id',
+            'arrive_zum_user_card_id',
+            'arrive_event_id',
             'onboarding_stage',
             'onboarding_stage_display',
             'banking_verified',
@@ -110,6 +115,11 @@ class CustomerSerializer(serializers.ModelSerializer):
             'full_address',
             'flinks_email',
             'flinks_name',
+            'source',
+            'arrive_application_id',
+            'arrive_zum_user_id',
+            'arrive_zum_user_card_id',
+            'arrive_event_id',
             'created_at',
             'updated_at',
             'loan_count',
@@ -766,6 +776,10 @@ class ApiIntegrationsSerializer(serializers.Serializer):
     zum_api_key = serializers.CharField(required=False, allow_blank=True)
     zum_webhook_secret = serializers.CharField(required=False, allow_blank=True)
     webhook_url = serializers.CharField(required=False, allow_blank=True)
+    arrive_api_key = serializers.CharField(required=False, allow_blank=True)
+    arrive_webhook_url = serializers.CharField(required=False, allow_blank=True)
+    arrive_webhook_secret = serializers.CharField(required=False, allow_blank=True)
+    arrive_portal_base_url = serializers.CharField(required=False, allow_blank=True)
     email = serializers.CharField(required=False, allow_blank=True)
     password = serializers.CharField(required=False, allow_blank=True)
 
@@ -781,6 +795,10 @@ class ApiIntegrationsSerializer(serializers.Serializer):
             'zum_api_key': 'ZUMRAILS_API_KEY',
             'zum_webhook_secret': 'ZUMRAILS_WEBHOOK_SECRET',
             'webhook_url': 'WEBHOOK_URL',
+            'arrive_api_key': 'ARRIVE_API_KEY',
+            'arrive_webhook_url': 'ARRIVE_WEBHOOK_URL',
+            'arrive_webhook_secret': 'ARRIVE_WEBHOOK_SECRET',
+            'arrive_portal_base_url': 'ARRIVE_PORTAL_BASE_URL',
             'email': 'EMAIL_HOST_USER',
             'password': 'EMAIL_HOST_PASSWORD',
         }

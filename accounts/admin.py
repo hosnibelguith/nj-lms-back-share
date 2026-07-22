@@ -50,8 +50,50 @@ class UserAdmin(BaseUserAdmin):
 
 @admin.register(Customer)
 class CustomerAdmin(admin.ModelAdmin):
-    list_display = ("full_name", "email", "phone", "province", "status", "created_at")
-    list_filter = ("status", "province", "created_at")
-    search_fields = ("first_name", "last_name", "email", "phone")
+    list_display = ("full_name", "email", "phone", "province", "status", "source", "created_at")
+    list_filter = ("status", "province", "source", "created_at")
+    search_fields = (
+        "first_name",
+        "last_name",
+        "email",
+        "phone",
+        "arrive_application_id",
+        "arrive_zum_user_id",
+        "arrive_event_id",
+    )
     ordering = ("-created_at",)
     readonly_fields = ("id", "created_at", "updated_at")
+    fieldsets = (
+        (None, {
+            "fields": (
+                "id",
+                "portal_user",
+                "first_name",
+                "last_name",
+                "email",
+                "phone",
+                "phone_normalized",
+                "status",
+                "source",
+            ),
+        }),
+        ("Arrive linkage", {
+            "fields": (
+                "arrive_application_id",
+                "arrive_zum_user_id",
+                "arrive_zum_user_card_id",
+                "arrive_event_id",
+            ),
+        }),
+        ("Onboarding", {
+            "fields": (
+                "onboarding_stage",
+                "banking_verified",
+                "references_completed",
+                "contract_completed",
+                "phone_verified",
+                "requested_loan_amount",
+            ),
+        }),
+        ("Timestamps", {"fields": ("created_at", "updated_at")}),
+    )
