@@ -55,10 +55,13 @@ class Command(BaseCommand):
             if options["approved_amount"] is not None:
                 amount = Decimal(str(options["approved_amount"]))
                 loan.principal = amount
-                fee = loan.fee or Decimal("0")
-                loan.total_amount = amount + fee
-                loan.balance = loan.total_amount
-                loan.save(update_fields=["principal", "total_amount", "balance", "updated_at"])
+                # Keep fee at 0 for partial Arrive QA approvals so totals match approved_amount.
+                loan.fee = Decimal("0.00")
+                loan.total_amount = amount
+                loan.balance = amount
+                loan.save(
+                    update_fields=["principal", "fee", "total_amount", "balance", "updated_at"]
+                )
                 self.stdout.write(f"SET_APPROVED_AMOUNT principal={loan.principal} total={loan.total_amount}")
 
             # Contract-signed apps land in pending; still allow pending_signature by moving to pending.
