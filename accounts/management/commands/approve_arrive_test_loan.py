@@ -55,14 +55,15 @@ class Command(BaseCommand):
             if options["approved_amount"] is not None:
                 amount = Decimal(str(options["approved_amount"]))
                 loan.principal = amount
-                # Keep fee at 0 for partial Arrive QA approvals so totals match approved_amount.
-                loan.fee = Decimal("0.00")
-                loan.total_amount = amount
-                loan.balance = amount
-                loan.save(
-                    update_fields=["principal", "fee", "total_amount", "balance", "updated_at"]
+                loan.save(update_fields=["principal", "updated_at"])
+                # Reprice fee/total/calendar from LoanFormula (brokerage + daily interest).
+                # Keep principal as the Arrive approved_amount / card fund amount.
+                LoanService.rebuild_payment_schedule(loan, reprice=True)
+                loan.refresh_from_db()
+                self.stdout.write(
+                    f"SET_APPROVED_AMOUNT principal={loan.principal} "
+                    f"fee={loan.fee} total={loan.total_amount}"
                 )
-                self.stdout.write(f"SET_APPROVED_AMOUNT principal={loan.principal} total={loan.total_amount}")
 
             # Contract-signed apps land in pending; still allow pending_signature by moving to pending.
             if loan.status == "pending_signature":

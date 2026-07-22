@@ -434,28 +434,68 @@ class LoanService:
 
     @staticmethod
     @transaction.atomic
-    def rebuild_payment_schedule(loan: Loan) -> list:
+    def rebuild_payment_schedule(loan: Loan, *, reprice: bool = True) -> list:
         """
         Replace unprocessed scheduled payments so the calendar matches
-        the loan's current total_amount (e.g. after a partial approve).
+        the loan's current principal.
+
+        When reprice=True (default), apply LoanFormula the same way as
+        create_initial_application:
+          principal + brokerage%  →  subtotal
+          + annual_rate/365 interest over the repayment plan  →  total_amount
+        Then split total_amount across the formula payment count.
         """
         Payment.objects.filter(loan=loan, status='scheduled').delete()
 
-        total = LoanService.money(loan.total_amount or loan.principal or Decimal('0.00'))
-        if total <= 0:
+        principal = LoanService.money(loan.principal or Decimal('0.00'))
+        if principal <= 0:
             return []
 
-        formula = loan.formula or LoanService.get_formula_for_amount(loan.principal or total)
+        formula = LoanService.get_formula_for_amount(principal) or loan.formula
         first_date = LoanService.get_demo_first_payment_date()
 
-        if formula:
+        if reprice and formula:
+            amounts = LoanService.calculate_from_formula(formula, principal)
+            total_amount = LoanService.calculate_schedule_total(
+                principal_balance=amounts['total_amount'],
+                annual_rate_percent=formula.annual_interest_rate,
+                start_date=first_date,
+                num_payments=formula.default_number_of_payments,
+                frequency_days=formula.default_frequency_days,
+            )
+            fee = LoanService.money(total_amount - principal)
+            loan.formula = formula
+            loan.fee = fee
+            loan.total_amount = total_amount
+            loan.balance = total_amount
+            loan.save(
+                update_fields=[
+                    'formula',
+                    'fee',
+                    'total_amount',
+                    'balance',
+                    'updated_at',
+                ]
+            )
+            num_payments = max(1, int(formula.default_number_of_payments or 1))
+            frequency_days = int(formula.default_frequency_days or 14)
+        elif formula:
+            total_amount = LoanService.money(
+                loan.total_amount or loan.principal or Decimal('0.00')
+            )
             num_payments = max(1, int(formula.default_number_of_payments or 1))
             frequency_days = int(formula.default_frequency_days or 14)
         else:
+            total_amount = LoanService.money(
+                loan.total_amount or loan.principal or Decimal('0.00')
+            )
             num_payments = 1
             frequency_days = 14
 
-        payment_amount = LoanService.money(total / Decimal(num_payments))
+        if total_amount <= 0:
+            return []
+
+        payment_amount = LoanService.money(total_amount / Decimal(num_payments))
         return LoanService.generate_payment_schedule(
             loan=loan,
             num_payments=num_payments,
