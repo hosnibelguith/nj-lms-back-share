@@ -51,6 +51,9 @@ class ArriveIntegrationTests(TestCase):
         self.assertIn("application_url", body)
         self.assertEqual(body["status"], "application_in_progress")
         self.assertEqual(body["arrive_application_id"], "arrive-application-uuid")
+        self.assertEqual(body["requested_amount"], "750.00")
+        self.assertIsNone(body["approved_amount"])
+        self.assertEqual(body["currency"], "CAD")
         self.assertTrue(
             body["application_url"].startswith(
                 "https://portal.test/customer/arrive/handoff?token="
@@ -120,6 +123,9 @@ class ArriveIntegrationTests(TestCase):
         self.assertEqual(resume.status_code, 200)
         self.assertIn("portal_embed_url", resume.json())
         self.assertEqual(resume.json()["status"], "application_in_progress")
+        self.assertEqual(resume.json()["requested_amount"], "750.00")
+        self.assertIsNone(resume.json()["approved_amount"])
+        self.assertEqual(resume.json()["currency"], "CAD")
 
     def test_decision_payload_decline_reasons(self):
         user = User(email="x@example.com", full_name="X", user_type="customer")

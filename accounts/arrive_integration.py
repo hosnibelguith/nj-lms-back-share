@@ -319,8 +319,25 @@ def create_or_resume_lead(payload: dict[str, Any]) -> tuple[Customer, Loan, Arri
     return customer, loan, token, created
 
 
-def lead_response_payload(customer: Customer, loan: Loan, token: ArriveHandoffToken) -> dict[str, Any]:
+def amount_fields_for_loan(customer: Customer, loan: Loan) -> dict[str, Any]:
+    """
+    Arrive-facing amounts. Keep requested vs approved separate so partial
+    approvals (e.g. requested 5000, approved 500) stay explicit.
+    """
+    requested = _money(customer.requested_loan_amount or loan.principal)
+    decision = loan_decision_status(loan)
+    approved_amount = None
+    if decision == "approved":
+        approved_amount = f"{_money(loan.principal):.2f}"
     return {
+        "requested_amount": f"{requested:.2f}",
+        "approved_amount": approved_amount,
+        "currency": "CAD",
+    }
+
+
+def lead_response_payload(customer: Customer, loan: Loan, token: ArriveHandoffToken) -> dict[str, Any]:
+    payload = {
         "lendstack_customer_id": str(customer.id),
         "loan_id": str(loan.id),
         "arrive_application_id": customer.arrive_application_id,
@@ -329,6 +346,8 @@ def lead_response_payload(customer: Customer, loan: Loan, token: ArriveHandoffTo
         "expires_at": token.expires_at.isoformat().replace("+00:00", "Z"),
         "status": portal_status_for_loan(loan),
     }
+    payload.update(amount_fields_for_loan(customer, loan))
+    return payload
 
 
 def resume_portal_session(
@@ -358,7 +377,7 @@ def resume_portal_session(
 
     token = mint_handoff_token(customer)
     decision = loan_decision_status(loan)
-    return {
+    payload = {
         "portal_embed_url": build_application_url(token),
         "expires_at": token.expires_at.isoformat().replace("+00:00", "Z"),
         "status": portal_status_for_loan(loan),
@@ -366,6 +385,8 @@ def resume_portal_session(
         "lendstack_customer_id": str(customer.id),
         "loan_id": str(loan.id),
     }
+    payload.update(amount_fields_for_loan(customer, loan))
+    return payload
 
 
 def _decline_reasons(loan: Loan) -> list[str]:
