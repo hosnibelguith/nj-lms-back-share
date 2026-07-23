@@ -176,7 +176,7 @@ def funding_configuration_ready(loan: Loan) -> dict:
         "arrive_external_funding": arrive_loan,
         "recommended_method_override": "card_issuance" if arrive_loan else None,
         "allowed_methods": (
-            ["card_issuance"] if arrive_loan else ["eft", "etransfer", "card_issuance"]
+            ["card_issuance"] if arrive_loan else ["eft", "etransfer"]
         ),
         "blockers": blockers,
     }
@@ -269,9 +269,9 @@ class FundingService:
                 "Arrive loans cannot be funded via EFT / e-Transfer. Use Card Issuance."
             )
         if not arrive_loan and method == "card_issuance":
-            # Allow card_issuance for non-Arrive only when explicitly chosen;
-            # destination/processor rules still apply below for bank methods only.
-            pass
+            raise ValueError(
+                "Card Issuance is only available for Arrive applications. Use EFT or e-Transfer."
+            )
 
         if loan.status == "human_approved" and arrive_loan:
             loan.status = "pending_funding"
