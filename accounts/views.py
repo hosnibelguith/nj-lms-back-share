@@ -760,7 +760,7 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
 
 class CustomerPortalContractPreviewView(CustomerPortalBaseView):
     """
-    Return/create the current demonstrative agreement.
+    Return/create the current loan agreement (rendered with live variables).
     """
 
     def get(self, request):
@@ -799,13 +799,30 @@ class CustomerPortalContractPreviewView(CustomerPortalBaseView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        from contracts.services import AGREEMENT_VERSION, render_loan_agreement
+
         contract, _ = Contract.objects.get_or_create(
             customer=customer,
             loan=loan,
             defaults={
                 'created_by': None,
+                'agreement_version': AGREEMENT_VERSION,
+                'agreement_text': render_loan_agreement(customer, loan),
             },
         )
+
+        # Keep draft agreements fresh with current loan/bank variables.
+        if contract.status != 'signed':
+            rendered = render_loan_agreement(customer, loan)
+            if (
+                contract.agreement_text != rendered
+                or contract.agreement_version != AGREEMENT_VERSION
+            ):
+                contract.agreement_text = rendered
+                contract.agreement_version = AGREEMENT_VERSION
+                contract.save(
+                    update_fields=['agreement_text', 'agreement_version', 'updated_at']
+                )
 
         serializer = ContractSerializer(contract)
 
@@ -848,10 +865,21 @@ class CustomerPortalSignContractView(CustomerPortalBaseView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        from contracts.services import AGREEMENT_VERSION, render_loan_agreement
+
         contract, _ = Contract.objects.get_or_create(
             customer=customer,
             loan=loan,
+            defaults={
+                'agreement_version': AGREEMENT_VERSION,
+                'agreement_text': render_loan_agreement(customer, loan),
+            },
         )
+
+        # Freeze the filled agreement text at signature time.
+        if contract.status != 'signed':
+            contract.agreement_text = render_loan_agreement(customer, loan)
+            contract.agreement_version = AGREEMENT_VERSION
 
         contract.typed_name = serializer.validated_data['typed_name']
         contract.signer_email = customer.email

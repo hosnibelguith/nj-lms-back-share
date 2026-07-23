@@ -18,27 +18,11 @@ class Contract(models.Model):
         ('void', 'Void'),
     ]
 
-    AGREEMENT_VERSION = 'demo-v1'
+    AGREEMENT_VERSION = 'mohawk-arrive-v1'
 
-    DEFAULT_AGREEMENT_TEXT = """
-DEMONSTRATIVE LOAN AGREEMENT
-
-This agreement is a placeholder for demonstration and product testing purposes.
-
-By continuing, you confirm that:
-1. The information you provided in your application is accurate.
-2. You authorize review of your banking information for eligibility assessment.
-3. You understand that submitting this agreement does not guarantee approval or funding.
-4. Final approval, funding, repayment schedule, and legal terms may be confirmed later.
-5. The legal team will replace this text with the final contract language before production use.
-
-DEMONSTRATIVE REPAYMENT SCHEDULE
-
-Requested amount: shown in your portal.
-Estimated fees: shown in your portal.
-Estimated repayment: to be confirmed before funding.
-Payment method: bank account selected during verification.
-"""
+    DEFAULT_AGREEMENT_TEXT = (
+        'Loan agreement content is generated dynamically at preview/sign time.'
+    )
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
