@@ -141,6 +141,14 @@ def funding_destination_snapshot(loan: Loan, method: str, destination: dict | No
     return {"method": "eft", "account": account_dict or {}}
 
 
+def is_arrive_funded_loan(loan: Loan) -> bool:
+    """Arrive funds the card after our decision webhook — never LendStack EFT/EMT."""
+    from accounts.models import Customer
+
+    customer = getattr(loan, "customer", None)
+    return bool(customer and getattr(customer, "source", None) == Customer.SOURCE_ARRIVE)
+
+
 def funding_configuration_ready(loan: Loan) -> dict:
     configured = loan.funding_destination if isinstance(loan.funding_destination, dict) else {}
     emt = configured.get("emt") if isinstance(configured.get("emt"), dict) else {}
@@ -150,19 +158,27 @@ def funding_configuration_ready(loan: Loan) -> dict:
     eft_configured = bool(eft.get("account") or loan.bank_account)
     collections_configured = bool(collections_account)
     blockers = []
+    arrive_funded = is_arrive_funded_loan(loan)
+    if arrive_funded:
+        blockers.append(
+            "Arrive loan: card funding is handled by Arrive after the decision webhook. "
+            "EFT / e-Transfer funding is disabled."
+        )
     if loan.status != "pending_funding":
         blockers.append("Loan is not pending funding.")
     if loan.funded_payments.filter(status__in=["processing", "completed"]).exists():
         blockers.append("Funding already exists for this loan.")
-    if not emt_configured or not eft_configured:
-        blockers.append("Funding destination required.")
-    if not collections_configured:
-        blockers.append("Collections account required.")
+    if not arrive_funded:
+        if not emt_configured or not eft_configured:
+            blockers.append("Funding destination required.")
+        if not collections_configured:
+            blockers.append("Collections account required.")
     return {
         "emt_configured": emt_configured,
         "eft_configured": eft_configured,
         "collections_account_configured": collections_configured,
         "has_active_funding": loan.funded_payments.filter(status__in=["processing", "completed"]).exists(),
+        "arrive_external_funding": arrive_funded,
         "blockers": blockers,
     }
 
@@ -246,8 +262,13 @@ class FundingService:
     @staticmethod
     @transaction.atomic
     def initiate(loan: Loan, *, method: str, schedule_confirmed: bool, user, destination=None, collections_account=None):
-        loan = Loan.objects.select_for_update().get(pk=loan.pk)
+        loan = Loan.objects.select_for_update().select_related("customer").get(pk=loan.pk)
 
+        if is_arrive_funded_loan(loan):
+            raise ValueError(
+                "Arrive loans are funded by Arrive after the decision webhook. "
+                "EFT / e-Transfer funding is disabled."
+            )
         if loan.status != "pending_funding":
             raise ValueError("Only loans pending funding can be funded.")
         if not schedule_confirmed:

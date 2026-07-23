@@ -238,6 +238,18 @@ class LoanViewSet(viewsets.ModelViewSet):
     def fund(self, request, pk=None):
         loan = self.get_object()
 
+        from loans.zumrails import is_arrive_funded_loan
+        if is_arrive_funded_loan(loan):
+            return Response(
+                {
+                    'error': (
+                        'Arrive loans are funded by Arrive after the decision webhook. '
+                        'EFT / e-Transfer funding is disabled.'
+                    )
+                },
+                status=400,
+            )
+
         if loan.status != 'pending_funding':
             return Response({'error': 'Only signed loans can be funded'}, status=400)
 
