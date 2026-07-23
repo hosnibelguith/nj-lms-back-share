@@ -260,6 +260,8 @@ class LoanViewSet(viewsets.ModelViewSet):
         recommended_method = FundingMethodRecommendation.for_date()
         if is_arrive_funded_loan(loan):
             recommended_method = 'card_issuance'
+        elif recommended_method == 'card_issuance':
+            recommended_method = 'eft'
         selected_method = method
         if recommended_method and recommended_method != selected_method:
             if not serializer.validated_data.get('override_confirmed'):
