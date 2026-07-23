@@ -283,7 +283,11 @@ class LoanService:
 
         loan.approve(user=approved_by, source=source)
 
-        if loan.contract_signed_at:
+        customer = loan.customer
+        contract_ready = bool(
+            loan.contract_signed_at or getattr(customer, 'contract_completed', False)
+        )
+        if contract_ready:
             loan.status = 'pending_funding'
             loan.save(update_fields=['status', 'updated_at'])
 
@@ -291,23 +295,8 @@ class LoanService:
             loan.notes = ((loan.notes or '') + f"\n{notes}").strip()
             loan.save(update_fields=['notes', 'updated_at'])
 
-        # Arrive funds the card on their side after the decision webhook.
-        # Mark the LendStack loan funded/active so the portal shows the
-        # final repayment schedule (not an estimate).
-        customer = loan.customer
-        if (
-            getattr(customer, 'source', None) == Customer.SOURCE_ARRIVE
-            and loan.contract_signed_at
-            and loan.status == 'pending_funding'
-            and not loan.funded_at
-        ):
-            LoanService.fund_loan(
-                loan,
-                method='arrive_card',
-                reference=f"ARRIVE-{customer.arrive_application_id or loan.id}",
-                user=approved_by,
-            )
-            loan.refresh_from_db()
+        # Arrive card funding is confirmed by staff via Fund Customer → Card Issuance
+        # (not auto-funded here). EFT/EMT remains for non-Arrive loans.
 
         from accounts.arrive_integration import queue_decision_webhook
         queue_decision_webhook(loan, 'approved')

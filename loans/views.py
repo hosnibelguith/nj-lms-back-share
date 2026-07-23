@@ -239,25 +239,28 @@ class LoanViewSet(viewsets.ModelViewSet):
         loan = self.get_object()
 
         from loans.zumrails import is_arrive_funded_loan
-        if is_arrive_funded_loan(loan):
+        serializer = LoanFundSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        method = serializer.validated_data['method']
+
+        if is_arrive_funded_loan(loan) and method in ('eft', 'etransfer'):
             return Response(
                 {
                     'error': (
-                        'Arrive loans are funded by Arrive after the decision webhook. '
-                        'EFT / e-Transfer funding is disabled.'
+                        'Arrive loans cannot be funded via EFT / e-Transfer. '
+                        'Use Card Issuance.'
                     )
                 },
                 status=400,
             )
 
-        if loan.status != 'pending_funding':
-            return Response({'error': 'Only signed loans can be funded'}, status=400)
-
-        serializer = LoanFundSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        if loan.status not in ('pending_funding', 'human_approved'):
+            return Response({'error': 'Only signed/approved loans can be funded'}, status=400)
 
         recommended_method = FundingMethodRecommendation.for_date()
-        selected_method = serializer.validated_data['method']
+        if is_arrive_funded_loan(loan):
+            recommended_method = 'card_issuance'
+        selected_method = method
         if recommended_method and recommended_method != selected_method:
             if not serializer.validated_data.get('override_confirmed'):
                 return Response({'error': 'Override confirmation required.'}, status=400)
@@ -273,7 +276,7 @@ class LoanViewSet(viewsets.ModelViewSet):
 
             funded_payment = FundingService.initiate(
                 loan=loan,
-                method=serializer.validated_data['method'],
+                method=selected_method,
                 schedule_confirmed=serializer.validated_data['schedule_confirmed'],
                 user=request.user,
                 destination=serializer.validated_data.get('funding_destination') or None,
@@ -297,7 +300,11 @@ class LoanViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'], url_path='funding/options')
     def funding_options(self, request, pk=None):
         loan = self.get_object()
+        from loans.zumrails import is_arrive_funded_loan
+
         recommended_method = FundingMethodRecommendation.for_date()
+        if is_arrive_funded_loan(loan):
+            recommended_method = 'card_issuance'
         collections_account = loan.collections_account or loan.bank_account
         readiness = funding_configuration_ready(loan)
         return Response({
@@ -313,6 +320,19 @@ class LoanViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['patch'], url_path='funding/configuration')
     def configure_funding(self, request, pk=None):
         loan = self.get_object()
+
+        from loans.zumrails import is_arrive_funded_loan
+        # Arrive loans fund via Card Issuance — bank destination config is optional.
+        if is_arrive_funded_loan(loan):
+            readiness = funding_configuration_ready(loan)
+            collections_account = loan.collections_account or loan.bank_account
+            return Response({
+                'loan_id': str(loan.id),
+                'funding_destination': loan.funding_destination,
+                'collections_account': collections_account.id if collections_account else None,
+                **readiness,
+            })
+
         serializer = LoanFundingConfigurationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 

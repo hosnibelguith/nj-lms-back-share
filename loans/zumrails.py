@@ -158,17 +158,12 @@ def funding_configuration_ready(loan: Loan) -> dict:
     eft_configured = bool(eft.get("account") or loan.bank_account)
     collections_configured = bool(collections_account)
     blockers = []
-    arrive_funded = is_arrive_funded_loan(loan)
-    if arrive_funded:
-        blockers.append(
-            "Arrive loan: card funding is handled by Arrive after the decision webhook. "
-            "EFT / e-Transfer funding is disabled."
-        )
-    if loan.status != "pending_funding":
+    arrive_loan = is_arrive_funded_loan(loan)
+    if loan.status not in ("pending_funding", "human_approved"):
         blockers.append("Loan is not pending funding.")
     if loan.funded_payments.filter(status__in=["processing", "completed"]).exists():
         blockers.append("Funding already exists for this loan.")
-    if not arrive_funded:
+    if not arrive_loan:
         if not emt_configured or not eft_configured:
             blockers.append("Funding destination required.")
         if not collections_configured:
@@ -178,7 +173,11 @@ def funding_configuration_ready(loan: Loan) -> dict:
         "eft_configured": eft_configured,
         "collections_account_configured": collections_configured,
         "has_active_funding": loan.funded_payments.filter(status__in=["processing", "completed"]).exists(),
-        "arrive_external_funding": arrive_funded,
+        "arrive_external_funding": arrive_loan,
+        "recommended_method_override": "card_issuance" if arrive_loan else None,
+        "allowed_methods": (
+            ["card_issuance"] if arrive_loan else ["eft", "etransfer", "card_issuance"]
+        ),
         "blockers": blockers,
     }
 
@@ -263,12 +262,21 @@ class FundingService:
     @transaction.atomic
     def initiate(loan: Loan, *, method: str, schedule_confirmed: bool, user, destination=None, collections_account=None):
         loan = Loan.objects.select_for_update().select_related("customer").get(pk=loan.pk)
+        arrive_loan = is_arrive_funded_loan(loan)
 
-        if is_arrive_funded_loan(loan):
+        if arrive_loan and method in ("eft", "etransfer"):
             raise ValueError(
-                "Arrive loans are funded by Arrive after the decision webhook. "
-                "EFT / e-Transfer funding is disabled."
+                "Arrive loans cannot be funded via EFT / e-Transfer. Use Card Issuance."
             )
+        if not arrive_loan and method == "card_issuance":
+            # Allow card_issuance for non-Arrive only when explicitly chosen;
+            # destination/processor rules still apply below for bank methods only.
+            pass
+
+        if loan.status == "human_approved" and arrive_loan:
+            loan.status = "pending_funding"
+            loan.save(update_fields=["status", "updated_at"])
+
         if loan.status != "pending_funding":
             raise ValueError("Only loans pending funding can be funded.")
         if not schedule_confirmed:
@@ -283,8 +291,60 @@ class FundingService:
             raise ValueError("Funding destination required.")
 
         collections_account = collections_account or loan.collections_account or loan.bank_account
-        if not collections_account:
+        if method in ("eft", "etransfer") and not collections_account:
             raise ValueError("Collections account required")
+
+        if method == "card_issuance":
+            destination_snapshot = {
+                "method": "card_issuance",
+                "arrive_application_id": getattr(loan.customer, "arrive_application_id", None),
+                "zum_user_id": getattr(loan.customer, "arrive_zum_user_id", None),
+            }
+            funding = FundedPayment.objects.create(
+                loan=loan,
+                amount=loan.principal,
+                method="card_issuance",
+                status="completed",
+                destination_snapshot=destination_snapshot,
+                collections_account_snapshot=account_snapshot(collections_account) if collections_account else {},
+                initiated_by=user,
+                reference=f"CARD-{loan.customer.arrive_application_id or loan.id}",
+                processor_transaction_id=f"card-issuance-{uuid.uuid4().hex[:12]}",
+                completed_at=timezone.now(),
+                notes="Card issuance funding (Arrive webhook / secured card).",
+            )
+            loan.funding_method = "card_issuance"
+            loan.funding_reference = funding.reference
+            loan.funding_destination = destination_snapshot
+            if collections_account:
+                loan.collections_account = collections_account
+            loan.funding_destination_locked_at = timezone.now()
+            loan.collections_account_locked_at = timezone.now()
+            loan.save(
+                update_fields=[
+                    "funding_method",
+                    "funding_reference",
+                    "funding_destination",
+                    "collections_account",
+                    "funding_destination_locked_at",
+                    "collections_account_locked_at",
+                    "updated_at",
+                ]
+            )
+            loan.mark_funding_completed(
+                method="card_issuance",
+                reference=funding.reference,
+                user=user,
+            )
+            log_activity(
+                loan,
+                "system",
+                "Card Issuance Funding",
+                "Loan marked funded via Card Issuance (no LendStack EFT/EMT).",
+                created_by=getattr(user, "id", "system"),
+                metadata={"funded_payment_id": str(funding.id), "method": "card_issuance"},
+            )
+            return funding
 
         destination_snapshot = funding_destination_snapshot(loan, method, destination)
         if not destination_snapshot or (method == "etransfer" and not destination_snapshot.get("email")):

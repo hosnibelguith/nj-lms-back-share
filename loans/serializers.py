@@ -460,7 +460,7 @@ class LoanDeclineSerializer(serializers.Serializer):
 
 
 class LoanFundSerializer(serializers.Serializer):
-    method = serializers.ChoiceField(choices=['etransfer', 'eft'])
+    method = serializers.ChoiceField(choices=['etransfer', 'eft', 'card_issuance'])
     reference = serializers.CharField(required=False, allow_blank=True, max_length=100)
     funding_destination = serializers.DictField(required=False)
     collections_account_id = serializers.UUIDField(required=False)

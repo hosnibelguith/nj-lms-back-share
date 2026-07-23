@@ -93,6 +93,7 @@ class FundingMethodRecommendation(models.Model):
     METHOD_CHOICES = [
         ('etransfer', 'Interac e-Transfer'),
         ('eft', 'EFT / Direct Deposit'),
+        ('card_issuance', 'Card Issuance'),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -153,6 +154,8 @@ class Loan(models.Model):
     FUNDING_METHOD_CHOICES = [
         ('etransfer', 'Interac e-Transfer'),
         ('eft', 'EFT / Direct Deposit'),
+        ('card_issuance', 'Card Issuance'),
+        ('arrive_card', 'Arrive Card'),
     ]
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -513,6 +516,8 @@ class FundedPayment(models.Model):
     METHOD_CHOICES = [
         ('etransfer', 'Interac e-Transfer'),
         ('eft', 'EFT / Direct Deposit'),
+        ('card_issuance', 'Card Issuance'),
+        ('arrive_card', 'Arrive Card'),
     ]
 
     STATUS_CHOICES = [
