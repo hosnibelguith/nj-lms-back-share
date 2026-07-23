@@ -291,6 +291,24 @@ class LoanService:
             loan.notes = ((loan.notes or '') + f"\n{notes}").strip()
             loan.save(update_fields=['notes', 'updated_at'])
 
+        # Arrive funds the card on their side after the decision webhook.
+        # Mark the LendStack loan funded/active so the portal shows the
+        # final repayment schedule (not an estimate).
+        customer = loan.customer
+        if (
+            getattr(customer, 'source', None) == Customer.SOURCE_ARRIVE
+            and loan.contract_signed_at
+            and loan.status == 'pending_funding'
+            and not loan.funded_at
+        ):
+            LoanService.fund_loan(
+                loan,
+                method='arrive_card',
+                reference=f"ARRIVE-{customer.arrive_application_id or loan.id}",
+                user=approved_by,
+            )
+            loan.refresh_from_db()
+
         from accounts.arrive_integration import queue_decision_webhook
         queue_decision_webhook(loan, 'approved')
 

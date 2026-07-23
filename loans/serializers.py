@@ -275,8 +275,10 @@ class CurrentApplicationSerializer(serializers.ModelSerializer):
 
 class CustomerLoanDetailSerializer(serializers.ModelSerializer):
     amount = serializers.DecimalField(source='total_amount', max_digits=10, decimal_places=2, read_only=True)
-    collectedAmount = serializers.SerializerMethodField()
-    fundedAt = serializers.SerializerMethodField()
+    collected_amount = serializers.SerializerMethodField()
+    collectedAmount = serializers.SerializerMethodField(method_name='get_collected_amount')
+    funded_at = serializers.SerializerMethodField()
+    fundedAt = serializers.SerializerMethodField(method_name='get_funded_at')
     paymentSchedule = CustomerLoanPaymentSerializer(source='payments', many=True, read_only=True)
     type_display = serializers.CharField(source='get_type_display', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
@@ -294,17 +296,19 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
             'principal',
             'fee',
             'balance',
+            'collected_amount',
             'collectedAmount',
+            'funded_at',
             'fundedAt',
             'paymentSchedule',
             'created_at',
             'updated_at',
         ]
 
-    def get_collectedAmount(self, obj):
+    def get_collected_amount(self, obj):
         return max(obj.total_amount - obj.balance, 0)
 
-    def get_fundedAt(self, obj):
+    def get_funded_at(self, obj):
         return obj.funded_at.isoformat() if obj.funded_at else None
 
 
