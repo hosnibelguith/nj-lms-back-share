@@ -1,7 +1,10 @@
+import logging
+
 from rest_framework import permissions, status, viewsets
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from .logging_utils import mask_identifier
 from .models import BankConnection, BankAccount, BankTransaction, FinancialAnalysisReport
 from .serializers import (
     BankConnectionSerializer,
@@ -11,6 +14,8 @@ from .serializers import (
     CustomerPortalBankingStatusSerializer,
 )
 from .tasks import fetch_flinks_accounts_only
+
+logger = logging.getLogger(__name__)
 
 
 class StaffOnlyPermission(permissions.BasePermission):
@@ -43,9 +48,18 @@ class ConnectBankView(CustomerPortalBaseView):
         login_id = request.data.get('login_id')
 
         if not login_id:
+            logger.warning(
+                'Flinks connect rejected: missing login_id user_id=%s',
+                getattr(request.user, 'id', None),
+            )
             return Response({"error": "Login ID is required"}, status=status.HTTP_400_BAD_REQUEST)
 
         customer = self.get_customer(request)
+        logger.info(
+            'Flinks connect received customer_id=%s login_id=%s',
+            customer.id,
+            mask_identifier(login_id),
+        )
         
         BankConnection.objects.filter(customer=customer, is_active=True).update(is_active=False)
 
@@ -58,6 +72,12 @@ class ConnectBankView(CustomerPortalBaseView):
         )
 
         fetch_flinks_accounts_only.delay(str(connection.id))
+        logger.info(
+            'Flinks sync task queued customer_id=%s connection_id=%s login_id=%s',
+            customer.id,
+            connection.id,
+            mask_identifier(login_id),
+        )
 
         return Response({
             "message": "Bank connected successfully. Syncing data...",
@@ -162,4 +182,5 @@ class FlinksWebhookView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
+        logger.info('Legacy Flinks webhook received keys=%s', sorted(request.data.keys()))
         return Response({"message": "Webhook received"}, status=status.HTTP_200_OK)

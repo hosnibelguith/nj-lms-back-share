@@ -1,3 +1,4 @@
+import logging
 import secrets
 from datetime import datetime
 
@@ -14,6 +15,9 @@ from .models import (
     BankingAnalysisEvent,
     FinancialAnalysisReport,
 )
+from .logging_utils import mask_identifier
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_bearer_token(authorization_header: str | None) -> str | None:
@@ -157,6 +161,12 @@ def process_banking_analysis_payload(payload: dict):
 
     existing = BankingAnalysisEvent.objects.filter(event_id=event_id).first()
     if existing:
+        logger.info(
+            'Banking analysis webhook duplicate event_id=%s login_id=%s tag=%s',
+            event_id,
+            mask_identifier(existing.login_id),
+            existing.tag,
+        )
         return existing, True
 
     login_id = payload.get('login_id')
@@ -177,6 +187,13 @@ def process_banking_analysis_payload(payload: dict):
             .order_by('-is_active', '-created_at')
             .first()
         )
+    logger.info(
+        'Banking analysis webhook processing event_id=%s login_id=%s tag=%s matched_connection=%s',
+        event_id,
+        mask_identifier(login_id),
+        payload.get('tag') or '',
+        bool(connection),
+    )
 
     eft_incomplete = not _coords_complete(primary)
     exception_note = ''
@@ -220,6 +237,14 @@ def process_banking_analysis_payload(payload: dict):
         eft_setup_incomplete=eft_incomplete,
         exception_note=exception_note,
     )
+    logger.info(
+        'Banking analysis webhook stored event_id=%s status=%s exception=%s customer_id=%s connection_id=%s',
+        event.event_id,
+        event.processing_status,
+        event.exception_note or '',
+        event.customer_id,
+        event.connection_id,
+    )
 
     if connection and connection.customer:
         FinancialAnalysisReport.objects.create(
@@ -235,6 +260,12 @@ def process_banking_analysis_payload(payload: dict):
                 'source_transactions': event.source_transactions,
             },
         )
+        logger.info(
+            'Banking analysis report created event_id=%s customer_id=%s connection_id=%s',
+            event.event_id,
+            connection.customer_id,
+            connection.id,
+        )
 
     return event, False
 
@@ -246,19 +277,23 @@ class MohawkBankingAnalysisWebhookView(APIView):
     def post(self, request):
         token = _extract_bearer_token(request.headers.get('Authorization'))
         if not _api_key_valid(token):
+            logger.warning('Banking analysis webhook rejected invalid_api_key')
             return Response({'error': 'invalid_api_key'}, status=status.HTTP_401_UNAUTHORIZED)
 
         payload = request.data
         if not isinstance(payload, dict):
+            logger.warning('Banking analysis webhook rejected invalid_json')
             return Response({'error': 'invalid_json'}, status=status.HTTP_400_BAD_REQUEST)
 
         event_id = payload.get('event_id')
         if not event_id:
+            logger.warning('Banking analysis webhook rejected missing_event_id')
             return Response({'error': 'event_id_required'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             event, duplicate = process_banking_analysis_payload(payload)
         except ValueError as exc:
+            logger.warning('Banking analysis webhook rejected event_id=%s error=%s', event_id, exc)
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         body = {
@@ -266,6 +301,12 @@ class MohawkBankingAnalysisWebhookView(APIView):
             'event_id': event.event_id,
             'duplicate': duplicate,
         }
+        logger.info(
+            'Banking analysis webhook response event_id=%s duplicate=%s status_code=%s',
+            event.event_id,
+            duplicate,
+            status.HTTP_200_OK if duplicate else status.HTTP_201_CREATED,
+        )
         if duplicate:
             return Response(body, status=status.HTTP_200_OK)
         return Response(body, status=status.HTTP_201_CREATED)

@@ -6,6 +6,7 @@ from celery import shared_task
 from django.conf import settings
 from django.utils.timezone import now
 
+from .logging_utils import mask_identifier
 from .models import BankConnection, BankAccount, BankTransaction
 
 logger = logging.getLogger(__name__)
@@ -50,22 +51,40 @@ def _poll_get_accounts_detail_async(instance, customer_id, request_id, headers):
         f'BankingServices/GetAccountsDetailAsync/{request_id}'
     )
     deadline = time.monotonic() + FLINKS_ASYNC_MAX_WAIT_SECONDS
+    attempt = 0
 
     while time.monotonic() < deadline:
+        attempt += 1
         async_resp = requests.get(async_url, headers=headers, timeout=30)
+        logger.info(
+            'Flinks async poll attempt=%s request_id=%s status=%s',
+            attempt,
+            mask_identifier(request_id),
+            async_resp.status_code,
+        )
         if async_resp.status_code == 200:
+            logger.info(
+                'Flinks async poll completed request_id=%s attempts=%s',
+                mask_identifier(request_id),
+                attempt,
+            )
             return async_resp.json()
         if async_resp.status_code == 202:
             time.sleep(FLINKS_ASYNC_POLL_INTERVAL_SECONDS)
             continue
         logger.error(
-            'Flinks GetAccountsDetailAsync failed. Status=%s Body=%s',
+            'Flinks GetAccountsDetailAsync failed request_id=%s status=%s body=%s',
+            mask_identifier(request_id),
             async_resp.status_code,
             async_resp.text,
         )
         return None
 
-    logger.error('Flinks GetAccountsDetailAsync timed out after 30 minutes for request_id=%s', request_id)
+    logger.error(
+        'Flinks GetAccountsDetailAsync timed out request_id=%s max_wait_seconds=%s',
+        mask_identifier(request_id),
+        FLINKS_ASYNC_MAX_WAIT_SECONDS,
+    )
     return None
 
 
@@ -113,6 +132,13 @@ def _log_banking_failure(customer, title, description):
 
 
 def _mark_banking_failed(connection, customer, reason):
+    logger.warning(
+        'Flinks sync marking failed customer_id=%s connection_id=%s login_id=%s reason=%s',
+        customer.id,
+        connection.id,
+        mask_identifier(connection.login_id),
+        reason,
+    )
     connection.sync_status = 'failed'
     connection.sync_error = reason
     connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
@@ -124,14 +150,17 @@ def _mark_banking_failed(connection, customer, reason):
 
     _log_banking_failure(customer, 'Banking Verification Failed', reason)
     send_banking_retry_email.delay(str(customer.id), reason)
-    logger.warning('Flinks sync failed for customer=%s: %s', customer.email, reason)
+    logger.warning('Flinks sync failed customer_id=%s connection_id=%s', customer.id, connection.id)
     return False
 
 
 def _persist_accounts(connection, customer, accounts_data):
     primary_assigned = False
+    account_count = 0
+    transaction_count = 0
 
     for acc in accounts_data:
+        account_count += 1
         normalized_type = _normalize_account_type(acc.get('Type'))
 
         account_obj, _created = BankAccount.objects.update_or_create(
@@ -157,6 +186,7 @@ def _persist_accounts(connection, customer, accounts_data):
             primary_assigned = True
 
         transactions = acc.get('Transactions') or []
+        transaction_count += len(transactions)
         for tx in transactions:
             BankTransaction.objects.update_or_create(
                 account=account_obj,
@@ -170,6 +200,14 @@ def _persist_accounts(connection, customer, accounts_data):
                     'balance': tx.get('Balance'),
                 },
             )
+    logger.info(
+        'Flinks accounts persisted customer_id=%s connection_id=%s accounts=%s transactions=%s primary_assigned=%s',
+        customer.id,
+        connection.id,
+        account_count,
+        transaction_count,
+        primary_assigned,
+    )
 
 
 def _mark_banking_success(connection, customer, flinks_email=None, flinks_phone=None, flinks_name=None):
@@ -213,7 +251,12 @@ def _mark_banking_success(connection, customer, flinks_email=None, flinks_phone=
     except Exception:
         logger.exception('Failed to log banking success activity for customer=%s', customer.id)
 
-    logger.info('Flinks synced successfully for customer=%s', customer.email)
+    logger.info(
+        'Flinks sync succeeded customer_id=%s connection_id=%s login_id=%s',
+        customer.id,
+        connection.id,
+        mask_identifier(connection.login_id),
+    )
     return True
 
 
@@ -258,6 +301,13 @@ def fetch_flinks_accounts_only(self, connection_id):
 
     customer = connection.customer
     login_id = connection.login_id
+    logger.info(
+        'Flinks sync started customer_id=%s connection_id=%s login_id=%s task_id=%s',
+        customer.id,
+        connection.id,
+        mask_identifier(login_id),
+        getattr(self.request, 'id', None),
+    )
     connection.sync_status = 'syncing'
     connection.sync_error = None
     connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
@@ -267,12 +317,26 @@ def fetch_flinks_accounts_only(self, connection_id):
     customer_id = GlobalSetting.get_value('FLINKS_CUSTOMER_ID', settings.FLINKS_CUSTOMER_ID)
     secret_key = GlobalSetting.get_value('FLINKS_SECRET_KEY_CA', settings.FLINKS_SECRET_KEY_CA)
     instance = GlobalSetting.get_value('FLINKS_INSTANCE', settings.FLINKS_INSTANCE)
+    logger.info(
+        'Flinks sync config customer_id=%s connection_id=%s instance=%s customer_id_configured=%s secret_key_configured=%s',
+        customer.id,
+        connection.id,
+        instance,
+        bool(customer_id),
+        bool(secret_key),
+    )
 
     headers = _flinks_headers(secret_key)
 
     auth_url = f'https://{instance}-api.private.fin.ag/v3/{customer_id}/BankingServices/Authorize'
 
     try:
+        logger.info(
+            'Flinks Authorize request customer_id=%s connection_id=%s login_id=%s',
+            customer.id,
+            connection.id,
+            mask_identifier(login_id),
+        )
         auth_resp = requests.post(
             auth_url,
             json={'LoginId': str(login_id), 'MostRecentCached': True},
@@ -280,18 +344,42 @@ def fetch_flinks_accounts_only(self, connection_id):
             timeout=30,
         )
     except requests.RequestException as exc:
+        logger.exception(
+            'Flinks Authorize request error customer_id=%s connection_id=%s login_id=%s',
+            customer.id,
+            connection.id,
+            mask_identifier(login_id),
+        )
         return _mark_banking_failed(connection, customer, str(exc))
 
+    logger.info(
+        'Flinks Authorize response customer_id=%s connection_id=%s status=%s',
+        customer.id,
+        connection.id,
+        auth_resp.status_code,
+    )
     if auth_resp.status_code != 200:
         return _mark_banking_failed(connection, customer, auth_resp.text)
 
     request_id = auth_resp.json().get('RequestId')
     if not request_id:
         return _mark_banking_failed(connection, customer, 'No RequestId returned by Flinks')
+    logger.info(
+        'Flinks Authorize accepted customer_id=%s connection_id=%s request_id=%s',
+        customer.id,
+        connection.id,
+        mask_identifier(request_id),
+    )
 
     acct_url = f'https://{instance}-api.private.fin.ag/v3/{customer_id}/BankingServices/GetAccountsDetail'
 
     try:
+        logger.info(
+            'Flinks GetAccountsDetail request customer_id=%s connection_id=%s request_id=%s',
+            customer.id,
+            connection.id,
+            mask_identifier(request_id),
+        )
         acct_resp = requests.post(
             acct_url,
             json={'RequestId': request_id, 'DaysOfTransactions': 'Days365'},
@@ -299,11 +387,30 @@ def fetch_flinks_accounts_only(self, connection_id):
             timeout=30,
         )
     except requests.RequestException as exc:
+        logger.exception(
+            'Flinks GetAccountsDetail request error customer_id=%s connection_id=%s request_id=%s',
+            customer.id,
+            connection.id,
+            mask_identifier(request_id),
+        )
         return _mark_banking_failed(connection, customer, str(exc))
 
+    logger.info(
+        'Flinks GetAccountsDetail response customer_id=%s connection_id=%s request_id=%s status=%s',
+        customer.id,
+        connection.id,
+        mask_identifier(request_id),
+        acct_resp.status_code,
+    )
     if acct_resp.status_code == 200:
         accounts_json = acct_resp.json()
     elif acct_resp.status_code == 202:
+        logger.info(
+            'Flinks GetAccountsDetail async accepted customer_id=%s connection_id=%s request_id=%s',
+            customer.id,
+            connection.id,
+            mask_identifier(request_id),
+        )
         accounts_json = _poll_get_accounts_detail_async(instance, customer_id, request_id, headers)
     else:
         return _mark_banking_failed(
@@ -321,6 +428,13 @@ def fetch_flinks_accounts_only(self, connection_id):
         return _mark_banking_failed(connection, customer, NO_ACCOUNTS_MESSAGE)
 
     total_transactions = _count_transactions(accounts_data)
+    logger.info(
+        'Flinks payload received customer_id=%s connection_id=%s accounts=%s transactions=%s',
+        customer.id,
+        connection.id,
+        len(accounts_data),
+        total_transactions,
+    )
     if total_transactions == 0:
         return _mark_banking_failed(connection, customer, ZERO_TRANSACTIONS_MESSAGE)
 
