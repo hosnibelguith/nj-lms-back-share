@@ -44,6 +44,15 @@ class CustomerPortalBaseView(APIView):
 
 
 class ConnectBankView(CustomerPortalBaseView):
+    def permission_denied(self, request, message=None, code=None):
+        logger.warning(
+            'Flinks connect rejected: permission denied user_id=%s is_authenticated=%s user_type=%s',
+            getattr(request.user, 'id', None),
+            bool(request.user and request.user.is_authenticated),
+            getattr(request.user, 'user_type', None),
+        )
+        return super().permission_denied(request, message=message, code=code)
+
     def post(self, request):
         login_id = request.data.get('login_id')
 
