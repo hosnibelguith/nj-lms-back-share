@@ -561,6 +561,22 @@ class CustomerPortalMeView(CustomerPortalBaseView):
         return Response(serializer.data)
 
 
+class CustomerPortalFlinksConfigView(CustomerPortalBaseView):
+    def get(self, request):
+        customer, error_response = self.get_customer(request)
+        if error_response:
+            return error_response
+
+        flinks_iframe_url = GlobalSetting.get_value(
+            'FLINKS_IFRAME_URL',
+            getattr(settings, 'FLINKS_IFRAME_URL', ''),
+        )
+
+        return Response({
+            'flinks_iframe_url': flinks_iframe_url or '',
+        })
+
+
 class CustomerPortalMyLoansView(CustomerPortalBaseView):
     def get(self, request):
         customer, error_response = self.get_customer(request)

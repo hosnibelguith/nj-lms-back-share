@@ -40,6 +40,7 @@ urlpatterns = [
     ),
     path('portal/login/', views.CustomerPortalLoginView.as_view(), name='customer-portal-login'),
     path('portal/me/', views.CustomerPortalMeView.as_view(), name='customer-portal-me'),
+    path('portal/me/flinks-config/', views.CustomerPortalFlinksConfigView.as_view(), name='customer-portal-flinks-config'),
     path('portal/me/loans/', views.CustomerPortalMyLoansView.as_view(), name='customer-portal-my-loans'),
     path(
         'portal/me/current-application/',
