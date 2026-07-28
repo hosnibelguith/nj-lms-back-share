@@ -377,7 +377,10 @@ ARRIVE_HANDOFF_TOKEN_TTL_SECONDS = int(os.environ.get("ARRIVE_HANDOFF_TOKEN_TTL_
 # -------------------------------------------------------------------
 # Frontend URL
 # -------------------------------------------------------------------
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+FRONTEND_URL = os.environ.get(
+    "FRONTEND_URL",
+    "http://localhost:3000" if DEBUG else "https://app.mohawkloans.com",
+)
 
 
 # -------------------------------------------------------------------
