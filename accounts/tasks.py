@@ -23,13 +23,13 @@ def send_welcome_email(customer_id: str):
         frontend_url = settings.FRONTEND_URL.rstrip('/')
 
         send_mail(
-            subject='Welcome to LendStack',
+            subject='Welcome to Mohawk Loans',
             message=(
                 f'Hello {customer.first_name},\n\n'
-                f'Thank you for applying with LendStack.\n\n'
+                f'Thank you for applying with Mohawk Loans.\n\n'
                 f'Your next step is to complete banking verification:\n'
                 f'{frontend_url}/customer/banking\n\n'
-                f'Thank you,\nLendStack'
+                f'Thank you,\nMohawk Loans'
             ),
             from_email=settings.DEFAULT_FROM_EMAIL,
             recipient_list=[customer.email],
