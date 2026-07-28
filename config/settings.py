@@ -242,13 +242,27 @@ SIMPLE_JWT = {
 # -------------------------------------------------------------------
 CORS_ALLOWED_ORIGINS = env_list(
     "CORS_ALLOWED_ORIGINS",
-    "http://localhost:3000,http://127.0.0.1:3000"
+    ",".join([
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://app.mohawkloans.com",
+        "https://mohawkloans.com",
+        "https://www.mohawkloans.com",
+        "https://frontend-ui-redisgn-3d3799602f44.herokuapp.com",
+    ])
 )
 CORS_ALLOW_CREDENTIALS = True
 
 CSRF_TRUSTED_ORIGINS = env_list(
     "CSRF_TRUSTED_ORIGINS",
-    "http://localhost:3000,http://127.0.0.1:3000"
+    ",".join([
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://app.mohawkloans.com",
+        "https://mohawkloans.com",
+        "https://www.mohawkloans.com",
+        "https://frontend-ui-redisgn-3d3799602f44.herokuapp.com",
+    ])
 )
 
 
