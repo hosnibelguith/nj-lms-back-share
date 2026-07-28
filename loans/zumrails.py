@@ -344,6 +344,26 @@ class FundingService:
                 created_by=getattr(user, "id", "system"),
                 metadata={"funded_payment_id": str(funding.id), "method": "card_issuance"},
             )
+            template_name = "Fund/Approve Template"
+            from communications.models import CommunicationTemplate
+            from communications.tasks import send_template_message
+
+            template = CommunicationTemplate.objects.filter(
+                name=template_name,
+                type="email",
+                is_active=True,
+            ).first()
+            if template and not loan.communications.filter(
+                direction="outbound",
+                type="email",
+                template_name=template_name,
+            ).exists():
+                customer_id = str(loan.customer_id)
+                loan_id = str(loan.id)
+                template_id = str(template.id)
+                transaction.on_commit(
+                    lambda: send_template_message.delay(customer_id, template_id, loan_id)
+                )
             return funding
 
         destination_snapshot = funding_destination_snapshot(loan, method, destination)
@@ -409,6 +429,26 @@ class FundingService:
                 "overrode_recommendation": bool(recommended_method and recommended_method != method),
             },
         )
+        template_name = "Fund/Approve Template"
+        from communications.models import CommunicationTemplate
+        from communications.tasks import send_template_message
+
+        template = CommunicationTemplate.objects.filter(
+            name=template_name,
+            type="email",
+            is_active=True,
+        ).first()
+        if template and not loan.communications.filter(
+            direction="outbound",
+            type="email",
+            template_name=template_name,
+        ).exists():
+            customer_id = str(loan.customer_id)
+            loan_id = str(loan.id)
+            template_id = str(template.id)
+            transaction.on_commit(
+                lambda: send_template_message.delay(customer_id, template_id, loan_id)
+            )
         return funding
 
 

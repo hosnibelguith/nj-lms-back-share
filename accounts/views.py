@@ -7,6 +7,7 @@ from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth.models import update_last_login
 from django.conf import settings
+from django.db import transaction
 from django.db.models import Count, Q
 from django.middleware.csrf import get_token
 from django.utils import timezone
@@ -911,7 +912,28 @@ class CustomerPortalSignContractView(CustomerPortalBaseView):
 
         contract.save()
 
-        LoanService.sign_customer_contract(customer)
+        loan = LoanService.sign_customer_contract(customer)
+
+        template_name = 'We Have Received Your Request Template'
+        from communications.models import CommunicationTemplate
+        from communications.tasks import send_template_message
+
+        template = CommunicationTemplate.objects.filter(
+            name=template_name,
+            type='email',
+            is_active=True,
+        ).first()
+        if template and not loan.communications.filter(
+            direction='outbound',
+            type='email',
+            template_name=template_name,
+        ).exists():
+            customer_id = str(customer.id)
+            loan_id = str(loan.id)
+            template_id = str(template.id)
+            transaction.on_commit(
+                lambda: send_template_message.delay(customer_id, template_id, loan_id)
+            )
 
         return Response({
             'message': 'Agreement signed successfully.',
