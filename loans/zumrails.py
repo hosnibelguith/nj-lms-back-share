@@ -159,7 +159,7 @@ def funding_configuration_ready(loan: Loan) -> dict:
     collections_configured = bool(collections_account)
     blockers = []
     arrive_loan = is_arrive_funded_loan(loan)
-    if loan.status not in ("pending_funding", "human_approved"):
+    if loan.status != "pending_funding":
         blockers.append("Loan is not pending funding.")
     if loan.funded_payments.filter(status__in=["processing", "completed"]).exists():
         blockers.append("Funding already exists for this loan.")
@@ -272,10 +272,6 @@ class FundingService:
             raise ValueError(
                 "Card Issuance is only available for Arrive applications. Use EFT or e-Transfer."
             )
-
-        if loan.status == "human_approved" and arrive_loan:
-            loan.status = "pending_funding"
-            loan.save(update_fields=["status", "updated_at"])
 
         if loan.status != "pending_funding":
             raise ValueError("Only loans pending funding can be funded.")

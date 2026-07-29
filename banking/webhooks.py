@@ -129,7 +129,7 @@ def _apply_primary_eft_account(connection: BankConnection, primary: dict):
     from loans.zumrails import account_snapshot
 
     loans = Loan.objects.filter(customer=connection.customer).exclude(
-        status__in=['paid_off', 'defaulted', 'ai_declined', 'human_declined']
+        status__in=['paid_off', 'defaulted', 'human_declined']
     )
     for loan in loans:
         update_fields = []

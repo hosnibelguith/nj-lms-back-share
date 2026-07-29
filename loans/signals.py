@@ -28,11 +28,8 @@ def loan_status_changed(sender, instance, **kwargs):
                 from activity.models import ActivityHistory
                 
                 activity_types = {
+                    'ibv_pending': ('system', 'IBV Pending'),
                     'pending_signature': ('contract_sent', 'Pending Signature'),
-                    'ai_approved': ('loan_created', 'AI Approved'),
-                    'ai_declined': ('loan_created', 'AI Declined'),
-                    'review_required': ('loan_created', 'Review Required'),
-                    'human_approved': ('loan_created', 'Human Approved'),
                     'human_declined': ('loan_created', 'Human Declined'),
                     'pending_funding': ('contract_signed', 'Pending Funding'),
                     'active': ('loan_funded', 'Loan Active'),
@@ -51,6 +48,17 @@ def loan_status_changed(sender, instance, **kwargs):
                     type=activity_type,
                     title=title,
                     description=f'Status changed from {old_instance.get_status_display()} to {instance.get_status_display()}'
+                )
+
+            if old_instance.ai_decision != instance.ai_decision and instance.ai_decision:
+                from activity.models import ActivityHistory
+
+                ActivityHistory.objects.create(
+                    customer=instance.customer,
+                    loan=instance,
+                    type='system',
+                    title='AI Decision',
+                    description=f'AI Decision: {instance.get_ai_decision_display()}',
                 )
         except Loan.DoesNotExist:
             pass

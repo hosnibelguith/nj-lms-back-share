@@ -49,7 +49,7 @@ class Command(BaseCommand):
                 f"principal={loan.principal} signed_at={loan.contract_signed_at}"
             )
 
-            if loan.status in ["human_approved", "pending_funding", "active", "human_declined", "ai_declined"]:
+            if loan.status in ["pending_funding", "active", "human_declined"]:
                 raise CommandError(f"Loan already decided/funded: status={loan.status}")
 
             if options["approved_amount"] is not None:
@@ -65,8 +65,8 @@ class Command(BaseCommand):
                     f"fee={loan.fee} total={loan.total_amount}"
                 )
 
-            # Contract-signed apps land in pending; still allow pending_signature by moving to pending.
-            if loan.status == "pending_signature":
+            # Contract-signed apps land in pending; normalize signature stages before approving.
+            if loan.status in ["ibv_pending", "pending_signature"]:
                 if not loan.contract_signed_at and not customer.contract_completed:
                     raise CommandError("Contract not signed yet; cannot approve.")
                 loan.status = "pending"

@@ -222,6 +222,10 @@ def _mark_banking_success(connection, customer, flinks_email=None, flinks_phone=
         customer.onboarding_stage = 'contract'
     customer.save(update_fields=['banking_verified', 'onboarding_stage', 'updated_at'])
 
+    from loans.services import LoanService
+    for loan in customer.loans.filter(status='ibv_pending'):
+        LoanService.mark_pending_signature(loan)
+
     portal_user = customer.portal_user
     if portal_user:
         update_fields = []

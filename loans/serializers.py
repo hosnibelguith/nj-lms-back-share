@@ -239,6 +239,7 @@ class WebhookEventSerializer(serializers.ModelSerializer):
 class CurrentApplicationSerializer(serializers.ModelSerializer):
     type_display = serializers.CharField(source='get_type_display', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
+    ai_decision_display = serializers.CharField(source='get_ai_decision_display', read_only=True)
     formula = LoanFormulaSerializer(read_only=True)
 
     collected_amount = serializers.SerializerMethodField()
@@ -251,6 +252,8 @@ class CurrentApplicationSerializer(serializers.ModelSerializer):
             'type_display',
             'status',
             'status_display',
+            'ai_decision',
+            'ai_decision_display',
             'formula',
             'principal',
             'fee',
@@ -282,6 +285,7 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
     paymentSchedule = CustomerLoanPaymentSerializer(source='payments', many=True, read_only=True)
     type_display = serializers.CharField(source='get_type_display', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
+    ai_decision_display = serializers.CharField(source='get_ai_decision_display', read_only=True)
 
     class Meta:
         model = Loan
@@ -291,6 +295,8 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
             'type_display',
             'status',
             'status_display',
+            'ai_decision',
+            'ai_decision_display',
             'is_active',
             'amount',
             'principal',
@@ -321,6 +327,7 @@ class LoanSerializer(serializers.ModelSerializer):
     collections_account = BankAccountSerializer(read_only=True)
     payments = PaymentSerializer(many=True, read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
+    ai_decision_display = serializers.CharField(source='get_ai_decision_display', read_only=True)
     type_display = serializers.CharField(source='get_type_display', read_only=True)
 
     class Meta:
@@ -329,6 +336,7 @@ class LoanSerializer(serializers.ModelSerializer):
             'id', 'customer', 'customer_id',
             'type', 'type_display', 'principal', 'fee', 'total_amount', 'balance',
             'status', 'status_display', 'is_active',
+            'ai_decision', 'ai_decision_display',
             'formula',
             'bank_account',
             'collections_account',
@@ -361,6 +369,7 @@ class LoanListSerializer(serializers.ModelSerializer):
     due_date = serializers.SerializerMethodField()
     collected_amount = serializers.SerializerMethodField()
     status_display = serializers.CharField(source='get_status_display', read_only=True)
+    ai_decision_display = serializers.CharField(source='get_ai_decision_display', read_only=True)
 
     class Meta:
         model = Loan
@@ -380,6 +389,8 @@ class LoanListSerializer(serializers.ModelSerializer):
             'collected_amount',
             'status',
             'status_display',
+            'ai_decision',
+            'ai_decision_display',
             'is_active',
             'created_at',
         ]

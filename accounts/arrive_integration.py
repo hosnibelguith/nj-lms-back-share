@@ -112,11 +112,9 @@ def get_primary_loan(customer: Customer) -> Loan | None:
 def loan_decision_status(loan: Loan | None) -> str | None:
     if not loan:
         return None
-    if loan.status in ("human_declined", "ai_declined") or loan.declined_at:
+    if loan.status == "human_declined" or loan.declined_at:
         return "declined"
     if loan.status in (
-        "human_approved",
-        "ai_approved",
         "pending_funding",
         "active",
         "paid_off",

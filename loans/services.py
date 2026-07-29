@@ -210,11 +210,9 @@ class LoanService:
         Prevents duplicate active/pending applications.
         """
         blocking_statuses = [
+            'ibv_pending',
             'pending',
             'pending_signature',
-            'ai_approved',
-            'review_required',
-            'human_approved',
             'pending_funding',
             'active',
         ]
@@ -257,7 +255,7 @@ class LoanService:
             fee=fee,
             total_amount=total_amount,
             balance=total_amount,
-            status='pending',
+            status='ibv_pending',
             is_active=True,
             notes='Initial application loan created automatically after customer signup.',
         )
@@ -278,18 +276,12 @@ class LoanService:
     @staticmethod
     @transaction.atomic
     def approve_loan(loan: Loan, approved_by=None, notes: str = None, source='human') -> Loan:
-        if loan.status not in ['pending', 'review_required', 'ai_approved', 'ai_declined']:
+        if source != 'human':
+            raise ValueError('AI decisions must be recorded with set_ai_decision.')
+        if loan.status != 'pending':
             raise ValueError(f"Cannot approve loan in status: {loan.status}")
 
         loan.approve(user=approved_by, source=source)
-
-        customer = loan.customer
-        contract_ready = bool(
-            loan.contract_signed_at or getattr(customer, 'contract_completed', False)
-        )
-        if contract_ready:
-            loan.status = 'pending_funding'
-            loan.save(update_fields=['status', 'updated_at'])
 
         if notes:
             loan.notes = ((loan.notes or '') + f"\n{notes}").strip()
@@ -306,7 +298,9 @@ class LoanService:
     @staticmethod
     @transaction.atomic
     def decline_loan(loan: Loan, reason: str, declined_by=None, source='human') -> Loan:
-        if loan.status not in ['pending', 'pending_signature', 'review_required', 'ai_approved', 'ai_declined', 'human_approved']:
+        if source != 'human':
+            raise ValueError('AI decisions must be recorded with set_ai_decision.')
+        if loan.status not in ['ibv_pending', 'pending', 'pending_signature', 'pending_funding']:
             raise ValueError(f"Cannot decline loan in status: {loan.status}")
 
         loan.decline(reason=reason, user=declined_by, source=source)
@@ -383,7 +377,7 @@ class LoanService:
     @staticmethod
     @transaction.atomic
     def mark_pending_signature(loan: Loan) -> Loan:
-        if loan.status not in ['pending', 'ai_approved', 'human_approved', 'review_required']:
+        if loan.status not in ['ibv_pending', 'pending']:
             raise ValueError(f"Cannot request signature in status: {loan.status}")
 
         contract_id = loan.contract_id or f"demo-contract-{str(loan.id)[:8]}"
@@ -394,7 +388,7 @@ class LoanService:
     @transaction.atomic
     def sign_customer_contract(customer: Customer) -> Loan:
         loan = customer.loans.filter(
-            status__in=['pending_signature', 'pending', 'ai_approved', 'human_approved']
+            status__in=['pending_signature', 'pending', 'ibv_pending']
         ).order_by('-created_at').first()
 
         if not loan:
@@ -416,7 +410,7 @@ class LoanService:
 
     @staticmethod
     def mock_ai_decision_for_loan(loan: Loan) -> str:
-        outcomes = ['ai_approved', 'ai_declined', 'review_required']
+        outcomes = ['approved', 'declined', 'review_required']
         index = sum(ord(char) for char in str(loan.id)) % len(outcomes)
         return outcomes[index]
 
@@ -436,31 +430,17 @@ class LoanService:
         decision = LoanService.mock_ai_decision_for_loan(loan)
         previous_status = loan.status
 
-        if decision == 'ai_approved':
-            loan.approve(user=None, source='ai')
-            if loan.contract_signed_at:
-                loan.status = 'pending_funding'
-                loan.save(update_fields=['status', 'updated_at'])
+        notes = ''
+        if decision == 'declined':
+            notes = 'AI declined the application based on current verification results.'
+        elif decision == 'review_required':
+            notes = 'AI requested human review.'
 
-        elif decision == 'ai_declined':
-            loan.decline(
-                reason='AI declined the application based on current verification results.',
-                user=None,
-                source='ai',
-            )
+        loan.set_ai_decision(decision, notes=notes)
 
-        else:
-            loan.status = 'review_required'
-            loan.is_active = True
-            loan.notes = ((loan.notes or '') + '\nAI decision: review required.').strip()
-            loan.save()
-
-            loan.log_state_event(
-                event_type='review_required',
-                previous_status=previous_status,
-                new_status='review_required',
-                notes='AI requested human review.',
-            )
+        if loan.status == 'pending_signature' and loan.contract_signed_at:
+            loan.status = 'pending'
+            loan.save(update_fields=['status', 'updated_at'])
 
         return loan
     

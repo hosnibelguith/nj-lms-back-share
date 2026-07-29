@@ -599,15 +599,12 @@ class CustomerPortalCurrentApplicationView(CustomerPortalBaseView):
 
     APPLICATION_PRIORITY = [
         'pending_signature',
-        'ai_approved',
-        'review_required',
-        'human_approved',
         'pending_funding',
         'active',
         'defaulted',
-        'ai_declined',
         'human_declined',
         'paid_off',
+        'ibv_pending',
         'pending',
     ]
 
@@ -647,15 +644,12 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
 
     APPLICATION_PRIORITY = [
         'pending_signature',
-        'ai_approved',
-        'review_required',
-        'human_approved',
         'pending_funding',
         'active',
         'defaulted',
-        'ai_declined',
         'human_declined',
         'paid_off',
+        'ibv_pending',
         'pending',
     ]
 
@@ -698,7 +692,7 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
             next_step = 'apply'
             next_url = '/apply'
 
-        elif loan.status in ['ai_declined', 'human_declined']:
+        elif loan.status == 'human_declined':
             portal_state = 'declined'
             next_step = 'appeal'
             next_url = '/customer/loans'
@@ -734,15 +728,10 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
             next_step = 'contract'
             next_url = '/customer/contracts'
 
-        elif loan.status == 'review_required':
-            portal_state = 'manual_review'
-            next_step = 'review'
-            next_url = '/customer/loans'
-
-        elif loan.status in ['ai_approved', 'human_approved']:
-            portal_state = 'approved'
-            next_step = 'funding'
-            next_url = '/customer/loans'
+        elif loan.status == 'ibv_pending':
+            portal_state = 'contract_required'
+            next_step = 'contract'
+            next_url = '/customer/contracts'
 
         elif loan.status == 'pending_funding':
             portal_state = 'pending_funding'
@@ -755,8 +744,8 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
                 next_step = 'contract'
                 next_url = '/customer/contracts'
             else:
-                portal_state = 'ai_analyzing'
-                next_step = 'analysis'
+                portal_state = 'manual_review'
+                next_step = 'review'
                 next_url = '/customer/loans'
 
         payload = {
@@ -795,10 +784,8 @@ class CustomerPortalContractPreviewView(CustomerPortalBaseView):
         loan = customer.loans.filter(
             status__in=[
                 'pending_signature',
+                'ibv_pending',
                 'pending',
-                'ai_approved',
-                'human_approved',
-                'review_required',
             ]
         ).order_by('-created_at').first()
 
@@ -817,6 +804,9 @@ class CustomerPortalContractPreviewView(CustomerPortalBaseView):
             )
 
         from contracts.services import AGREEMENT_VERSION, render_loan_agreement
+        if loan.status == 'ibv_pending':
+            from loans.services import LoanService
+            loan = LoanService.mark_pending_signature(loan)
 
         contract, _ = Contract.objects.get_or_create(
             customer=customer,
@@ -869,10 +859,8 @@ class CustomerPortalSignContractView(CustomerPortalBaseView):
         loan = customer.loans.filter(
             status__in=[
                 'pending_signature',
+                'ibv_pending',
                 'pending',
-                'ai_approved',
-                'human_approved',
-                'review_required',
             ]
         ).order_by('-created_at').first()
 
@@ -883,6 +871,9 @@ class CustomerPortalSignContractView(CustomerPortalBaseView):
             )
 
         from contracts.services import AGREEMENT_VERSION, render_loan_agreement
+        if loan.status == 'ibv_pending':
+            from loans.services import LoanService
+            loan = LoanService.mark_pending_signature(loan)
 
         contract, _ = Contract.objects.get_or_create(
             customer=customer,

@@ -114,7 +114,7 @@ class BackendApiWorkflowTests(APITestCase):
         self.assertEqual(customer.phone_normalized, "+14165550199")
         self.assertTrue(customer.phone_verified)
         self.assertEqual(customer.loans.count(), 1)
-        self.assertEqual(customer.loans.first().status, "pending")
+        self.assertEqual(customer.loans.first().status, "ibv_pending")
 
         challenge = AuthOTPChallenge.objects.get(id=start_response.data["challenge_id"])
         self.assertEqual(challenge.status, AuthOTPChallenge.STATUS_USED)
@@ -248,7 +248,7 @@ class BackendApiWorkflowTests(APITestCase):
             loan=self.loan,
             event_type="human_approved",
             previous_status="pending",
-            new_status="human_approved",
+            new_status="pending_funding",
             created_by=self.staff,
         )
         FundedPayment.objects.create(

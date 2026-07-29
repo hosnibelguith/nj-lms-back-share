@@ -85,7 +85,7 @@ class Command(BaseCommand):
             for _ in range(random.randint(1, 2)):
                 principal = Decimal(random.randint(300, 1000))
                 fee = Decimal('15.00') * (principal / 100) # Simple fee math
-                status = random.choice(['active', 'paid_off', 'pending_funding', 'pending', 'human_approved'])
+                status = random.choice(['active', 'paid_off', 'pending_funding', 'pending', 'ibv_pending'])
                 
                 # Logic for balance
                 total = principal + fee

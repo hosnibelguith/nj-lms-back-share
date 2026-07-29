@@ -37,11 +37,6 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING("ALREADY_FUNDED"))
             return
 
-        if loan.status == "human_approved":
-            loan.status = "pending_funding"
-            loan.save(update_fields=["status", "updated_at"])
-            self.stdout.write("NORMALIZED_STATUS pending_funding")
-
         if loan.status != "pending_funding":
             raise CommandError(f"Cannot fund loan in status={loan.status}")
 

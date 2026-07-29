@@ -2,7 +2,7 @@
 """
 Simplified Loan Models.
 Just 2 models: Loan and Payment.
-Loan lifecycle: pending → pending_signature → pending_funding → active → paid_off (or defaulted)
+Loan lifecycle: ibv_pending → pending_signature → pending → pending_funding → active → paid_off (or defaulted)
 """
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -131,23 +131,22 @@ class Loan(models.Model):
         ('payday', 'Payday'),
     ]
     
-    # Loan Status - Linear lifecycle
+    # Loan Status - business workflow only
     STATUS_CHOICES = [
-        ('pending', 'Pending'),
+        ('ibv_pending', 'IBV Pending'),
+        ('pending', 'Pending Human Decision'),
         ('pending_signature', 'Pending Signature'),
-
-        ('ai_approved', 'AI Approved'),
-        ('ai_declined', 'AI Declined'),
-        ('review_required', 'Review Required'),
-
-        ('human_approved', 'Human Approved'),
         ('human_declined', 'Human Declined'),
-
         ('pending_funding', 'Pending Funding'),
-
         ('active', 'Active'),
         ('paid_off', 'Paid Off'),
         ('defaulted', 'In Collections'),
+    ]
+
+    AI_DECISION_CHOICES = [
+        ('approved', 'Approved'),
+        ('declined', 'Declined'),
+        ('review_required', 'Review Required'),
     ]
     
     # Funding Methods
@@ -178,6 +177,13 @@ class Loan(models.Model):
     
     # Status
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    ai_decision = models.CharField(
+        max_length=20,
+        choices=AI_DECISION_CHOICES,
+        blank=True,
+        null=True,
+        db_index=True,
+    )
     is_active = models.BooleanField(default=True)
     # Banking (for funding and collections)
     bank_account = models.ForeignKey(
@@ -254,27 +260,35 @@ class Loan(models.Model):
         )
     
     def approve(self, user=None, source='human'):
-        """Approve the loan by AI or human."""
+        """Approve the loan by staff."""
         previous_status = self.status
 
-        self.status = 'ai_approved' if source == 'ai' else 'human_approved'
+        if source != 'human':
+            self.set_ai_decision('approved', user=user)
+            return
+
+        self.status = 'pending_funding'
         self.is_active = True
         self.approved_at = timezone.now()
         self.approved_by = user
         self.save()
 
         self.log_state_event(
-            event_type=self.status,
+            event_type='human_approved',
             previous_status=previous_status,
             new_status=self.status,
             user=user,
         )
     
     def decline(self, reason, user=None, source='human'):
-        """Decline the loan by AI or human."""
+        """Decline the loan by staff, or record an AI decline decision."""
         previous_status = self.status
 
-        self.status = 'ai_declined' if source == 'ai' else 'human_declined'
+        if source != 'human':
+            self.set_ai_decision('declined', user=user, notes=reason)
+            return
+
+        self.status = 'human_declined'
         self.is_active = False
         self.declined_at = timezone.now()
         self.decline_reason = reason
@@ -286,6 +300,19 @@ class Loan(models.Model):
             new_status=self.status,
             user=user,
             notes=reason,
+        )
+
+    def set_ai_decision(self, decision, user=None, notes=''):
+        """Record AI decision without changing loan workflow status."""
+        self.ai_decision = decision
+        self.save(update_fields=['ai_decision', 'updated_at'])
+
+        self.log_state_event(
+            event_type='ai_decision',
+            previous_status=None,
+            new_status=decision,
+            user=user,
+            notes=notes,
         )
     
     def mark_contract_sent(self, contract_id=None):
@@ -312,10 +339,7 @@ class Loan(models.Model):
 
         self.contract_signed_at = timezone.now()
 
-        if self.status in ['ai_approved', 'human_approved']:
-            self.status = 'pending_funding'
-        else:
-            self.status = 'pending'
+        self.status = 'pending'
 
         self.is_active = True
         self.save()
@@ -331,7 +355,7 @@ class Loan(models.Model):
         """Mark loan as funded/active."""
         previous_status = self.status
 
-        if self.status not in ['pending_funding', 'human_approved', 'ai_approved']:
+        if self.status != 'pending_funding':
             raise ValueError(f"Cannot fund loan in status: {self.status}")
 
         self.status = 'active'
@@ -701,10 +725,7 @@ class LoanStateEvent(models.Model):
         ('pending_signature', 'Pending Signature'),
         ('contract_signed', 'Contract Signed'),
 
-        ('ai_approved', 'AI Approved'),
-        ('ai_declined', 'AI Declined'),
-        ('review_required', 'Review Required'),
-
+        ('ai_decision', 'AI Decision'),
         ('human_approved', 'Human Approved'),
         ('human_declined', 'Human Declined'),
 

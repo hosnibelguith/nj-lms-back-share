@@ -22,8 +22,8 @@ def send_contract_task(loan_id: str):
         logger.error(f"Loan {loan_id} not found")
         return False
     
-    if loan.status not in ['ai_approved', 'human_approved', 'pending']:
-        logger.warning(f"Loan {loan_id} not in approved status")
+    if loan.status not in ['ibv_pending', 'pending']:
+        logger.warning(f"Loan {loan_id} not pending signature request")
         return False
     
     # TODO: Integrate with DocuSign API

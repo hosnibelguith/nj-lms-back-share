@@ -123,6 +123,10 @@ class LoanViewSet(viewsets.ModelViewSet):
         if status_param:
             qs = qs.filter(status=status_param)
 
+        ai_decision_param = self.request.query_params.get('ai_decision')
+        if ai_decision_param:
+            qs = qs.filter(ai_decision=ai_decision_param)
+
         customer_id = self.request.query_params.get('customer_id')
         if customer_id:
             qs = qs.filter(customer_id=customer_id)
@@ -197,8 +201,8 @@ class LoanViewSet(viewsets.ModelViewSet):
     def approve(self, request, pk=None):
         loan = self.get_object()
 
-        if loan.status not in ['pending', 'review_required', 'ai_approved', 'ai_declined']:
-            return Response({'error': 'Only pending loans can be approved'}, status=400)
+        if loan.status != 'pending':
+            return Response({'error': 'Only loans pending human decision can be approved'}, status=400)
 
         serializer = LoanApproveSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -219,7 +223,7 @@ class LoanViewSet(viewsets.ModelViewSet):
     def decline(self, request, pk=None):
         loan = self.get_object()
 
-        if loan.status not in ['pending', 'pending_signature', 'review_required', 'ai_approved', 'ai_declined', 'human_approved']:
+        if loan.status not in ['ibv_pending', 'pending', 'pending_signature', 'pending_funding']:
             return Response({'error': 'Only pending loans can be declined'}, status=400)
 
         serializer = LoanDeclineSerializer(data=request.data)
@@ -254,7 +258,7 @@ class LoanViewSet(viewsets.ModelViewSet):
                 status=400,
             )
 
-        if loan.status not in ('pending_funding', 'human_approved'):
+        if loan.status != 'pending_funding':
             return Response({'error': 'Only signed/approved loans can be funded'}, status=400)
 
         recommended_method = FundingMethodRecommendation.for_date()
@@ -564,8 +568,8 @@ class LoanViewSet(viewsets.ModelViewSet):
         totals = {
             "funded_payments_amount": str(funded_payments.aggregate(total=Sum('amount'))['total'] or 0),
             "collected_payments_amount": str(collected_payments.aggregate(total=Sum('amount'))['total'] or 0),
-            "approved_loans_count": events.filter(event_type__in=['ai_approved', 'human_approved']).count(),
-            "declined_loans_count": events.filter(event_type__in=['ai_declined', 'human_declined']).count(),
+            "approved_loans_count": events.filter(event_type='human_approved').count(),
+            "declined_loans_count": events.filter(event_type='human_declined').count(),
             "funded_loans_count": events.filter(event_type='funded').count(),
             "paid_off_loans_count": events.filter(event_type='paid_off').count(),
             "defaulted_loans_count": events.filter(event_type='defaulted').count(),
@@ -586,8 +590,8 @@ class LoanViewSet(viewsets.ModelViewSet):
             "series": {
                 "funded_payments_amount": funded_series,
                 "collected_payments_amount": collected_series,
-                "approved_loans_count": series(events.filter(event_type__in=['ai_approved', 'human_approved'])),
-                "declined_loans_count": series(events.filter(event_type__in=['ai_declined', 'human_declined'])),
+                "approved_loans_count": series(events.filter(event_type='human_approved')),
+                "declined_loans_count": series(events.filter(event_type='human_declined')),
                 "funded_loans_count": series(events.filter(event_type='funded')),
                 "paid_off_loans_count": series(events.filter(event_type='paid_off')),
                 "defaulted_loans_count": series(events.filter(event_type='defaulted')),
