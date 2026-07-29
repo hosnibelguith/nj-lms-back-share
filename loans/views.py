@@ -41,6 +41,7 @@ from .serializers import (
     PaymentSerializer,
     PaymentCreateSerializer,
     LoanApproveSerializer,
+    LoanAmountUpdateSerializer,
     LoanDeclineSerializer,
     LoanFundSerializer,
     LoanFundingConfigurationSerializer,
@@ -126,6 +127,12 @@ class LoanViewSet(viewsets.ModelViewSet):
         ai_decision_param = self.request.query_params.get('ai_decision')
         if ai_decision_param:
             qs = qs.filter(ai_decision=ai_decision_param)
+
+        ibv_status_param = self.request.query_params.get('ibv_status')
+        if ibv_status_param == 'pending':
+            qs = qs.filter(Q(status='ibv_pending') | Q(customer__banking_verified=False))
+        elif ibv_status_param == 'completed':
+            qs = qs.filter(customer__banking_verified=True)
 
         customer_id = self.request.query_params.get('customer_id')
         if customer_id:
@@ -216,6 +223,25 @@ class LoanViewSet(viewsets.ModelViewSet):
             approved_by=request.user,
             source='human',
         )
+
+        return Response(LoanSerializer(loan).data)
+
+    @action(detail=True, methods=['patch'], url_path='approved-amount')
+    def update_approved_amount(self, request, pk=None):
+        loan = self.get_object()
+
+        serializer = LoanAmountUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            loan = LoanService.update_approved_amount(
+                loan=loan,
+                principal=serializer.validated_data['principal'],
+                user=request.user,
+                notes=serializer.validated_data.get('notes') or '',
+            )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
 
         return Response(LoanSerializer(loan).data)
 

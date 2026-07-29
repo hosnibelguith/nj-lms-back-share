@@ -726,6 +726,7 @@ class LoanStateEvent(models.Model):
         ('contract_signed', 'Contract Signed'),
 
         ('ai_decision', 'AI Decision'),
+        ('amount_updated', 'Amount Updated'),
         ('human_approved', 'Human Approved'),
         ('human_declined', 'Human Declined'),
 

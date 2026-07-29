@@ -1,6 +1,8 @@
 """
 Simplified Loan Serializers.
 """
+from decimal import Decimal
+
 from rest_framework import serializers
 from .models import (
     CollectionPayment,
@@ -363,6 +365,7 @@ class LoanListSerializer(serializers.ModelSerializer):
     """List serializer aligned with current loans page."""
     customer_name = serializers.SerializerMethodField()
     customer_province = serializers.SerializerMethodField()
+    customer_banking_verified = serializers.BooleanField(source='customer.banking_verified', read_only=True)
     amount = serializers.DecimalField(source='total_amount', max_digits=10, decimal_places=2, read_only=True)
     formula = LoanFormulaSerializer(read_only=True)
     funded_date = serializers.SerializerMethodField()
@@ -370,6 +373,9 @@ class LoanListSerializer(serializers.ModelSerializer):
     collected_amount = serializers.SerializerMethodField()
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     ai_decision_display = serializers.CharField(source='get_ai_decision_display', read_only=True)
+    ibv_status = serializers.SerializerMethodField()
+    ibv_status_display = serializers.SerializerMethodField()
+    contract_signed = serializers.SerializerMethodField()
 
     class Meta:
         model = Loan
@@ -378,6 +384,7 @@ class LoanListSerializer(serializers.ModelSerializer):
             'customer_id',
             'customer_name',
             'customer_province',
+            'customer_banking_verified',
             'type',
             'amount',
             'principal',
@@ -391,6 +398,10 @@ class LoanListSerializer(serializers.ModelSerializer):
             'status_display',
             'ai_decision',
             'ai_decision_display',
+            'ibv_status',
+            'ibv_status_display',
+            'contract_signed',
+            'contract_signed_at',
             'is_active',
             'created_at',
         ]
@@ -415,6 +426,15 @@ class LoanListSerializer(serializers.ModelSerializer):
     def get_collected_amount(self, obj):
         return max(obj.total_amount - obj.balance, 0)
 
+    def get_ibv_status(self, obj):
+        return 'completed' if obj.customer.banking_verified else 'pending'
+
+    def get_ibv_status_display(self, obj):
+        return 'IBV Completed' if obj.customer.banking_verified else 'Pending IBV'
+
+    def get_contract_signed(self, obj):
+        return bool(obj.contract_signed_at)
+
 
 class LoanCreateSerializer(serializers.ModelSerializer):
     """Create loan."""
@@ -427,6 +447,14 @@ class LoanCreateSerializer(serializers.ModelSerializer):
         fee = validated_data.get('fee', 0)
         validated_data['total_amount'] = principal + fee
         validated_data['balance'] = principal + fee
+        customer = validated_data.get('customer')
+        if customer and not validated_data.get('status'):
+            if not customer.banking_verified:
+                validated_data['status'] = 'ibv_pending'
+            elif not customer.contract_completed:
+                validated_data['status'] = 'pending_signature'
+            else:
+                validated_data['status'] = 'pending'
         return super().create(validated_data)
 
 
@@ -468,6 +496,12 @@ class LoanApproveSerializer(serializers.Serializer):
 class LoanDeclineSerializer(serializers.Serializer):
     """Decline loan."""
     reason = serializers.CharField(required=True)
+
+
+class LoanAmountUpdateSerializer(serializers.Serializer):
+    """Update approved loan principal before funding."""
+    principal = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal('0.01'))
+    notes = serializers.CharField(required=False, allow_blank=True)
 
 
 class LoanFundSerializer(serializers.Serializer):

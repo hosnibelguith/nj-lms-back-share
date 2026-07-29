@@ -330,6 +330,40 @@ class LoanService:
             )
 
         return loan
+
+    @staticmethod
+    @transaction.atomic
+    def update_approved_amount(loan: Loan, principal: Decimal, user=None, notes: str = '') -> Loan:
+        loan = Loan.objects.select_for_update().get(pk=loan.pk)
+
+        if loan.status not in ['ibv_pending', 'pending_signature', 'pending', 'pending_funding']:
+            raise ValueError(f"Cannot update approved amount in status: {loan.status}")
+        if loan.funded_payments.filter(status__in=['processing', 'completed']).exists():
+            raise ValueError('Cannot update approved amount after funding has started.')
+
+        old_principal = loan.principal
+        principal = LoanService.money(principal)
+        if principal <= 0:
+            raise ValueError('Approved amount must be greater than zero.')
+
+        loan.principal = principal
+        loan.save(update_fields=['principal', 'updated_at'])
+        LoanService.rebuild_payment_schedule(loan, reprice=True)
+        loan.refresh_from_db()
+
+        detail = f'Approved amount changed from ${old_principal} to ${loan.principal}.'
+        if notes:
+            loan.notes = ((loan.notes or '') + f"\n{notes}").strip()
+            loan.save(update_fields=['notes', 'updated_at'])
+        loan.log_state_event(
+            event_type='amount_updated',
+            previous_status=loan.status,
+            new_status=loan.status,
+            user=user,
+            notes=detail,
+        )
+
+        return loan
     
     @staticmethod
     @transaction.atomic
@@ -516,8 +550,13 @@ class LoanService:
             frequency_days = int(formula.default_frequency_days or 14)
         else:
             total_amount = LoanService.money(
-                loan.total_amount or loan.principal or Decimal('0.00')
+                principal if reprice else (loan.total_amount or loan.principal or Decimal('0.00'))
             )
+            if reprice:
+                loan.fee = Decimal('0.00')
+                loan.total_amount = total_amount
+                loan.balance = total_amount
+                loan.save(update_fields=['fee', 'total_amount', 'balance', 'updated_at'])
             num_payments = 1
             frequency_days = 14
 

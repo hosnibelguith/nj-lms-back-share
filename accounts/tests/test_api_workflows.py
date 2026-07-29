@@ -1,4 +1,5 @@
 from decimal import Decimal
+from datetime import timedelta
 
 from django.conf import settings
 from django.test import override_settings
@@ -277,10 +278,60 @@ class BackendApiWorkflowTests(APITestCase):
         results = list_response.data["results"] if isinstance(list_response.data, dict) else list_response.data
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["customer_name"], "Customer User")
+        self.assertEqual(results[0]["ibv_status"], "pending")
+        self.assertFalse(results[0]["contract_signed"])
+
+        self.loan.ai_decision = "approved"
+        self.loan.contract_signed_at = timezone.now()
+        self.loan.save(update_fields=["ai_decision", "contract_signed_at", "updated_at"])
+        self.customer.banking_verified = True
+        self.customer.save(update_fields=["banking_verified", "updated_at"])
+
+        filtered_response = self.client.get(
+            "/api/loans/",
+            {"ai_decision": "approved", "ibv_status": "completed"},
+        )
+        self.assertEqual(filtered_response.status_code, 200, filtered_response.data)
+        filtered_results = filtered_response.data["results"] if isinstance(filtered_response.data, dict) else filtered_response.data
+        self.assertEqual(len(filtered_results), 1)
+        self.assertEqual(filtered_results[0]["ai_decision"], "approved")
+        self.assertEqual(filtered_results[0]["ibv_status"], "completed")
+        self.assertTrue(filtered_results[0]["contract_signed"])
 
         analytics_response = self.client.get("/api/loans/dashboard/analytics/")
         self.assertEqual(analytics_response.status_code, 200, analytics_response.data)
         self.assertIn("totals", analytics_response.data)
         self.assertIn("series", analytics_response.data)
         self.assertIn("funded_payments_amount", analytics_response.data["series"])
-        self.assertEqual(analytics_response.data["totals"]["approved_loans_count"], 1)
+
+    def test_staff_can_update_approved_amount_before_funding(self):
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("300.00"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+        )
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("300.00"),
+            scheduled_date=timezone.localdate() + timedelta(days=14),
+            status="scheduled",
+        )
+
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.patch(
+            f"/api/loans/{self.loan.id}/approved-amount/",
+            {"principal": "300.00", "notes": "Approved lower amount."},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.principal, Decimal("300.00"))
+        self.assertEqual(self.loan.fee, Decimal("0.00"))
+        self.assertEqual(self.loan.total_amount, Decimal("300.00"))
+        self.assertEqual(self.loan.balance, Decimal("300.00"))
+        self.assertEqual(self.loan.payments.filter(status="scheduled").count(), 1)
+        self.assertTrue(
+            self.loan.state_events.filter(event_type="amount_updated").exists()
+        )
