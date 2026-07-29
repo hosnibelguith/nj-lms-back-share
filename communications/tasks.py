@@ -3,8 +3,82 @@ from celery import shared_task
 from django.utils import timezone
 from django.conf import settings
 import logging
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+
+def _setting_bool(key: str, default: bool) -> bool:
+    from accounts.models import GlobalSetting
+
+    raw = GlobalSetting.get_value(key, str(default))
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _setting_int(key: str, default: int) -> int:
+    from accounts.models import GlobalSetting
+
+    try:
+        return int(GlobalSetting.get_value(key, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _workflow_reminder_already_sent_today(loan, template_name: str, today) -> bool:
+    return loan.communications.filter(
+        direction="outbound",
+        type="email",
+        template_name=template_name,
+        created_at__date=today,
+    ).exists()
+
+
+def _workflow_reminder_timezone() -> str:
+    from accounts.models import GlobalSetting
+
+    return GlobalSetting.get_value(
+        "LOAN_WORKFLOW_REMINDER_TIMEZONE",
+        getattr(settings, "LOAN_WORKFLOW_REMINDER_TIMEZONE", "America/New_York"),
+    ) or "America/New_York"
+
+
+def _queue_workflow_reminder(loan, template_name: str, extra_context: dict, today) -> bool:
+    from communications.models import CommunicationTemplate
+
+    max_days = _setting_int(
+        "LOAN_WORKFLOW_REMINDER_MAX_DAYS",
+        getattr(settings, "LOAN_WORKFLOW_REMINDER_MAX_DAYS", 7),
+    )
+    sent_count = loan.communications.filter(
+        direction="outbound",
+        type="email",
+        template_name=template_name,
+    ).count()
+    if sent_count >= max_days:
+        return False
+    if _workflow_reminder_already_sent_today(loan, template_name, today):
+        return False
+
+    template = CommunicationTemplate.objects.filter(
+        name=template_name,
+        type="email",
+        is_active=True,
+    ).first()
+    if not template:
+        logger.warning("Workflow reminder template missing: %s", template_name)
+        return False
+
+    send_template_message.delay(
+        str(loan.customer_id),
+        str(template.id),
+        str(loan.id),
+        extra_context={
+            "reminder_number": sent_count + 1,
+            "reminder_max_days": max_days,
+            **extra_context,
+        },
+    )
+    return True
 
 
 @shared_task(bind=True, max_retries=3)
@@ -94,6 +168,69 @@ def poll_inbound_email():
     result = poll_configured_inbound_emails(limit=settings.INBOUND_EMAIL_POLL_LIMIT)
     logger.info("Inbound email poll result: %s", result.as_dict())
     return result.as_dict()
+
+
+@shared_task
+def send_loan_workflow_reminders():
+    """
+    Send daily IBV/signature workflow reminders.
+
+    The PeriodicTask schedule is seeded at 8:30 AM America/New_York and can be
+    edited in django-celery-beat admin. GlobalSetting keys control enablement
+    and max reminder days.
+    """
+    if not _setting_bool(
+        "LOAN_WORKFLOW_REMINDERS_ENABLED",
+        getattr(settings, "LOAN_WORKFLOW_REMINDERS_ENABLED", True),
+    ):
+        logger.info("Loan workflow reminders disabled.")
+        return {"skipped": True, "reason": "disabled"}
+
+    from loans.models import Loan
+
+    frontend_url = getattr(settings, "FRONTEND_URL", "http://localhost:3000").rstrip("/")
+    tz_name = _workflow_reminder_timezone()
+    try:
+        today = timezone.localtime(timezone.now(), ZoneInfo(tz_name)).date()
+    except Exception:
+        logger.warning("Invalid workflow reminder timezone %s; using America/New_York", tz_name)
+        today = timezone.localtime(timezone.now(), ZoneInfo("America/New_York")).date()
+
+    ibv_sent = 0
+    signature_sent = 0
+
+    ibv_loans = Loan.objects.select_related("customer").filter(
+        status="ibv_pending",
+        customer__banking_verified=False,
+        is_active=True,
+    )
+    for loan in ibv_loans:
+        if _queue_workflow_reminder(
+            loan,
+            "IBV Reminder Template",
+            {"portal_url": f"{frontend_url}/customer/banking"},
+            today,
+        ):
+            ibv_sent += 1
+
+    signature_loans = Loan.objects.select_related("customer").filter(
+        status="pending_funding",
+        approved_at__isnull=False,
+        contract_signed_at__isnull=True,
+        is_active=True,
+    )
+    for loan in signature_loans:
+        if _queue_workflow_reminder(
+            loan,
+            "Contract Signature Reminder Template",
+            {"portal_url": f"{frontend_url}/customer/contracts"},
+            today,
+        ):
+            signature_sent += 1
+
+    result = {"ibv_sent": ibv_sent, "signature_sent": signature_sent}
+    logger.info("Loan workflow reminders queued: %s", result)
+    return result
 
 
 @shared_task(bind=True, max_retries=3)
@@ -264,7 +401,7 @@ def send_template_message(customer_id: str, template_id: str, loan_id: str = Non
             try:
                 loan = Loan.objects.get(id=loan_id)
                 context.update({
-                    'loan_amount': str(loan.amount),
+                    'loan_amount': str(loan.principal),
                     'loan_balance': str(loan.balance),
                     'loan_type': loan.type,
                 })

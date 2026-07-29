@@ -83,6 +83,7 @@ class ZumRailsWorkflowTests(APITestCase):
             total_amount=Decimal("600.00"),
             balance=Decimal("600.00"),
             status="pending_funding",
+            contract_signed_at=timezone.now(),
             bank_account=self.account,
             collections_account=self.account,
             is_active=True,
@@ -125,6 +126,7 @@ class ZumRailsWorkflowTests(APITestCase):
             total_amount=Decimal("360.00"),
             balance=Decimal("360.00"),
             status="pending_funding",
+            contract_signed_at=timezone.now(),
             is_active=True,
         )
 
@@ -136,6 +138,23 @@ class ZumRailsWorkflowTests(APITestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.data["error"], "Funding destination required.")
+
+    def test_funding_requires_contract_signature(self):
+        self.loan.contract_signed_at = None
+        self.loan.save(update_fields=["contract_signed_at", "updated_at"])
+
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/funding/initiate/",
+            {"method": "eft", "schedule_confirmed": True, "override_confirmed": True},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["error"], "Contract must be signed before funding.")
+
+        options_response = self.client.get(f"/api/loans/{self.loan.id}/funding/options/")
+        self.assertEqual(options_response.status_code, 200)
+        self.assertIn("Contract must be signed before funding.", options_response.data["blockers"])
 
     def test_configure_funding_saves_destinations(self):
         response = self.client.get(f"/api/loans/{self.loan.id}/funding/options/")

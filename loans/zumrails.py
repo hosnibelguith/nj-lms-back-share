@@ -161,6 +161,8 @@ def funding_configuration_ready(loan: Loan) -> dict:
     arrive_loan = is_arrive_funded_loan(loan)
     if loan.status != "pending_funding":
         blockers.append("Loan is not pending funding.")
+    if not loan.contract_signed_at:
+        blockers.append("Contract must be signed before funding.")
     if loan.funded_payments.filter(status__in=["processing", "completed"]).exists():
         blockers.append("Funding already exists for this loan.")
     if not arrive_loan:
@@ -275,6 +277,8 @@ class FundingService:
 
         if loan.status != "pending_funding":
             raise ValueError("Only loans pending funding can be funded.")
+        if not loan.contract_signed_at:
+            raise ValueError("Contract must be signed before funding.")
         if not schedule_confirmed:
             raise ValueError("Schedule confirmation required")
         if loan.funded_payments.filter(status__in=["processing", "completed"]).exists():

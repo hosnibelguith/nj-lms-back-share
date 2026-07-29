@@ -7,7 +7,9 @@ from django.utils import timezone
 from rest_framework.test import APITestCase
 from unittest.mock import patch
 
-from accounts.models import AuthOTPChallenge, Customer, User
+from accounts.models import AuthOTPChallenge, Customer, GlobalSetting, User
+from communications.models import Communication, CommunicationTemplate
+from communications.tasks import send_loan_workflow_reminders
 from loans.models import FundedPayment, Loan, LoanStateEvent, Payment
 
 
@@ -335,3 +337,111 @@ class BackendApiWorkflowTests(APITestCase):
         self.assertTrue(
             self.loan.state_events.filter(event_type="amount_updated").exists()
         )
+
+    def test_staff_can_approve_pending_signature_without_contract_signature(self):
+        self.loan.status = "pending_signature"
+        self.loan.contract_signed_at = None
+        self.loan.save(update_fields=["status", "contract_signed_at", "updated_at"])
+
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.post(f"/api/loans/{self.loan.id}/approve/", {}, format="json")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "pending_funding")
+        self.assertIsNone(self.loan.contract_signed_at)
+        self.assertTrue(
+            self.loan.state_events.filter(
+                event_type="human_approved",
+                previous_status="pending_signature",
+                new_status="pending_funding",
+            ).exists()
+        )
+
+    def test_loan_workflow_reminders_send_ibv_and_signature_once_per_day(self):
+        CommunicationTemplate.objects.create(
+            name="IBV Reminder Template",
+            type="email",
+            subject="IBV reminder",
+            content="Complete IBV at {{portal_url}}",
+            is_active=True,
+        )
+        CommunicationTemplate.objects.create(
+            name="Contract Signature Reminder Template",
+            type="email",
+            subject="Signature reminder",
+            content="Sign at {{portal_url}}",
+            is_active=True,
+        )
+        GlobalSetting.objects.update_or_create(
+            key="LOAN_WORKFLOW_REMINDERS_ENABLED",
+            defaults={"value": "True"},
+        )
+        GlobalSetting.objects.update_or_create(
+            key="LOAN_WORKFLOW_REMINDER_MAX_DAYS",
+            defaults={"value": "7"},
+        )
+
+        self.loan.status = "ibv_pending"
+        self.loan.save(update_fields=["status", "updated_at"])
+
+        approved_unsigned = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("300.00"),
+            fee=Decimal("60.00"),
+            total_amount=Decimal("360.00"),
+            balance=Decimal("360.00"),
+            status="pending_funding",
+            approved_at=timezone.now(),
+            is_active=True,
+        )
+
+        first_result = send_loan_workflow_reminders()
+        second_result = send_loan_workflow_reminders()
+
+        self.assertEqual(first_result, {"ibv_sent": 1, "signature_sent": 1})
+        self.assertEqual(second_result, {"ibv_sent": 0, "signature_sent": 0})
+        self.assertEqual(
+            self.loan.communications.filter(template_name="IBV Reminder Template").count(),
+            1,
+        )
+        self.assertEqual(
+            approved_unsigned.communications.filter(
+                template_name="Contract Signature Reminder Template"
+            ).count(),
+            1,
+        )
+
+    def test_loan_workflow_reminders_stop_after_max_days(self):
+        CommunicationTemplate.objects.create(
+            name="IBV Reminder Template",
+            type="email",
+            subject="IBV reminder",
+            content="Complete IBV at {{portal_url}}",
+            is_active=True,
+        )
+        GlobalSetting.objects.update_or_create(
+            key="LOAN_WORKFLOW_REMINDERS_ENABLED",
+            defaults={"value": "True"},
+        )
+        GlobalSetting.objects.update_or_create(
+            key="LOAN_WORKFLOW_REMINDER_MAX_DAYS",
+            defaults={"value": "1"},
+        )
+        self.loan.status = "ibv_pending"
+        self.loan.save(update_fields=["status", "updated_at"])
+        Communication.objects.create(
+            customer=self.customer,
+            loan=self.loan,
+            type="email",
+            direction="outbound",
+            to_address=self.customer.email,
+            subject="IBV reminder",
+            content="Existing reminder",
+            status="sent",
+            template_name="IBV Reminder Template",
+        )
+
+        result = send_loan_workflow_reminders()
+
+        self.assertEqual(result["ibv_sent"], 0)

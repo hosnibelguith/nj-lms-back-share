@@ -287,6 +287,16 @@ CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 CELERY_TASK_ALWAYS_EAGER = os.environ.get("CELERY_TASK_ALWAYS_EAGER", "False").lower() == "true"
 CELERY_TASK_EAGER_PROPAGATES = CELERY_TASK_ALWAYS_EAGER
 
+LOAN_WORKFLOW_REMINDERS_ENABLED = os.environ.get(
+    "LOAN_WORKFLOW_REMINDERS_ENABLED",
+    "True",
+).lower() == "true"
+LOAN_WORKFLOW_REMINDER_MAX_DAYS = int(os.environ.get("LOAN_WORKFLOW_REMINDER_MAX_DAYS", "7"))
+LOAN_WORKFLOW_REMINDER_TIMEZONE = os.environ.get(
+    "LOAN_WORKFLOW_REMINDER_TIMEZONE",
+    "America/New_York",
+)
+
 
 # -------------------------------------------------------------------
 # Email

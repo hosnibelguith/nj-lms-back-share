@@ -208,8 +208,8 @@ class LoanViewSet(viewsets.ModelViewSet):
     def approve(self, request, pk=None):
         loan = self.get_object()
 
-        if loan.status != 'pending':
-            return Response({'error': 'Only loans pending human decision can be approved'}, status=400)
+        if loan.status not in ['pending', 'pending_signature']:
+            return Response({'error': 'Only pending or pending signature loans can be approved'}, status=400)
 
         serializer = LoanApproveSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -286,6 +286,8 @@ class LoanViewSet(viewsets.ModelViewSet):
 
         if loan.status != 'pending_funding':
             return Response({'error': 'Only signed/approved loans can be funded'}, status=400)
+        if not loan.contract_signed_at:
+            return Response({'error': 'Contract must be signed before funding.'}, status=400)
 
         recommended_method = FundingMethodRecommendation.for_date()
         if is_arrive_funded_loan(loan):
