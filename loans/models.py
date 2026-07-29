@@ -237,6 +237,13 @@ class Loan(models.Model):
     
     def __str__(self):
         return f"Loan #{str(self.id)[:8]} - {self.customer} - ${self.principal}"
+
+    @property
+    def contract_signed(self):
+        return bool(
+            self.contract_signed_at
+            or getattr(self.customer, 'contract_completed', False)
+        )
     
     def save(self, *args, **kwargs):
         # Auto-calculate total_amount if not set

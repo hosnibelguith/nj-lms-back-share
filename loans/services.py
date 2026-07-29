@@ -370,7 +370,7 @@ class LoanService:
     def fund_loan(loan: Loan, method: str = 'eft', reference: str = '', user=None) -> Loan:
         if loan.status != 'pending_funding':
             raise ValueError(f"Cannot fund loan in status: {loan.status}")
-        if not loan.contract_signed_at:
+        if not loan.contract_signed:
             raise ValueError('Contract must be signed before funding.')
 
         ref = reference or f"{method.upper()}-{timezone.now().strftime('%Y%m%d')}-{str(loan.id)[:8].upper()}"

@@ -45,7 +45,7 @@ class ZumRailsWorkflowTests(APITestCase):
             status="pending",
             onboarding_stage="portal_active",
             banking_verified=True,
-            contract_completed=True,
+            contract_completed=False,
             requested_loan_amount=Decimal("500.00"),
         )
         self.connection = BankConnection.objects.create(
@@ -155,6 +155,27 @@ class ZumRailsWorkflowTests(APITestCase):
         options_response = self.client.get(f"/api/loans/{self.loan.id}/funding/options/")
         self.assertEqual(options_response.status_code, 200)
         self.assertIn("Contract must be signed before funding.", options_response.data["blockers"])
+
+    def test_customer_contract_completed_allows_funding_when_loan_timestamp_missing(self):
+        self.loan.contract_signed_at = None
+        self.loan.save(update_fields=["contract_signed_at", "updated_at"])
+        self.customer.contract_completed = True
+        self.customer.save(update_fields=["contract_completed", "updated_at"])
+
+        options_response = self.client.get(f"/api/loans/{self.loan.id}/funding/options/")
+        self.assertEqual(options_response.status_code, 200)
+        self.assertNotIn(
+            "Contract must be signed before funding.",
+            options_response.data["blockers"],
+        )
+
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/funding/initiate/",
+            {"method": "eft", "schedule_confirmed": True, "override_confirmed": True},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
 
     def test_configure_funding_saves_destinations(self):
         response = self.client.get(f"/api/loans/{self.loan.id}/funding/options/")

@@ -286,7 +286,7 @@ class LoanViewSet(viewsets.ModelViewSet):
 
         if loan.status != 'pending_funding':
             return Response({'error': 'Only signed/approved loans can be funded'}, status=400)
-        if not loan.contract_signed_at:
+        if not loan.contract_signed:
             return Response({'error': 'Contract must be signed before funding.'}, status=400)
 
         recommended_method = FundingMethodRecommendation.for_date()

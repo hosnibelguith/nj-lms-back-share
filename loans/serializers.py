@@ -243,6 +243,7 @@ class CurrentApplicationSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     ai_decision_display = serializers.CharField(source='get_ai_decision_display', read_only=True)
     formula = LoanFormulaSerializer(read_only=True)
+    contract_signed = serializers.BooleanField(read_only=True)
 
     collected_amount = serializers.SerializerMethodField()
 
@@ -269,6 +270,7 @@ class CurrentApplicationSerializer(serializers.ModelSerializer):
             'decline_reason',
             'contract_id',
             'contract_sent_at',
+            'contract_signed',
             'contract_signed_at',
             'created_at',
             'updated_at',
@@ -288,6 +290,7 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
     type_display = serializers.CharField(source='get_type_display', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     ai_decision_display = serializers.CharField(source='get_ai_decision_display', read_only=True)
+    contract_signed = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Loan
@@ -308,6 +311,9 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
             'collectedAmount',
             'funded_at',
             'fundedAt',
+            'contract_signed',
+            'contract_signed_at',
+            'contract_sent_at',
             'paymentSchedule',
             'created_at',
             'updated_at',
@@ -331,6 +337,7 @@ class LoanSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     ai_decision_display = serializers.CharField(source='get_ai_decision_display', read_only=True)
     type_display = serializers.CharField(source='get_type_display', read_only=True)
+    contract_signed = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Loan
@@ -346,7 +353,7 @@ class LoanSerializer(serializers.ModelSerializer):
             'funding_destination',
             'funding_destination_locked_at',
             'collections_account_locked_at',
-            'contract_id', 'contract_sent_at', 'contract_signed_at',
+            'contract_id', 'contract_sent_at', 'contract_signed', 'contract_signed_at',
             'approved_at', 'approved_by', 'declined_at', 'decline_reason',
             'notes', 'payments',
             'created_at', 'updated_at'
@@ -433,7 +440,7 @@ class LoanListSerializer(serializers.ModelSerializer):
         return 'IBV Completed' if obj.customer.banking_verified else 'Pending IBV'
 
     def get_contract_signed(self, obj):
-        return bool(obj.contract_signed_at)
+        return obj.contract_signed
 
 
 class LoanCreateSerializer(serializers.ModelSerializer):
