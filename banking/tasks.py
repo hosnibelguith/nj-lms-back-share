@@ -20,6 +20,11 @@ ZERO_TRANSACTIONS_MESSAGE = (
 NO_ACCOUNTS_MESSAGE = (
     'No bank accounts were returned. Please reconnect your bank account.'
 )
+UNSUPPORTED_IBV_INSTITUTIONS = {'621', '623'}
+UNSUPPORTED_INSTITUTION_MESSAGE = (
+    'We could not complete banking verification with this financial institution. '
+    'Please reconnect using a supported bank account.'
+)
 
 
 def _normalize_account_type(raw_type):
@@ -31,6 +36,20 @@ def _normalize_account_type(raw_type):
     if value in {'credit', 'loan', 'investment'}:
         return value
     return 'other'
+
+
+def _normalize_institution_number(raw_value):
+    value = ''.join(ch for ch in str(raw_value or '') if ch.isdigit())
+    return value[-3:] if len(value) >= 3 else value
+
+
+def _unsupported_institutions(accounts_data):
+    institutions = set()
+    for account in accounts_data:
+        institution = _normalize_institution_number(account.get('InstitutionNumber'))
+        if institution in UNSUPPORTED_IBV_INSTITUTIONS:
+            institutions.add(institution)
+    return institutions
 
 
 def _flinks_headers(secret_key):
@@ -151,6 +170,27 @@ def _mark_banking_failed(connection, customer, reason):
     _log_banking_failure(customer, 'Banking Verification Failed', reason)
     send_banking_retry_email.delay(str(customer.id), reason)
     logger.warning('Flinks sync failed customer_id=%s connection_id=%s', customer.id, connection.id)
+    return False
+
+
+def _delete_unsupported_banking_connection(connection, customer, reason):
+    logger.warning(
+        'Flinks sync deleting unsupported institution connection customer_id=%s connection_id=%s login_id=%s reason=%s',
+        customer.id,
+        connection.id,
+        mask_identifier(connection.login_id),
+        reason,
+    )
+
+    customer.banking_verified = False
+    if customer.onboarding_stage != 'banking_verification':
+        customer.onboarding_stage = 'banking_verification'
+    customer.save(update_fields=['banking_verified', 'onboarding_stage', 'updated_at'])
+
+    _log_banking_failure(customer, 'Banking Verification Failed', reason)
+    send_banking_retry_email.delay(str(customer.id), reason)
+    connection.delete()
+    logger.warning('Unsupported Flinks connection deleted customer_id=%s', customer.id)
     return False
 
 
@@ -441,6 +481,14 @@ def fetch_flinks_accounts_only(self, connection_id):
     )
     if total_transactions == 0:
         return _mark_banking_failed(connection, customer, ZERO_TRANSACTIONS_MESSAGE)
+
+    unsupported_institutions = _unsupported_institutions(accounts_data)
+    if unsupported_institutions:
+        reason = (
+            f"{UNSUPPORTED_INSTITUTION_MESSAGE} "
+            f"Unsupported institution number(s): {', '.join(sorted(unsupported_institutions))}."
+        )
+        return _delete_unsupported_banking_connection(connection, customer, reason)
 
     flinks_email, flinks_phone, flinks_name = _extract_holder_identity(accounts_data)
     _persist_accounts(connection, customer, accounts_data)

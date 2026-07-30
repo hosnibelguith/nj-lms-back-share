@@ -1,7 +1,9 @@
 from decimal import Decimal
+from io import StringIO
 from unittest.mock import patch
 from uuid import uuid4
 
+from django.core.management import call_command
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
@@ -137,7 +139,7 @@ class BankingConnectTests(TestCase):
         self.assertEqual(connection_a.sync_status, 'pending')
         self.assertFalse(self.customer_a.banking_verified)
 
-    def test_institution_621_is_accepted(self):
+    def _sync_payload_with_institution(self, institution_number):
         connection = BankConnection.objects.create(
             customer=self.customer_a,
             login_id=str(uuid4()),
@@ -152,25 +154,87 @@ class BankingConnectTests(TestCase):
                     'Type': 'Chequing',
                     'Currency': 'CAD',
                     'Balance': {'Current': 500},
-                    'InstitutionNumber': '621',
+                    'InstitutionNumber': institution_number,
                     'TransitNumber': '12345',
                     'AccountNumber': '9999999999',
-                    'Transactions': [{'Id': 'tx-621', 'Date': '2026-01-01', 'Description': 'Pay', 'Credit': 50}],
+                    'Transactions': [{
+                        'Id': f'tx-{institution_number}',
+                        'Date': '2026-01-01',
+                        'Description': 'Pay',
+                        'Credit': 50,
+                    }],
                 }
             ]
         }
 
         with patch('banking.tasks.requests.post') as mocked_post:
             mocked_post.side_effect = [
-                type('Resp', (), {'status_code': 200, 'json': lambda self: {'RequestId': 'req-621'}, 'text': ''})(),
+                type(
+                    'Resp',
+                    (),
+                    {
+                        'status_code': 200,
+                        'json': lambda self: {'RequestId': f'req-{institution_number}'},
+                        'text': '',
+                    },
+                )(),
                 type('Resp', (), {'status_code': 200, 'json': lambda self: accounts_payload, 'text': ''})(),
             ]
-            self.assertTrue(tasks.fetch_flinks_accounts_only(str(connection.id)))
+            result = tasks.fetch_flinks_accounts_only(str(connection.id))
 
-        connection.refresh_from_db()
+        return connection, result
+
+    def test_institution_621_is_rejected_and_connection_is_deleted(self):
+        connection, result = self._sync_payload_with_institution('621')
+
         self.customer_a.refresh_from_db()
-        self.assertEqual(connection.sync_status, 'synced')
-        self.assertTrue(self.customer_a.banking_verified)
+        self.assertFalse(result)
+        self.assertFalse(BankConnection.objects.filter(id=connection.id).exists())
+        self.assertEqual(BankAccount.objects.filter(customer=self.customer_a).count(), 0)
+        self.assertFalse(self.customer_a.banking_verified)
+        self.assertEqual(self.customer_a.onboarding_stage, 'banking_verification')
+
+    def test_institution_623_is_rejected_and_connection_is_deleted(self):
+        connection, result = self._sync_payload_with_institution('623')
+
+        self.customer_a.refresh_from_db()
+        self.assertFalse(result)
+        self.assertFalse(BankConnection.objects.filter(id=connection.id).exists())
+        self.assertEqual(BankAccount.objects.filter(customer=self.customer_a).count(), 0)
+        self.assertFalse(self.customer_a.banking_verified)
+        self.assertEqual(self.customer_a.onboarding_stage, 'banking_verification')
+
+    def test_purge_command_removes_existing_unsupported_connection(self):
+        self.customer_a.banking_verified = True
+        self.customer_a.onboarding_stage = 'contract'
+        self.customer_a.save(update_fields=['banking_verified', 'onboarding_stage', 'updated_at'])
+        connection = BankConnection.objects.create(
+            customer=self.customer_a,
+            login_id=str(uuid4()),
+            provider='flinks',
+            is_active=True,
+            sync_status='synced',
+        )
+        BankAccount.objects.create(
+            connection=connection,
+            customer=self.customer_a,
+            external_id='acct-stale-621',
+            name='Unsupported Chequing',
+            type='checking',
+            institution_number='621',
+            transit_number='12345',
+            account_number='9999999999',
+        )
+
+        output = StringIO()
+        call_command('purge_unsupported_ibv_connections', stdout=output)
+
+        self.customer_a.refresh_from_db()
+        self.assertFalse(BankConnection.objects.filter(id=connection.id).exists())
+        self.assertEqual(BankAccount.objects.filter(customer=self.customer_a).count(), 0)
+        self.assertFalse(self.customer_a.banking_verified)
+        self.assertEqual(self.customer_a.onboarding_stage, 'banking_verification')
+        self.assertIn('Deleted 1 unsupported IBV connection(s)', output.getvalue())
 
 
 @override_settings(
