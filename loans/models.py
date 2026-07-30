@@ -346,7 +346,7 @@ class Loan(models.Model):
 
         self.contract_signed_at = timezone.now()
 
-        self.status = 'pending'
+        self.status = 'pending_funding' if previous_status == 'pending_funding' else 'pending'
 
         self.is_active = True
         self.save()

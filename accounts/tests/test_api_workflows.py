@@ -10,6 +10,7 @@ from unittest.mock import patch
 from accounts.models import AuthOTPChallenge, Customer, GlobalSetting, User
 from communications.models import Communication, CommunicationTemplate
 from communications.tasks import send_loan_workflow_reminders
+from contracts.models import Contract
 from loans.models import FundedPayment, Loan, LoanStateEvent, Payment
 
 
@@ -357,6 +358,63 @@ class BackendApiWorkflowTests(APITestCase):
                 new_status="pending_funding",
             ).exists()
         )
+
+    def test_customer_can_sign_contract_after_manual_approval(self):
+        self.customer.banking_verified = True
+        self.customer.contract_completed = False
+        self.customer.onboarding_stage = "contract"
+        self.customer.save(
+            update_fields=[
+                "banking_verified",
+                "contract_completed",
+                "onboarding_stage",
+                "updated_at",
+            ]
+        )
+        self.loan.status = "pending_funding"
+        self.loan.approved_at = timezone.now()
+        self.loan.contract_signed_at = None
+        self.loan.save(update_fields=["status", "approved_at", "contract_signed_at", "updated_at"])
+        Contract.objects.create(
+            customer=self.customer,
+            loan=self.loan,
+            agreement_text="older duplicate draft",
+        )
+        Contract.objects.create(
+            customer=self.customer,
+            loan=self.loan,
+            agreement_text="newer duplicate draft",
+        )
+
+        self.client.force_authenticate(user=self.customer_user)
+
+        dashboard_response = self.client.get("/api/portal/me/dashboard/")
+        self.assertEqual(dashboard_response.status_code, 200, dashboard_response.data)
+        self.assertEqual(dashboard_response.data["portal_state"], "contract_required")
+        self.assertEqual(dashboard_response.data["next_url"], "/customer/contracts")
+
+        preview_response = self.client.get("/api/portal/me/contract-preview/")
+        self.assertEqual(preview_response.status_code, 200, preview_response.data)
+        self.assertEqual(str(preview_response.data["loan"]), str(self.loan.id))
+
+        sign_response = self.client.post(
+            "/api/portal/me/sign-contract/",
+            {
+                "typed_name": self.customer.full_name,
+                "accepted_terms": True,
+                "accepted_credit_check": True,
+                "accepted_banking_review": True,
+                "accepted_electronic_signature": True,
+            },
+            format="json",
+        )
+        self.assertEqual(sign_response.status_code, 200, sign_response.data)
+
+        self.loan.refresh_from_db()
+        self.customer.refresh_from_db()
+        self.assertEqual(self.loan.status, "pending_funding")
+        self.assertIsNotNone(self.loan.contract_signed_at)
+        self.assertTrue(self.customer.contract_completed)
 
     def test_loan_workflow_reminders_send_ibv_and_signature_once_per_day(self):
         CommunicationTemplate.objects.create(

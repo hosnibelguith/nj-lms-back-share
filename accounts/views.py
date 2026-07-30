@@ -734,9 +734,14 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
             next_url = '/customer/contracts'
 
         elif loan.status == 'pending_funding':
-            portal_state = 'pending_funding'
-            next_step = 'funding'
-            next_url = '/customer/loans'
+            if not customer.contract_completed:
+                portal_state = 'contract_required'
+                next_step = 'contract'
+                next_url = '/customer/contracts'
+            else:
+                portal_state = 'pending_funding'
+                next_step = 'funding'
+                next_url = '/customer/loans'
 
         elif loan.status == 'pending':
             if not customer.contract_completed:
@@ -786,6 +791,7 @@ class CustomerPortalContractPreviewView(CustomerPortalBaseView):
                 'pending_signature',
                 'ibv_pending',
                 'pending',
+                'pending_funding',
             ]
         ).order_by('-created_at').first()
 
@@ -805,18 +811,24 @@ class CustomerPortalContractPreviewView(CustomerPortalBaseView):
 
         from contracts.services import AGREEMENT_VERSION, render_loan_agreement
         if loan.status == 'ibv_pending':
-            from loans.services import LoanService
             loan = LoanService.mark_pending_signature(loan)
 
-        contract, _ = Contract.objects.get_or_create(
-            customer=customer,
-            loan=loan,
-            defaults={
-                'created_by': None,
-                'agreement_version': AGREEMENT_VERSION,
-                'agreement_text': render_loan_agreement(customer, loan),
-            },
+        contract = (
+            Contract.objects.filter(customer=customer, loan=loan, status='signed')
+            .order_by('-signed_date', '-created_at')
+            .first()
+            or Contract.objects.filter(customer=customer, loan=loan)
+            .order_by('-created_at')
+            .first()
         )
+        if not contract:
+            contract = Contract.objects.create(
+                customer=customer,
+                loan=loan,
+                created_by=None,
+                agreement_version=AGREEMENT_VERSION,
+                agreement_text=render_loan_agreement(customer, loan),
+            )
 
         # Keep draft agreements fresh with current loan/bank variables.
         if contract.status != 'signed':
@@ -861,6 +873,7 @@ class CustomerPortalSignContractView(CustomerPortalBaseView):
                 'pending_signature',
                 'ibv_pending',
                 'pending',
+                'pending_funding',
             ]
         ).order_by('-created_at').first()
 
@@ -872,17 +885,24 @@ class CustomerPortalSignContractView(CustomerPortalBaseView):
 
         from contracts.services import AGREEMENT_VERSION, render_loan_agreement
         if loan.status == 'ibv_pending':
-            from loans.services import LoanService
             loan = LoanService.mark_pending_signature(loan)
 
-        contract, _ = Contract.objects.get_or_create(
-            customer=customer,
-            loan=loan,
-            defaults={
-                'agreement_version': AGREEMENT_VERSION,
-                'agreement_text': render_loan_agreement(customer, loan),
-            },
+        contract = (
+            Contract.objects.filter(customer=customer, loan=loan)
+            .exclude(status='signed')
+            .order_by('-created_at')
+            .first()
+            or Contract.objects.filter(customer=customer, loan=loan, status='signed')
+            .order_by('-signed_date', '-created_at')
+            .first()
         )
+        if not contract:
+            contract = Contract.objects.create(
+                customer=customer,
+                loan=loan,
+                agreement_version=AGREEMENT_VERSION,
+                agreement_text=render_loan_agreement(customer, loan),
+            )
 
         # Freeze the filled agreement text at signature time.
         if contract.status != 'signed':

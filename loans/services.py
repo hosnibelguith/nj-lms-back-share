@@ -424,7 +424,7 @@ class LoanService:
     @transaction.atomic
     def sign_customer_contract(customer: Customer) -> Loan:
         loan = customer.loans.filter(
-            status__in=['pending_signature', 'pending', 'ibv_pending']
+            status__in=['pending_signature', 'pending', 'ibv_pending', 'pending_funding']
         ).order_by('-created_at').first()
 
         if not loan:
@@ -433,7 +433,7 @@ class LoanService:
         if not customer.banking_verified:
             raise ValueError('Banking verification must be completed before signing.')
 
-        if loan.status != 'pending_signature':
+        if loan.status not in ['pending_signature', 'pending_funding']:
             LoanService.mark_pending_signature(loan)
 
         loan.mark_contract_signed()
