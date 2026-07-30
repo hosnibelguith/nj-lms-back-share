@@ -69,3 +69,5 @@ class CustomerPortalBankingStatusSerializer(serializers.Serializer):
     last_synced_at = serializers.DateTimeField(allow_null=True)
     account_count = serializers.IntegerField()
     failure_message = serializers.CharField(allow_null=True, required=False)
+    failure_reason_code = serializers.CharField(allow_null=True, required=False)
+    requires_ibv_refill = serializers.BooleanField(required=False)

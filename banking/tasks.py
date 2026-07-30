@@ -25,6 +25,7 @@ UNSUPPORTED_INSTITUTION_MESSAGE = (
     'We could not complete banking verification with this financial institution. '
     'Please reconnect using a supported bank account.'
 )
+UNSUPPORTED_IBV_REASON_CODE = 'unsupported_ibv_institution'
 
 
 def _normalize_account_type(raw_type):
@@ -134,9 +135,13 @@ def _count_transactions(accounts_data):
     return total
 
 
-def _log_banking_failure(customer, title, description):
+def _log_banking_failure(customer, title, description, metadata=None):
     try:
         from activity.models import ActivityHistory
+
+        activity_metadata = {'source': 'flinks_sync'}
+        if metadata:
+            activity_metadata.update(metadata)
 
         ActivityHistory.objects.create(
             customer=customer,
@@ -144,7 +149,7 @@ def _log_banking_failure(customer, title, description):
             title=title,
             description=description,
             created_by='system',
-            metadata={'source': 'flinks_sync'},
+            metadata=activity_metadata,
         )
     except Exception:
         logger.exception('Failed to log banking failure activity for customer=%s', customer.id)
@@ -173,7 +178,7 @@ def _mark_banking_failed(connection, customer, reason):
     return False
 
 
-def _delete_unsupported_banking_connection(connection, customer, reason):
+def _delete_unsupported_banking_connection(connection, customer, reason, institutions):
     logger.warning(
         'Flinks sync deleting unsupported institution connection customer_id=%s connection_id=%s login_id=%s reason=%s',
         customer.id,
@@ -187,7 +192,15 @@ def _delete_unsupported_banking_connection(connection, customer, reason):
         customer.onboarding_stage = 'banking_verification'
     customer.save(update_fields=['banking_verified', 'onboarding_stage', 'updated_at'])
 
-    _log_banking_failure(customer, 'Banking Verification Failed', reason)
+    _log_banking_failure(
+        customer,
+        'Banking Verification Reset',
+        reason,
+        metadata={
+            'reason_code': UNSUPPORTED_IBV_REASON_CODE,
+            'unsupported_institutions': sorted(institutions),
+        },
+    )
     send_banking_retry_email.delay(str(customer.id), reason)
     connection.delete()
     logger.warning('Unsupported Flinks connection deleted customer_id=%s', customer.id)
@@ -314,6 +327,14 @@ def send_banking_retry_email(customer_id, failure_reason=''):
         customer = Customer.objects.get(id=customer_id)
         frontend_url = settings.FRONTEND_URL.rstrip('/')
         banking_url = f'{frontend_url}/customer/banking'
+        is_unsupported_institution = UNSUPPORTED_INSTITUTION_MESSAGE in (failure_reason or '')
+        action_copy = (
+            'The bank account you connected is not supported for IBV. '
+            'Please refill IBV by reconnecting with a supported bank account. '
+            'If you reconnect the same unsupported institution again, it will not count as completed.'
+            if is_unsupported_institution
+            else 'Please reconnect your bank account.'
+        )
 
         send_mail(
             subject='Action Required: Please reconnect your bank account',
@@ -321,7 +342,8 @@ def send_banking_retry_email(customer_id, failure_reason=''):
                 f'Hello {customer.first_name},\n\n'
                 f'We were unable to complete your banking verification.\n\n'
                 f'{failure_reason}\n\n'
-                f'Please reconnect your bank account here:\n{banking_url}\n\n'
+                f'{action_copy}\n\n'
+                f'Refill IBV here:\n{banking_url}\n\n'
                 f'Thank you,\nLendStack'
             ),
             from_email=settings.DEFAULT_FROM_EMAIL,
@@ -488,7 +510,12 @@ def fetch_flinks_accounts_only(self, connection_id):
             f"{UNSUPPORTED_INSTITUTION_MESSAGE} "
             f"Unsupported institution number(s): {', '.join(sorted(unsupported_institutions))}."
         )
-        return _delete_unsupported_banking_connection(connection, customer, reason)
+        return _delete_unsupported_banking_connection(
+            connection,
+            customer,
+            reason,
+            unsupported_institutions,
+        )
 
     flinks_email, flinks_phone, flinks_name = _extract_holder_identity(accounts_data)
     _persist_accounts(connection, customer, accounts_data)

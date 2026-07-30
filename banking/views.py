@@ -13,7 +13,7 @@ from .serializers import (
     FinancialAnalysisReportSerializer,
     CustomerPortalBankingStatusSerializer,
 )
-from .tasks import fetch_flinks_accounts_only
+from .tasks import fetch_flinks_accounts_only, UNSUPPORTED_IBV_REASON_CODE
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +98,14 @@ class CustomerPortalBankingStatusView(CustomerPortalBaseView):
     def get(self, request):
         customer = self.get_customer(request)
         connection = customer.bank_connections.filter(is_active=True).order_by('-created_at').first()
+        latest_failure = customer.activities.filter(
+            metadata__reason_code=UNSUPPORTED_IBV_REASON_CODE,
+        ).order_by('-created_at').first()
+        failure_reason_code = (
+            latest_failure.metadata.get('reason_code')
+            if latest_failure and isinstance(latest_failure.metadata, dict)
+            else None
+        )
 
         payload = {
             'banking_verified': customer.banking_verified,
@@ -106,7 +114,17 @@ class CustomerPortalBankingStatusView(CustomerPortalBaseView):
             'connection_status': connection.sync_status if connection else None,
             'last_synced_at': connection.last_synced_at if connection else None,
             'account_count': customer.bank_accounts.filter(connection__is_active=True).count(),
-            'failure_message': connection.sync_error if connection and connection.sync_status == 'failed' else None,
+            'failure_message': (
+                connection.sync_error
+                if connection and connection.sync_status == 'failed'
+                else latest_failure.description if latest_failure else None
+            ),
+            'failure_reason_code': failure_reason_code,
+            'requires_ibv_refill': (
+                not customer.banking_verified
+                and customer.onboarding_stage == 'banking_verification'
+                and failure_reason_code == UNSUPPORTED_IBV_REASON_CODE
+            ),
         }
 
         serializer = CustomerPortalBankingStatusSerializer(payload)
