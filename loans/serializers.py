@@ -121,22 +121,25 @@ class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
         ]
 
     def get_balance_after(self, obj):
+        """
+        Remaining loan total after this installment in schedule order.
+        Uses all payments (including scheduled) so the table declines correctly
+        before any collections are completed.
+        """
         loan = obj.loan
         payments = list(
-            loan.payments.order_by('scheduled_date', 'created_at').only(
-                'id', 'amount', 'status', 'scheduled_date', 'created_at'
+            loan.payments.order_by('scheduled_date', 'created_at', 'id').only(
+                'id', 'amount', 'scheduled_date', 'created_at'
             )
         )
 
-        running_balance = loan.total_amount
+        running_balance = loan.total_amount or Decimal('0.00')
         for payment in payments:
-            if payment.status == 'completed':
-                running_balance -= payment.amount
-
+            running_balance -= payment.amount or Decimal('0.00')
             if payment.id == obj.id:
-                return max(running_balance, 0)
+                return max(running_balance, Decimal('0.00'))
 
-        return loan.balance
+        return max(loan.balance or Decimal('0.00'), Decimal('0.00'))
 
 
 class FundedPaymentSerializer(serializers.ModelSerializer):
