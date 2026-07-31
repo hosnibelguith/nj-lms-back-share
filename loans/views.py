@@ -118,10 +118,10 @@ class LoanViewSet(viewsets.ModelViewSet):
     # -------------------------
     # QUERY FILTERING
     # -------------------------
-    def get_queryset(self):
+    def _filtered_queryset(self, *, ignore_status=False):
         qs = super().get_queryset()
 
-        status_param = self.request.query_params.get('status')
+        status_param = None if ignore_status else self.request.query_params.get('status')
         if status_param:
             qs = qs.filter(status=status_param)
 
@@ -201,6 +201,33 @@ class LoanViewSet(viewsets.ModelViewSet):
             qs = qs.order_by(allowed_ordering[ordering])
 
         return qs
+
+    def get_queryset(self):
+        return self._filtered_queryset(ignore_status=False)
+
+    @action(detail=False, methods=['get'], url_path='status-summary')
+    def status_summary(self, request):
+        """
+        Full loan counts by status bucket for the current list filters.
+        Ignores `status` so top cards stay a useful breakdown while other
+        filters (search, province, AI, IBV, dates) still apply.
+        """
+        qs = self._filtered_queryset(ignore_status=True)
+        by_status = {
+            row['status']: row['count']
+            for row in qs.values('status').annotate(count=Count('id'))
+        }
+
+        pending_statuses = ('ibv_pending', 'pending', 'pending_signature')
+        return Response({
+            'pending': sum(by_status.get(status, 0) for status in pending_statuses),
+            'approved': by_status.get('pending_funding', 0),
+            'active': by_status.get('active', 0),
+            'declined': by_status.get('human_declined', 0),
+            'paid_off': by_status.get('paid_off', 0),
+            'defaulted': by_status.get('defaulted', 0),
+        })
+
     # =====================================================
     # ACTIONS
     # =====================================================
@@ -342,6 +369,8 @@ class LoanViewSet(viewsets.ModelViewSet):
         recommended_method = FundingMethodRecommendation.for_date()
         if is_arrive_funded_loan(loan):
             recommended_method = 'card_issuance'
+        elif recommended_method == 'card_issuance':
+            recommended_method = 'eft'
         collections_account = loan.collections_account or loan.bank_account
         readiness = funding_configuration_ready(loan)
         return Response({
