@@ -5,7 +5,7 @@ Called by views and celery tasks.
 """
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import timedelta
-from django.db import transaction
+from django.db import models, transaction
 from django.utils import timezone
 from accounts.models import Customer
 from .models import Loan, Payment, LoanFormula, FundedPayment
@@ -604,17 +604,162 @@ class LoanService:
             start_date=first_date,
             frequency_days=frequency_days,
         )
+
+    @staticmethod
+    @transaction.atomic
+    def adjust_payment_schedule(
+        loan: Loan,
+        *,
+        payment_amount: Decimal,
+        frequency: str,
+        start_date,
+        user=None,
+        notes: str = '',
+    ) -> list:
+        """
+        Reprice the loan using the staff-selected installment amount and
+        cadence, then replace only unprocessed scheduled payments.
+
+        The number of installments is solved from the chosen payment amount:
+        choose the smallest schedule where payment_amount * n covers principal
+        + brokerage + daily interest for n periods. The final installment is
+        adjusted to the exact remaining balance.
+        """
+        if loan.status not in [
+            'pending_signature',
+            'pending',
+            'pending_funding',
+            'active',
+            'defaulted',
+        ]:
+            raise ValueError(f"Cannot adjust schedule in status: {loan.status}")
+
+        payment_amount = LoanService.money(payment_amount)
+        if payment_amount <= 0:
+            raise ValueError('Payment amount must be greater than zero.')
+
+        frequency_days_by_key = {
+            'weekly': 7,
+            'bi-weekly': 14,
+            'monthly': 30,
+        }
+        frequency_days = frequency_days_by_key.get(frequency)
+        if not frequency_days:
+            raise ValueError('Invalid payment frequency.')
+
+        principal = LoanService.money(loan.principal or Decimal('0.00'))
+        if principal <= 0:
+            raise ValueError('Loan principal must be greater than zero.')
+
+        formula = LoanService.get_formula_for_amount(principal) or loan.formula
+        if formula:
+            amounts = LoanService.calculate_from_formula(formula, principal)
+            priced_principal = amounts['total_amount']
+            annual_rate = formula.annual_interest_rate
+        else:
+            priced_principal = principal
+            annual_rate = Decimal('0.00')
+
+        paid_total = loan.payments.filter(status='completed').aggregate(
+            total=models.Sum('amount')
+        )['total'] or Decimal('0.00')
+
+        max_payments = 260
+        num_payments = None
+        total_amount = None
+        balance_due = None
+
+        for candidate_count in range(1, max_payments + 1):
+            candidate_total = LoanService.calculate_schedule_total(
+                principal_balance=priced_principal,
+                annual_rate_percent=annual_rate,
+                start_date=start_date,
+                num_payments=candidate_count,
+                frequency_days=frequency_days,
+            )
+            candidate_balance = max(
+                LoanService.money(candidate_total - paid_total),
+                Decimal('0.00'),
+            )
+            if payment_amount * Decimal(candidate_count) >= candidate_balance:
+                num_payments = candidate_count
+                total_amount = candidate_total
+                balance_due = candidate_balance
+                break
+
+        if num_payments is None or total_amount is None or balance_due is None:
+            minimum_payment = LoanService.money(
+                max(
+                    LoanService.calculate_schedule_total(
+                        principal_balance=priced_principal,
+                        annual_rate_percent=annual_rate,
+                        start_date=start_date,
+                        num_payments=max_payments,
+                        frequency_days=frequency_days,
+                    ) - paid_total,
+                    Decimal('0.00'),
+                ) / Decimal(max_payments)
+            )
+            raise ValueError(
+                f'Payment amount is too low for this schedule. '
+                f'Use at least ${minimum_payment}.'
+            )
+
+        if balance_due <= 0:
+            raise ValueError('This loan has no remaining balance to schedule.')
+
+        Payment.objects.filter(loan=loan, status='scheduled').delete()
+
+        loan.formula = formula
+        loan.fee = LoanService.money(total_amount - principal)
+        loan.total_amount = total_amount
+        loan.balance = balance_due
+        loan.save(
+            update_fields=[
+                'formula',
+                'fee',
+                'total_amount',
+                'balance',
+                'updated_at',
+            ]
+        )
+
+        payments = LoanService.generate_payment_schedule(
+            loan=loan,
+            num_payments=num_payments,
+            payment_amount=payment_amount,
+            start_date=start_date,
+            frequency_days=frequency_days,
+            schedule_total=balance_due,
+        )
+
+        detail = (
+            f'Schedule adjusted to {num_payments} {frequency} payment(s) '
+            f'from {start_date}; target payment ${payment_amount}.'
+        )
+        if notes:
+            detail = f'{detail} {notes}'
+        loan.log_state_event(
+            event_type='amount_updated',
+            previous_status=loan.status,
+            new_status=loan.status,
+            user=user,
+            notes=detail,
+        )
+
+        return payments
     
     @staticmethod
     @transaction.atomic
-    def generate_payment_schedule(loan: Loan, num_payments: int, 
-                                  payment_amount: Decimal, 
+    def generate_payment_schedule(loan: Loan, num_payments: int,
+                                  payment_amount: Decimal,
                                   start_date,
-                                  frequency_days: int = 14) -> list:
+                                  frequency_days: int = 14,
+                                  schedule_total: Decimal = None) -> list:
         """Generate a payment schedule for a loan."""
         payments = []
         current_date = start_date
-        remaining = loan.total_amount
+        remaining = LoanService.money(schedule_total or loan.total_amount)
         
         for i in range(num_payments):
             is_last = (i == num_payments - 1)

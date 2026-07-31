@@ -44,6 +44,7 @@ from .serializers import (
     PaymentCreateSerializer,
     LoanApproveSerializer,
     LoanAmountUpdateSerializer,
+    LoanScheduleAdjustSerializer,
     LoanDeclineSerializer,
     LoanFundSerializer,
     LoanFundingConfigurationSerializer,
@@ -342,6 +343,28 @@ class LoanViewSet(viewsets.ModelViewSet):
         except ValueError as exc:
             return Response({'error': str(exc)}, status=400)
 
+        return Response(LoanSerializer(loan).data)
+
+    @action(detail=True, methods=['patch'], url_path='adjust-schedule')
+    def adjust_schedule(self, request, pk=None):
+        loan = self.get_object()
+
+        serializer = LoanScheduleAdjustSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            LoanService.adjust_payment_schedule(
+                loan=loan,
+                payment_amount=serializer.validated_data['payment_amount'],
+                frequency=serializer.validated_data['frequency'],
+                start_date=serializer.validated_data['start_date'],
+                user=request.user,
+                notes=serializer.validated_data.get('notes') or '',
+            )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
+
+        loan.refresh_from_db()
         return Response(LoanSerializer(loan).data)
 
     @action(detail=True, methods=['post'])

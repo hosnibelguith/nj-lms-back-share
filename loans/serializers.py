@@ -529,6 +529,14 @@ class LoanAmountUpdateSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True)
 
 
+class LoanScheduleAdjustSerializer(serializers.Serializer):
+    """Reprice and replace the scheduled repayment calendar."""
+    payment_amount = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal('0.01'))
+    frequency = serializers.ChoiceField(choices=['weekly', 'bi-weekly', 'monthly'])
+    start_date = serializers.DateField()
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+
 class LoanFundSerializer(serializers.Serializer):
     method = serializers.ChoiceField(choices=['etransfer', 'eft', 'card_issuance'])
     reference = serializers.CharField(required=False, allow_blank=True, max_length=100)

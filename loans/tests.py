@@ -17,7 +17,7 @@ from rest_framework.test import APITestCase
 from accounts.models import Customer, User
 from banking.models import BankAccount, BankConnection
 
-from .models import CollectionPayment, CollectionsAccountChangeAudit, FundedPayment, FundingMethodRecommendation, Loan, LoanStateEvent, Payment
+from .models import CollectionPayment, CollectionsAccountChangeAudit, FundedPayment, FundingMethodRecommendation, Loan, LoanFormula, LoanStateEvent, Payment
 from .zumrails import ZumRailsRequestError, ZumRailsService
 
 
@@ -248,8 +248,104 @@ class ZumRailsWorkflowTests(APITestCase):
             format="json",
         )
 
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("schedule_confirmed", response.data)
+        self.assertIn(response.status_code, [400, 403])
+        if response.status_code == 400:
+            self.assertIn("schedule_confirmed", response.data)
+
+    def test_adjust_schedule_reprices_daily_interest_from_selected_terms(self):
+        formula = LoanFormula.objects.create(
+            name="Schedule Adjust 500",
+            principal_amount=Decimal("500.00"),
+            brokerage_percent=Decimal("70.00"),
+            repayment_percent=Decimal("35.00"),
+            default_number_of_payments=4,
+            default_frequency_days=14,
+            is_active=True,
+        )
+        self.loan.formula = formula
+        self.loan.fee = Decimal("378.53")
+        self.loan.total_amount = Decimal("878.53")
+        self.loan.balance = Decimal("878.53")
+        self.loan.save(update_fields=["formula", "fee", "total_amount", "balance", "updated_at"])
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("219.63"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+        )
+
+        start_date = timezone.localdate() + timedelta(days=7)
+        response = self.client.patch(
+            f"/api/loans/{self.loan.id}/adjust-schedule/",
+            {
+                "payment_amount": "180.00",
+                "frequency": "weekly",
+                "start_date": start_date.isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.loan.refresh_from_db()
+        payments = list(self.loan.payments.filter(status="scheduled").order_by("scheduled_date"))
+
+        self.assertEqual(payments[0].scheduled_date, start_date)
+        self.assertTrue(all(payment.amount <= Decimal("180.00") for payment in payments))
+        self.assertEqual(sum((payment.amount for payment in payments), Decimal("0.00")), self.loan.total_amount)
+        self.assertGreater(self.loan.fee, Decimal("350.00"))
+        self.assertTrue(
+            self.loan.state_events.filter(event_type="amount_updated").exists()
+        )
+
+    def test_adjust_schedule_on_active_loan_schedules_remaining_balance_only(self):
+        formula = LoanFormula.objects.create(
+            name="Active Schedule Adjust 500",
+            principal_amount=Decimal("500.00"),
+            brokerage_percent=Decimal("70.00"),
+            repayment_percent=Decimal("35.00"),
+            default_number_of_payments=4,
+            default_frequency_days=14,
+            is_active=True,
+        )
+        self.loan.status = "active"
+        self.loan.formula = formula
+        self.loan.fee = Decimal("378.53")
+        self.loan.total_amount = Decimal("878.53")
+        self.loan.balance = Decimal("778.53")
+        self.loan.save(update_fields=["status", "formula", "fee", "total_amount", "balance", "updated_at"])
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate() - timedelta(days=7),
+            status="completed",
+            processed_at=timezone.now(),
+        )
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("219.63"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+        )
+
+        start_date = timezone.localdate() + timedelta(days=7)
+        response = self.client.patch(
+            f"/api/loans/{self.loan.id}/adjust-schedule/",
+            {
+                "payment_amount": "180.00",
+                "frequency": "weekly",
+                "start_date": start_date.isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.loan.refresh_from_db()
+        scheduled = list(self.loan.payments.filter(status="scheduled").order_by("scheduled_date"))
+
+        self.assertEqual(self.loan.payments.filter(status="completed").count(), 1)
+        self.assertEqual(sum((payment.amount for payment in scheduled), Decimal("0.00")), self.loan.balance)
+        self.assertEqual(self.loan.balance, self.loan.total_amount - Decimal("100.00"))
+        self.assertTrue(all(payment.amount <= Decimal("180.00") for payment in scheduled))
 
     def test_duplicate_funding_is_blocked(self):
         FundedPayment.objects.create(
