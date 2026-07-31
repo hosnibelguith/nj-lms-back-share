@@ -424,29 +424,26 @@ class LoanViewSet(viewsets.ModelViewSet):
         loan = self.get_object()
 
         from loans.zumrails import is_arrive_funded_loan
-        # Arrive loans fund via Card Issuance — bank destination config is optional.
-        if is_arrive_funded_loan(loan):
-            readiness = funding_configuration_ready(loan)
-            collections_account = loan.collections_account or loan.bank_account
-            return Response({
-                'loan_id': str(loan.id),
-                'funding_destination': loan.funding_destination,
-                'collections_account': collections_account.id if collections_account else None,
-                **readiness,
-            })
-
         serializer = LoanFundingConfigurationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         try:
-            loan = FundingConfigurationService.configure(
-                loan,
-                emt_email=serializer.validated_data.get('emt_email'),
-                emt_source=serializer.validated_data.get('emt_source'),
-                eft_bank_account_id=serializer.validated_data.get('eft_bank_account_id'),
-                collections_account_id=serializer.validated_data.get('collections_account_id'),
-                user=request.user,
-            )
+            # Arrive: only collections account is configurable (Card Issuance funds the card).
+            if is_arrive_funded_loan(loan):
+                loan = FundingConfigurationService.configure(
+                    loan,
+                    collections_account_id=serializer.validated_data.get('collections_account_id'),
+                    user=request.user,
+                )
+            else:
+                loan = FundingConfigurationService.configure(
+                    loan,
+                    emt_email=serializer.validated_data.get('emt_email'),
+                    emt_source=serializer.validated_data.get('emt_source'),
+                    eft_bank_account_id=serializer.validated_data.get('eft_bank_account_id'),
+                    collections_account_id=serializer.validated_data.get('collections_account_id'),
+                    user=request.user,
+                )
         except BankAccount.DoesNotExist:
             return Response({'error': 'Selected account must belong to this customer.'}, status=400)
         except ValueError as exc:

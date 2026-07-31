@@ -192,6 +192,10 @@ def funding_configuration_ready(loan: Loan) -> dict:
             blockers.append("Funding destination required.")
         if not collections_configured:
             blockers.append("Collections account required.")
+    elif not collections_configured:
+        # Arrive funds via Card Issuance, but staff must still pick the
+        # collections (repayment) bank account when multiple chequing accounts exist.
+        blockers.append("Collections account required.")
     return {
         "emt_configured": emt_configured,
         "eft_configured": eft_configured,
@@ -557,7 +561,7 @@ class FundingService:
                 collections_account = (
                     collections_account or loan.collections_account or loan.bank_account
                 )
-                if method in ("eft", "etransfer") and not collections_account:
+                if method in ("eft", "etransfer", "card_issuance") and not collections_account:
                     raise ValueError("Collections account required")
 
                 if method == "card_issuance":
