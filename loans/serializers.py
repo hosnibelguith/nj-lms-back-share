@@ -371,6 +371,8 @@ class LoanSerializer(serializers.ModelSerializer):
 class LoanListSerializer(serializers.ModelSerializer):
     """List serializer aligned with current loans page."""
     customer_name = serializers.SerializerMethodField()
+    customer_email = serializers.EmailField(source='customer.email', read_only=True)
+    customer_phone = serializers.CharField(source='customer.phone', read_only=True)
     customer_province = serializers.SerializerMethodField()
     customer_banking_verified = serializers.BooleanField(source='customer.banking_verified', read_only=True)
     amount = serializers.DecimalField(source='total_amount', max_digits=10, decimal_places=2, read_only=True)
@@ -390,6 +392,8 @@ class LoanListSerializer(serializers.ModelSerializer):
             'id',
             'customer_id',
             'customer_name',
+            'customer_email',
+            'customer_phone',
             'customer_province',
             'customer_banking_verified',
             'type',

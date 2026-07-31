@@ -1,4 +1,5 @@
 from decimal import Decimal
+import re
 
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
@@ -6,8 +7,8 @@ from rest_framework.response import Response
 
 from django.utils import timezone
 from django.utils.dateparse import parse_date
-from django.db.models import Q, Sum, Count, F
-from django.db.models.functions import TruncDate
+from django.db.models import Q, Sum, Count, F, Value, CharField
+from django.db.models.functions import TruncDate, Concat
 
 from banking.models import BankAccount
 
@@ -157,12 +158,47 @@ class LoanViewSet(viewsets.ModelViewSet):
 
         search = self.request.query_params.get('search')
         if search:
-            qs = qs.filter(
-                Q(id__icontains=search) |
-                Q(customer__first_name__icontains=search) |
-                Q(customer__last_name__icontains=search) |
-                Q(customer__email__icontains=search)
-            )
+            raw = search.strip()
+            if raw:
+                qs = qs.annotate(
+                    _customer_full_name=Concat(
+                        'customer__first_name',
+                        Value(' '),
+                        'customer__last_name',
+                        output_field=CharField(),
+                    )
+                )
+                filters = (
+                    Q(id__icontains=raw) |
+                    Q(customer__first_name__icontains=raw) |
+                    Q(customer__last_name__icontains=raw) |
+                    Q(customer__email__icontains=raw) |
+                    Q(customer__phone__icontains=raw) |
+                    Q(customer__phone_normalized__icontains=raw) |
+                    Q(_customer_full_name__icontains=raw)
+                )
+
+                # Multi-word English names: each token can match first or last name.
+                tokens = [token for token in raw.split() if token]
+                if len(tokens) >= 2:
+                    name_q = Q()
+                    for token in tokens:
+                        name_q &= (
+                            Q(customer__first_name__icontains=token) |
+                            Q(customer__last_name__icontains=token) |
+                            Q(_customer_full_name__icontains=token)
+                        )
+                    filters |= name_q
+
+                # Phone search ignores formatting: "(416) 555-0100" → "4165550100".
+                digits = re.sub(r'\D', '', raw)
+                if len(digits) >= 3:
+                    filters |= (
+                        Q(customer__phone__icontains=digits) |
+                        Q(customer__phone_normalized__icontains=digits)
+                    )
+
+                qs = qs.filter(filters)
 
         date_from = self.request.query_params.get('date_from')
         if date_from:
