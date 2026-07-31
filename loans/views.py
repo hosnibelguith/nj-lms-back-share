@@ -63,6 +63,19 @@ class StaffOnlyPermission(permissions.BasePermission):
         )
 
 
+class ManagerOrAdminPermission(permissions.BasePermission):
+    """Staff Manager (4) or Admin (5) only."""
+
+    def has_permission(self, request, view):
+        user = request.user
+        return bool(
+            user
+            and user.is_authenticated
+            and getattr(user, 'user_type', None) == 'staff'
+            and getattr(user, 'has_permission', lambda _lvl: False)(4)
+        )
+
+
 # =====================================================
 # LOANS
 # =====================================================
@@ -328,8 +341,44 @@ class LoanViewSet(viewsets.ModelViewSet):
 
         return Response(LoanSerializer(loan).data)
 
+    @action(
+        detail=True,
+        methods=['post'],
+        url_path='revert-decline',
+        permission_classes=[ManagerOrAdminPermission],
+    )
+    def revert_decline(self, request, pk=None):
+        loan = self.get_object()
+
+        if loan.status != 'human_declined':
+            return Response(
+                {'error': 'Only human-declined loans can be reverted to approve'},
+                status=400,
+            )
+
+        notes = ''
+        if isinstance(request.data, dict):
+            notes = (request.data.get('notes') or '').strip()
+
+        try:
+            loan = LoanService.revert_decline_to_approve(
+                loan=loan,
+                approved_by=request.user,
+                notes=notes or None,
+            )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
+
+        return Response(LoanSerializer(loan).data)
+
     @action(detail=True, methods=['post'])
     def fund(self, request, pk=None):
+        if not ManagerOrAdminPermission().has_permission(request, self):
+            return Response(
+                {'error': 'Only Manager or Admin can fund loans.'},
+                status=403,
+            )
+
         loan = self.get_object()
 
         from loans.zumrails import is_arrive_funded_loan

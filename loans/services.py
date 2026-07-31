@@ -333,6 +333,37 @@ class LoanService:
 
     @staticmethod
     @transaction.atomic
+    def revert_decline_to_approve(loan: Loan, approved_by=None, notes: str = None) -> Loan:
+        """Undo a human decline and move the loan back to approved (pending funding)."""
+        if loan.status != 'human_declined':
+            raise ValueError(f"Cannot revert decline for loan in status: {loan.status}")
+
+        previous_status = loan.status
+        loan.status = 'pending_funding'
+        loan.is_active = True
+        loan.approved_at = timezone.now()
+        loan.approved_by = approved_by
+        loan.declined_at = None
+        loan.decline_reason = ''
+        if notes:
+            loan.notes = ((loan.notes or '') + f"\n{notes}").strip()
+        loan.save()
+
+        loan.log_state_event(
+            event_type='human_approved',
+            previous_status=previous_status,
+            new_status=loan.status,
+            user=approved_by,
+            notes=notes or 'Reverted decline to approve',
+        )
+
+        from accounts.arrive_integration import queue_decision_webhook
+        queue_decision_webhook(loan, 'approved')
+
+        return loan
+
+    @staticmethod
+    @transaction.atomic
     def update_approved_amount(loan: Loan, principal: Decimal, user=None, notes: str = '') -> Loan:
         loan = Loan.objects.select_for_update().get(pk=loan.pk)
 
