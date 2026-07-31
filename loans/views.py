@@ -137,7 +137,11 @@ class LoanViewSet(viewsets.ModelViewSet):
 
         status_param = None if ignore_status else self.request.query_params.get('status')
         if status_param:
-            qs = qs.filter(status=status_param)
+            statuses = [part.strip() for part in status_param.split(',') if part.strip()]
+            if len(statuses) == 1:
+                qs = qs.filter(status=statuses[0])
+            elif statuses:
+                qs = qs.filter(status__in=statuses)
 
         ai_decision_param = self.request.query_params.get('ai_decision')
         if ai_decision_param:
