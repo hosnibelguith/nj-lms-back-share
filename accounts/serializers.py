@@ -773,7 +773,8 @@ class ApiIntegrationsSerializer(serializers.Serializer):
     flinks_customer_id = serializers.CharField(required=False, allow_blank=True)
     flinks_secret_key = serializers.CharField(required=False, allow_blank=True)
     zum_api_base_url = serializers.CharField(required=False, allow_blank=True)
-    zum_api_key = serializers.CharField(required=False, allow_blank=True)
+    zum_username = serializers.CharField(required=False, allow_blank=True)
+    zum_password = serializers.CharField(required=False, allow_blank=True)
     zum_webhook_secret = serializers.CharField(required=False, allow_blank=True)
     webhook_url = serializers.CharField(required=False, allow_blank=True)
     arrive_api_key = serializers.CharField(required=False, allow_blank=True)
@@ -792,7 +793,8 @@ class ApiIntegrationsSerializer(serializers.Serializer):
             'flinks_customer_id': 'FLINKS_CUSTOMER_ID',
             'flinks_secret_key': 'FLINKS_SECRET_KEY_CA',
             'zum_api_base_url': 'ZUMRAILS_API_BASE_URL',
-            'zum_api_key': 'ZUMRAILS_API_KEY',
+            'zum_username': 'ZUMRAILS_USERNAME',
+            'zum_password': 'ZUMRAILS_PASSWORD',
             'zum_webhook_secret': 'ZUMRAILS_WEBHOOK_SECRET',
             'webhook_url': 'WEBHOOK_URL',
             'arrive_api_key': 'ARRIVE_API_KEY',

@@ -2,9 +2,14 @@ import base64
 import hashlib
 import hmac
 import json
+import uuid
 from decimal import Decimal
 from datetime import timedelta
+from unittest.mock import Mock, patch
 
+import requests
+from django.core.cache import cache
+from django.db import IntegrityError, transaction
 from django.test import override_settings
 from django.utils import timezone
 from rest_framework.test import APITestCase
@@ -12,7 +17,8 @@ from rest_framework.test import APITestCase
 from accounts.models import Customer, User
 from banking.models import BankAccount, BankConnection
 
-from .models import CollectionPayment, CollectionsAccountChangeAudit, FundedPayment, FundingMethodRecommendation, Loan, Payment
+from .models import CollectionPayment, CollectionsAccountChangeAudit, FundedPayment, FundingMethodRecommendation, Loan, LoanStateEvent, Payment
+from .zumrails import ZumRailsRequestError, ZumRailsService
 
 
 @override_settings(
@@ -263,6 +269,23 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.data["error"], "Funding already exists for this loan.")
 
+    def test_database_constraint_blocks_concurrent_active_funding(self):
+        FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="eft",
+            status="processing",
+        )
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                FundedPayment.objects.create(
+                    loan=self.loan,
+                    amount=self.loan.principal,
+                    method="etransfer",
+                    status="processing",
+                )
+
     def test_funding_retry_after_failed_creates_new_record(self):
         FundedPayment.objects.create(
             loan=self.loan,
@@ -283,10 +306,10 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(self.loan.funded_payments.count(), 2)
         self.assertEqual(self.loan.funded_payments.order_by("-created_at").first().status, "processing")
         self.loan.refresh_from_db()
-        self.assertEqual(self.loan.status, "active")
-        self.assertIsNotNone(self.loan.funded_at)
+        self.assertEqual(self.loan.status, "pending_funding")
+        self.assertIsNone(self.loan.funded_at)
 
-    def test_funding_initiate_activates_loan_immediately(self):
+    def test_funding_initiate_waits_for_completed_webhook(self):
         response = self.client.post(
             f"/api/loans/{self.loan.id}/funding/initiate/",
             {"method": "eft", "schedule_confirmed": True, "override_confirmed": True},
@@ -297,10 +320,63 @@ class ZumRailsWorkflowTests(APITestCase):
         self.loan.refresh_from_db()
         funding = self.loan.funded_payments.order_by("-created_at").first()
         self.assertEqual(funding.status, "processing")
-        self.assertEqual(self.loan.status, "active")
-        self.assertIsNotNone(self.loan.funded_at)
+        self.assertEqual(self.loan.status, "pending_funding")
+        self.assertIsNone(self.loan.funded_at)
         self.assertIsNotNone(self.loan.funding_destination_locked_at)
         self.assertIsNotNone(self.loan.collections_account_locked_at)
+
+    @patch(
+        "loans.zumrails.ZumRailsService.initiate_transaction",
+        side_effect=ZumRailsRequestError("request outcome unknown"),
+    )
+    def test_unknown_submission_is_retained_and_blocks_another_send(self, mock_send):
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/funding/initiate/",
+            {"method": "eft", "schedule_confirmed": True, "override_confirmed": True},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 502)
+        funding = self.loan.funded_payments.get()
+        self.assertEqual(funding.status, "processing")
+        self.assertIsNone(funding.processor_transaction_id)
+        self.assertEqual(funding.failure_reason, "request outcome unknown")
+
+        duplicate = self.client.post(
+            f"/api/loans/{self.loan.id}/funding/initiate/",
+            {"method": "eft", "schedule_confirmed": True, "override_confirmed": True},
+            format="json",
+        )
+        self.assertEqual(duplicate.status_code, 400)
+        self.assertEqual(duplicate.data["error"], "Funding already exists for this loan.")
+        self.assertEqual(mock_send.call_count, 1)
+
+    @patch(
+        "loans.zumrails.ZumRailsService.initiate_transaction",
+        side_effect=ZumRailsRequestError(
+            "request rejected",
+            outcome_unknown=False,
+        ),
+    )
+    def test_confirmed_api_rejection_marks_attempt_failed_for_retry(self, mock_send):
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/funding/initiate/",
+            {"method": "eft", "schedule_confirmed": True, "override_confirmed": True},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 502)
+        funding = self.loan.funded_payments.get()
+        self.assertEqual(funding.status, "failed")
+
+        retry = self.client.post(
+            f"/api/loans/{self.loan.id}/funding/initiate/",
+            {"method": "eft", "schedule_confirmed": True, "override_confirmed": True},
+            format="json",
+        )
+        self.assertEqual(retry.status_code, 502)
+        self.assertEqual(self.loan.funded_payments.count(), 2)
+        self.assertEqual(mock_send.call_count, 2)
 
     def test_invalid_webhook_signature_returns_401(self):
         response = self.post_webhook(
@@ -329,6 +405,114 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(funding.status, "completed")
         self.assertEqual(self.loan.status, "active")
         self.assertIsNotNone(self.loan.funded_at)
+
+    def test_official_root_webhook_shape_is_idempotent(self):
+        funding = FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="eft",
+            status="processing",
+            processor_transaction_id="funding-root-1",
+        )
+        payload = {
+            "Type": "Transaction",
+            "Id": funding.processor_transaction_id,
+            "TransactionStatus": "Completed",
+        }
+
+        first = self.post_webhook(payload)
+        exact_duplicate = self.post_webhook(payload)
+        semantic_duplicate = self.post_webhook({
+            **payload,
+            "UpdatedAt": timezone.now().isoformat(),
+        })
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(exact_duplicate.status_code, 200)
+        self.assertEqual(semantic_duplicate.status_code, 200)
+        self.assertEqual(
+            LoanStateEvent.objects.filter(loan=self.loan, event_type="funded").count(),
+            1,
+        )
+
+    def test_webhook_correlates_attempt_by_client_transaction_id(self):
+        funding = FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="eft",
+            status="processing",
+        )
+
+        response = self.post_webhook({
+            "Type": "Transaction",
+            "Id": "processor-late-response-1",
+            "ClientTransactionId": str(funding.id),
+            "TransactionStatus": "Completed",
+        })
+
+        self.assertEqual(response.status_code, 200)
+        funding.refresh_from_db()
+        self.assertEqual(funding.processor_transaction_id, "processor-late-response-1")
+        self.assertEqual(funding.status, "completed")
+
+    def test_late_funding_return_reopens_loan_and_old_completion_is_ignored(self):
+        funding = FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="eft",
+            status="processing",
+            processor_transaction_id="funding-return-1",
+        )
+        completed = self.post_webhook({
+            "Type": "Transaction",
+            "Id": funding.processor_transaction_id,
+            "TransactionStatus": "Completed",
+        })
+        returned = self.post_webhook({
+            "Type": "Transaction",
+            "Id": funding.processor_transaction_id,
+            "TransactionStatus": "Returned",
+            "FailedTransactionEvent": "EftFailedCustomerInitiatedReturnCreditOnly",
+        })
+        stale_completed = self.post_webhook({
+            "Type": "Transaction",
+            "Id": funding.processor_transaction_id,
+            "TransactionStatus": "Completed",
+            "UpdatedAt": timezone.now().isoformat(),
+        })
+
+        self.assertEqual(completed.status_code, 200)
+        self.assertEqual(returned.status_code, 200)
+        self.assertEqual(stale_completed.status_code, 200)
+        funding.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(funding.status, "returned")
+        self.assertEqual(self.loan.status, "pending_funding")
+        self.assertFalse(self.loan.is_active)
+        self.assertIsNone(self.loan.funded_at)
+
+    def test_documented_failure_event_outside_legacy_list_is_processed(self):
+        self.loan.status = "active"
+        self.loan.save(update_fields=["status", "updated_at"])
+        collection = CollectionPayment.objects.create(
+            loan=self.loan,
+            amount=Decimal("50.00"),
+            status="processing",
+            processor_transaction_id="collection-new-failure",
+            account_snapshot={"id": str(self.account.id)},
+        )
+
+        response = self.post_webhook({
+            "Type": "TransactionEvent",
+            "Id": collection.processor_transaction_id,
+            "Event": "EftFailedFundsNotFree",
+            "CreatedAt": timezone.now().isoformat(),
+        })
+
+        self.assertEqual(response.status_code, 200)
+        collection.refresh_from_db()
+        self.assertEqual(collection.status, "failed")
+        self.assertEqual(collection.event_history[0]["event"], "EftFailedFundsNotFree")
 
     def test_collection_completed_webhook_waits_for_settlement(self):
         self.loan.status = "active"
@@ -360,6 +544,27 @@ class ZumRailsWorkflowTests(APITestCase):
         self.loan.refresh_from_db()
         self.assertEqual(collection.status, "completed")
         self.assertEqual(self.loan.balance, Decimal("500.00"))
+
+    def test_scheduled_collection_task_does_not_send_payment_twice(self):
+        from loans.tasks import process_scheduled_payments
+
+        self.loan.status = "active"
+        self.loan.save(update_fields=["status", "updated_at"])
+        payment = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+        )
+
+        first = process_scheduled_payments()
+        second = process_scheduled_payments()
+
+        payment.refresh_from_db()
+        self.assertEqual(first["initiated"], 1)
+        self.assertEqual(second["initiated"], 0)
+        self.assertEqual(payment.status, "pending")
+        self.assertEqual(payment.collection_attempts.count(), 1)
 
     def test_collections_account_change_requires_failed_collection(self):
         response = self.client.patch(
@@ -462,3 +667,201 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(result["completed"], 1)
         self.assertEqual(collection.status, "completed")
         self.assertEqual(self.loan.balance, Decimal("550.00"))
+
+    def test_late_eft_failure_reverses_a_settled_collection_once(self):
+        self.loan.status = "active"
+        self.loan.balance = Decimal("500.00")
+        self.loan.save(update_fields=["status", "balance", "updated_at"])
+        payment = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate(),
+            status="completed",
+        )
+        collection = CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=payment,
+            amount=Decimal("100.00"),
+            status="completed",
+            processor_transaction_id="late-failure-1",
+            zum_status="Completed",
+            settled_at=timezone.now(),
+            account_snapshot={"id": str(self.account.id)},
+        )
+        payload = {
+            "Type": "TransactionEvent",
+            "Id": collection.processor_transaction_id,
+            "Event": "EftFailedInsufficientFunds",
+        }
+
+        first = self.post_webhook(payload)
+        duplicate = self.post_webhook(payload)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(duplicate.status_code, 200)
+        collection.refresh_from_db()
+        payment.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(collection.status, "failed")
+        self.assertEqual(payment.status, "nsf")
+        self.assertEqual(self.loan.balance, Decimal("600.00"))
+
+
+@override_settings(
+    ZUMRAILS_DRY_RUN=False,
+    ZUMRAILS_API_BASE_URL="https://sandbox.example",
+    ZUMRAILS_USERNAME="api-user",
+    ZUMRAILS_PASSWORD="api-password",
+    ZUMRAILS_WALLET_ID="wallet-1",
+)
+class ZumRailsClientTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+
+    @staticmethod
+    def response(data, status_code=200):
+        response = Mock()
+        response.status_code = status_code
+        response.json.return_value = data
+        if status_code >= 400:
+            response.raise_for_status.side_effect = requests.HTTPError(
+                response=response
+            )
+        return response
+
+    @patch("loans.zumrails.requests.request")
+    @patch("loans.zumrails.requests.post")
+    def test_authenticates_and_sends_documented_eft_payload(
+        self,
+        mock_post,
+        mock_request,
+    ):
+        mock_post.return_value = self.response({"result": {"Token": "token-1"}})
+        mock_request.return_value = self.response({"result": {"Id": "transaction-1"}})
+        client_id = uuid.uuid4()
+
+        result = ZumRailsService.initiate_transaction(
+            amount=Decimal("123.45"),
+            transaction_type="AccountsPayable",
+            method="Eft",
+            memo="Loan 12345678",
+            comment="Loan disbursement",
+            client_transaction_id=client_id,
+            user_payload={
+                "FirstName": "Jane",
+                "LastName": "Doe",
+                "Email": "jane@example.com",
+                "BankAccountInformation": {
+                    "InstitutionNumber": "003",
+                    "TransitNumber": "12345",
+                    "AccountNumber": "1234567",
+                },
+            },
+        )
+
+        self.assertEqual(result, "transaction-1")
+        mock_post.assert_called_once_with(
+            "https://sandbox.example/api/authorize",
+            json={"Username": "api-user", "Password": "api-password"},
+            headers={"Content-Type": "application/json"},
+            timeout=15,
+        )
+        request_kwargs = mock_request.call_args.kwargs
+        self.assertEqual(mock_request.call_args.args[:2], ("POST", "https://sandbox.example/api/transaction"))
+        self.assertEqual(request_kwargs["headers"]["Authorization"], "Bearer token-1")
+        self.assertEqual(request_kwargs["headers"]["idempotency-key"], str(client_id))
+        self.assertEqual(request_kwargs["json"]["ZumRailsType"], "AccountsPayable")
+        self.assertEqual(request_kwargs["json"]["TransactionMethod"], "Eft")
+        self.assertEqual(request_kwargs["json"]["ClientTransactionId"], str(client_id))
+        self.assertEqual(request_kwargs["json"]["WalletId"], "wallet-1")
+        self.assertNotIn("Type", request_kwargs["json"])
+        self.assertNotIn("Method", request_kwargs["json"])
+
+    @patch("loans.zumrails.requests.request")
+    @patch("loans.zumrails.requests.post")
+    def test_interac_payload_and_token_cache(self, mock_post, mock_request):
+        mock_post.return_value = self.response({"Token": "token-1"})
+        mock_request.side_effect = [
+            self.response({"Id": "interac-1"}),
+            self.response({"Id": "interac-2"}),
+        ]
+
+        for index in range(2):
+            ZumRailsService.initiate_transaction(
+                amount=Decimal("50.00"),
+                transaction_type="AccountsPayable",
+                method="Interac",
+                memo=f"Loan {index}",
+                client_transaction_id=uuid.uuid4(),
+                user_payload={
+                    "FirstName": "Jane",
+                    "LastName": "Doe",
+                    "Email": "jane@example.com",
+                },
+            )
+
+        self.assertEqual(mock_post.call_count, 1)
+        payload = mock_request.call_args.kwargs["json"]
+        self.assertEqual(payload["InteracNotificationChannel"], "email")
+        self.assertFalse(payload["InteracHasSecurityQuestionAndAnswer"])
+
+    @patch("loans.zumrails.requests.request")
+    @patch("loans.zumrails.requests.post")
+    def test_401_reauthenticates_once(self, mock_post, mock_request):
+        mock_post.side_effect = [
+            self.response({"Token": "expired-token"}),
+            self.response({"Token": "fresh-token"}),
+        ]
+        mock_request.side_effect = [
+            self.response({"error": "unauthorized"}, status_code=401),
+            self.response({"Id": "transaction-1"}),
+        ]
+
+        result = ZumRailsService.initiate_transaction(
+            amount=Decimal("10.00"),
+            transaction_type="AccountsReceivable",
+            method="Eft",
+            memo="Loan 1",
+            client_transaction_id=uuid.uuid4(),
+            user_payload={"FirstName": "Jane", "LastName": "Doe", "Email": "jane@example.com"},
+        )
+
+        self.assertEqual(result, "transaction-1")
+        self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(
+            mock_request.call_args.kwargs["headers"]["Authorization"],
+            "Bearer fresh-token",
+        )
+
+    @override_settings(ZUMRAILS_WALLET_ID="")
+    @patch("loans.zumrails.requests.request")
+    @patch("loans.zumrails.requests.post")
+    def test_discovers_and_uses_cad_wallet(self, mock_post, mock_request):
+        mock_post.return_value = self.response({"Token": "token-1"})
+        mock_request.side_effect = [
+            self.response({
+                "result": [
+                    {"Id": "wallet-us", "Currency": "USD"},
+                    {"Id": "wallet-ca", "Currency": "CAD"},
+                ]
+            }),
+            self.response({"result": {"Id": "transaction-1"}}),
+        ]
+
+        ZumRailsService.initiate_transaction(
+            amount=Decimal("10.00"),
+            transaction_type="AccountsReceivable",
+            method="Eft",
+            memo="Loan 1",
+            client_transaction_id=uuid.uuid4(),
+            user_payload={"FirstName": "Jane", "LastName": "Doe", "Email": "jane@example.com"},
+        )
+
+        self.assertEqual(mock_request.call_args_list[0].args[:2], (
+            "GET",
+            "https://sandbox.example/api/wallet",
+        ))
+        self.assertEqual(
+            mock_request.call_args_list[1].kwargs["json"]["WalletId"],
+            "wallet-ca",
+        )

@@ -26,6 +26,7 @@ from .zumrails import (
     FundingConfigurationService,
     FundingService,
     SettlementService,
+    ZumRailsRequestError,
     funding_configuration_ready,
 )
 from .serializers import (
@@ -318,6 +319,8 @@ class LoanViewSet(viewsets.ModelViewSet):
             )
         except BankAccount.DoesNotExist:
             return Response({'error': 'Collections account required'}, status=400)
+        except ZumRailsRequestError as exc:
+            return Response({'error': str(exc)}, status=502)
         except ValueError as exc:
             return Response({'error': str(exc)}, status=400)
 
@@ -414,6 +417,8 @@ class LoanViewSet(viewsets.ModelViewSet):
                 payment=payment,
                 user=request.user,
             )
+        except ZumRailsRequestError as exc:
+            return Response({'error': str(exc)}, status=502)
         except ValueError as exc:
             return Response({'error': str(exc)}, status=400)
 

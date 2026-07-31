@@ -576,6 +576,7 @@ class FundedPayment(models.Model):
     collections_account_snapshot = models.JSONField(default=dict, blank=True)
     processor_transaction_id = models.CharField(max_length=255, blank=True, null=True, db_index=True)
     zum_status = models.CharField(max_length=100, blank=True, null=True)
+    event_history = models.JSONField(default=list, blank=True)
     initiated_at = models.DateTimeField(default=timezone.now)
     initiated_by = models.ForeignKey(
         'accounts.User',
@@ -594,6 +595,18 @@ class FundedPayment(models.Model):
     class Meta:
         db_table = 'loans_funded_payment'
         ordering = ['-initiated_at', '-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['loan'],
+                condition=models.Q(status__in=['processing', 'completed']),
+                name='unique_active_funding_per_loan',
+            ),
+            models.UniqueConstraint(
+                fields=['processor_transaction_id'],
+                condition=models.Q(processor_transaction_id__isnull=False),
+                name='unique_funding_processor_tx',
+            ),
+        ]
 
     def __str__(self):
         return f"Funded payment ${self.amount} for Loan #{str(self.loan_id)[:8]}"
@@ -667,6 +680,21 @@ class CollectionPayment(models.Model):
     class Meta:
         db_table = 'loans_collection_payment'
         ordering = ['-initiated_at', '-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['payment'],
+                condition=models.Q(
+                    payment__isnull=False,
+                    status__in=['processing', 'completed'],
+                ),
+                name='unique_active_collection_per_payment',
+            ),
+            models.UniqueConstraint(
+                fields=['processor_transaction_id'],
+                condition=models.Q(processor_transaction_id__isnull=False),
+                name='unique_collection_processor_tx',
+            ),
+        ]
 
     def __str__(self):
         return f"Collection ${self.amount} for Loan #{str(self.loan_id)[:8]}"
