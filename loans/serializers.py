@@ -378,6 +378,8 @@ class LoanListSerializer(serializers.ModelSerializer):
     customer_phone = serializers.CharField(source='customer.phone', read_only=True)
     customer_province = serializers.SerializerMethodField()
     customer_banking_verified = serializers.BooleanField(source='customer.banking_verified', read_only=True)
+    customer_source = serializers.CharField(source='customer.source', read_only=True)
+    is_arrive = serializers.SerializerMethodField()
     amount = serializers.DecimalField(source='total_amount', max_digits=10, decimal_places=2, read_only=True)
     formula = LoanFormulaSerializer(read_only=True)
     funded_date = serializers.SerializerMethodField()
@@ -399,6 +401,8 @@ class LoanListSerializer(serializers.ModelSerializer):
             'customer_phone',
             'customer_province',
             'customer_banking_verified',
+            'customer_source',
+            'is_arrive',
             'type',
             'amount',
             'principal',
@@ -425,6 +429,13 @@ class LoanListSerializer(serializers.ModelSerializer):
 
     def get_customer_province(self, obj):
         return getattr(obj.customer, 'province', None)
+
+    def get_is_arrive(self, obj):
+        customer = obj.customer
+        return bool(
+            getattr(customer, 'source', None) == 'arrive'
+            or getattr(customer, 'arrive_application_id', None)
+        )
 
     def get_funded_date(self, obj):
         if not obj.funded_at:

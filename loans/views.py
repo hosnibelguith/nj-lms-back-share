@@ -161,6 +161,23 @@ class LoanViewSet(viewsets.ModelViewSet):
         if province:
             qs = qs.filter(customer__province=province)
 
+        source = self.request.query_params.get('source')
+        if source:
+            normalized_source = source.strip().lower()
+            if normalized_source == 'arrive':
+                qs = qs.filter(
+                    Q(customer__source='arrive') |
+                    (
+                        Q(customer__arrive_application_id__isnull=False) &
+                        ~Q(customer__arrive_application_id='')
+                    )
+                )
+            elif normalized_source in ('organic', 'landing', 'kyc'):
+                qs = qs.exclude(customer__source='arrive').filter(
+                    Q(customer__arrive_application_id__isnull=True) |
+                    Q(customer__arrive_application_id='')
+                )
+
         is_active_param = self.request.query_params.get('is_active')
         if is_active_param is not None:
             normalized = is_active_param.strip().lower()
