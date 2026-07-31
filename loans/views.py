@@ -288,10 +288,11 @@ class LoanViewSet(viewsets.ModelViewSet):
             for row in qs.values('status').annotate(count=Count('id'))
         }
 
-        pending_statuses = ('ibv_pending', 'pending', 'pending_signature')
         return Response({
-            'pending': sum(by_status.get(status, 0) for status in pending_statuses),
-            'approved': by_status.get('pending_funding', 0),
+            'ibv_pending': by_status.get('ibv_pending', 0),
+            'pending': by_status.get('pending', 0),
+            'pending_signature': by_status.get('pending_signature', 0),
+            'pending_funding': by_status.get('pending_funding', 0),
             'active': by_status.get('active', 0),
             'declined': by_status.get('human_declined', 0),
             'paid_off': by_status.get('paid_off', 0),
