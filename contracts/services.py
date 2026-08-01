@@ -38,9 +38,9 @@ def _esc(value: Any, fallback: str = "—") -> str:
 def _lender_settings() -> dict[str, str]:
     return {
         "lending_license_holder": GlobalSetting.get_value(
-            "LENDING_LICENSE_HOLDER", "NoJuice"
+            "LENDING_LICENSE_HOLDER", "MohawkLoans"
         )
-        or "NoJuice",
+        or "MohawkLoans",
         "lending_license_holder_address": GlobalSetting.get_value(
             "LENDING_LICENSE_HOLDER_ADDRESS",
             "Mohawk Territory of Kanehsatake, Quebec, Canada",
@@ -163,7 +163,7 @@ def render_loan_agreement(customer, loan) -> str:
 AGREEMENT_HTML = """
 <article class="loan-agreement">
   <header class="party-block">
-    <p><strong>LENDER:</strong> {lending_license_holder} powered by MohawkLoans (hereinafter referred to as "MohawkLoans")</p>
+    <p><strong>LENDER:</strong> MohawkLoans (hereinafter referred to as "MohawkLoans")</p>
     <p><strong>BORROWER NAME:</strong> {customer_name}</p>
     <p><strong>BORROWER'S TELEPHONE NUMBER:</strong> {customer_phone_number}</p>
     <p><strong>ORIGINATION DATE:</strong> {date_today}</p>
@@ -313,7 +313,7 @@ AGREEMENT_HTML = """
     </div>
     <div>
       <p class="label">Lender</p>
-      <p class="sig-line">{lending_license_holder}</p>
+      <p class="sig-line">MohawkLoans</p>
       <p class="label">Date</p>
       <p class="sig-line">{date_today}</p>
     </div>
@@ -323,7 +323,7 @@ AGREEMENT_HTML = """
 
   <h2>PRE-AUTHORIZED DEBIT (PAD) AGREEMENT</h2>
   <p><strong>FOR ACCOUNT NUMBER:</strong> {bank_account_number}</p>
-  <p>I, the undersigned, authorize {lending_license_holder} powered by MohawkLoans (hereinafter "Payee") and the financial institution designated below to debit the account identified below to reimburse the Loan for the above numbered account as established in this PAD Agreement.</p>
+  <p>I, the undersigned, authorize MohawkLoans (hereinafter "Payee") and the financial institution designated below to debit the account identified below to reimburse the Loan for the above numbered account as established in this PAD Agreement.</p>
 
   <h3>PAYOR INFORMATION — Account holder name and account number</h3>
   <div class="meta-grid">
@@ -337,7 +337,7 @@ AGREEMENT_HTML = """
 
   <h3>PAYEE INFORMATION — Contact information</h3>
   <div class="meta-grid">
-    <p><span>Name of organization</span><strong>{lending_license_holder}</strong></p>
+    <p><span>Name of organization</span><strong>MohawkLoans</strong></p>
     <p><span>c/o or e-mail address</span><strong>{lending_license_holder_email}</strong></p>
     <p><span>Address (street, city, province)</span><strong>{lending_license_holder_address}</strong></p>
     <p><span>Telephone No.</span><strong>{lending_license_holder_phone}</strong></p>

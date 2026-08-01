@@ -26,7 +26,7 @@ class LoanFormula(models.Model):
 
     name = models.CharField(max_length=255)
     loan_type = models.CharField(max_length=20, choices=[
-        ('nojuice', 'NoJuice'),
+        ('nojuice', 'MohawkLoans'),
         ('payday', 'Payday'),
     ], default='nojuice')
 
@@ -127,7 +127,7 @@ class Loan(models.Model):
     """
     # Loan Types
     TYPE_CHOICES = [
-        ('nojuice', 'NoJuice'),
+        ('nojuice', 'MohawkLoans'),
         ('payday', 'Payday'),
     ]
     
