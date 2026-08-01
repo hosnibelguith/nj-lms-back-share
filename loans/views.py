@@ -721,17 +721,35 @@ class LoanViewSet(viewsets.ModelViewSet):
 
         date_from = parse_date(request.query_params.get('date_from')) if request.query_params.get('date_from') else None
         date_to = parse_date(request.query_params.get('date_to')) if request.query_params.get('date_to') else None
+        source = (request.query_params.get('source') or '').strip().lower()
 
-        events = LoanStateEvent.objects.all()
+        events = LoanStateEvent.objects.select_related('loan__customer')
+        loans = Loan.objects.select_related('customer')
+
+        if source in ('arrive', 'organic'):
+            events = events.filter(loan__customer__source=source)
+            loans = loans.filter(customer__source=source)
 
         if date_from:
             events = events.filter(created_at__date__gte=date_from)
         if date_to:
             events = events.filter(created_at__date__lte=date_to)
 
-        def series(qs):
+        received_loans = loans
+        approved_loans = loans.filter(approved_at__isnull=False)
+        funded_loans = loans.filter(funded_at__isnull=False)
+        if date_from:
+            received_loans = received_loans.filter(created_at__date__gte=date_from)
+            approved_loans = approved_loans.filter(approved_at__date__gte=date_from)
+            funded_loans = funded_loans.filter(funded_at__date__gte=date_from)
+        if date_to:
+            received_loans = received_loans.filter(created_at__date__lte=date_to)
+            approved_loans = approved_loans.filter(approved_at__date__lte=date_to)
+            funded_loans = funded_loans.filter(funded_at__date__lte=date_to)
+
+        def series(qs, date_field='created_at'):
             return list(
-                qs.annotate(date=TruncDate('created_at'))
+                qs.annotate(date=TruncDate(date_field))
                 .values('date')
                 .annotate(value=Count('id'))
                 .order_by('date')
@@ -744,6 +762,12 @@ class LoanViewSet(viewsets.ModelViewSet):
             processed_at__isnull=False,
         )
         sent_payments = Payment.objects.all()
+
+        if source in ('arrive', 'organic'):
+            funded_payments = funded_payments.filter(loan__customer__source=source)
+            collected_payments = collected_payments.filter(loan__customer__source=source)
+            nsf_payments = nsf_payments.filter(loan__customer__source=source)
+            sent_payments = sent_payments.filter(loan__customer__source=source)
 
         if date_from:
             funded_payments = funded_payments.filter(initiated_at__date__gte=date_from)
@@ -771,12 +795,20 @@ class LoanViewSet(viewsets.ModelViewSet):
             .annotate(value=Sum('amount')) \
             .order_by('date')
 
+        received_arrive = received_loans.filter(customer__source='arrive')
+        received_organic = received_loans.exclude(customer__source='arrive')
+
+        # Ops KPIs use loan timestamps (created/approved/funded). Other lifecycle
+        # counts still use LoanStateEvent for trend compatibility.
         totals = {
             "funded_payments_amount": str(funded_payments.aggregate(total=Sum('amount'))['total'] or 0),
             "collected_payments_amount": str(collected_payments.aggregate(total=Sum('amount'))['total'] or 0),
-            "approved_loans_count": events.filter(event_type='human_approved').count(),
+            "received_applications_count": received_loans.count(),
+            "received_arrive_count": received_arrive.count(),
+            "received_organic_count": received_organic.count(),
+            "approved_loans_count": approved_loans.count(),
             "declined_loans_count": events.filter(event_type='human_declined').count(),
-            "funded_loans_count": events.filter(event_type='funded').count(),
+            "funded_loans_count": funded_loans.count(),
             "paid_off_loans_count": events.filter(event_type='paid_off').count(),
             "defaulted_loans_count": events.filter(event_type='defaulted').count(),
             "reactivated_loans_count": events.filter(event_type='reactivated').count(),
@@ -791,14 +823,18 @@ class LoanViewSet(viewsets.ModelViewSet):
             "period": {
                 "date_from": date_from,
                 "date_to": date_to,
+                "source": source or "all",
             },
             "totals": totals,
             "series": {
                 "funded_payments_amount": funded_series,
                 "collected_payments_amount": collected_series,
-                "approved_loans_count": series(events.filter(event_type='human_approved')),
+                "received_applications_count": series(received_loans, 'created_at'),
+                "received_arrive_count": series(received_arrive, 'created_at'),
+                "received_organic_count": series(received_organic, 'created_at'),
+                "approved_loans_count": series(approved_loans, 'approved_at'),
                 "declined_loans_count": series(events.filter(event_type='human_declined')),
-                "funded_loans_count": series(events.filter(event_type='funded')),
+                "funded_loans_count": series(funded_loans, 'funded_at'),
                 "paid_off_loans_count": series(events.filter(event_type='paid_off')),
                 "defaulted_loans_count": series(events.filter(event_type='defaulted')),
                 "reactivated_loans_count": series(events.filter(event_type='reactivated')),

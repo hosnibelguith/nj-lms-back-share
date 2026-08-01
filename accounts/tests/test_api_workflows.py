@@ -306,6 +306,90 @@ class BackendApiWorkflowTests(APITestCase):
         self.assertIn("totals", analytics_response.data)
         self.assertIn("series", analytics_response.data)
         self.assertIn("funded_payments_amount", analytics_response.data["series"])
+        self.assertIn("received_applications_count", analytics_response.data["totals"])
+        self.assertIn("received_arrive_count", analytics_response.data["totals"])
+        self.assertIn("received_organic_count", analytics_response.data["totals"])
+
+    def test_dashboard_ops_stats_by_day_and_source(self):
+        today = timezone.localdate()
+        yesterday = today - timedelta(days=1)
+
+        arrive_user = User.objects.create_user(
+            email="arrive-dash@example.com",
+            password="password123",
+            full_name="Arrive Dash",
+            user_type="customer",
+        )
+        arrive_customer = Customer.objects.create(
+            portal_user=arrive_user,
+            first_name="Arrive",
+            last_name="Dash",
+            email="arrive-dash@example.com",
+            phone="4165559999",
+            phone_normalized="4165559999",
+            province="ON",
+            status="pending",
+            source="arrive",
+            onboarding_stage="portal_active",
+            banking_verified=True,
+            requested_loan_amount=Decimal("400.00"),
+        )
+        arrive_loan = Loan.objects.create(
+            customer=arrive_customer,
+            principal=Decimal("400.00"),
+            fee=Decimal("40.00"),
+            total_amount=Decimal("440.00"),
+            balance=Decimal("440.00"),
+            status="pending_funding",
+            is_active=True,
+            approved_at=timezone.now(),
+        )
+        # Keep created_at as today (auto_now_add). Mark organic loan as older.
+        self.loan.created_at = timezone.now() - timedelta(days=1)
+        self.loan.approved_at = timezone.now() - timedelta(days=1)
+        self.loan.funded_at = timezone.now()
+        self.loan.status = "active"
+        self.loan.save(
+            update_fields=[
+                "created_at",
+                "approved_at",
+                "funded_at",
+                "status",
+                "updated_at",
+            ]
+        )
+
+        self.client.force_authenticate(user=self.staff)
+        today_response = self.client.get(
+            "/api/loans/dashboard/analytics/",
+            {"date_from": str(today), "date_to": str(today)},
+        )
+        self.assertEqual(today_response.status_code, 200, today_response.data)
+        totals = today_response.data["totals"]
+        self.assertEqual(totals["received_applications_count"], 1)
+        self.assertEqual(totals["received_arrive_count"], 1)
+        self.assertEqual(totals["received_organic_count"], 0)
+        self.assertEqual(totals["approved_loans_count"], 1)
+        self.assertEqual(totals["funded_loans_count"], 1)
+
+        arrive_only = self.client.get(
+            "/api/loans/dashboard/analytics/",
+            {"date_from": str(today), "date_to": str(today), "source": "arrive"},
+        )
+        self.assertEqual(arrive_only.status_code, 200, arrive_only.data)
+        self.assertEqual(arrive_only.data["totals"]["received_applications_count"], 1)
+        self.assertEqual(arrive_only.data["totals"]["received_arrive_count"], 1)
+
+        week_response = self.client.get(
+            "/api/loans/dashboard/analytics/",
+            {"date_from": str(yesterday), "date_to": str(today)},
+        )
+        self.assertEqual(week_response.status_code, 200, week_response.data)
+        week_totals = week_response.data["totals"]
+        self.assertEqual(week_totals["received_applications_count"], 2)
+        self.assertEqual(week_totals["received_arrive_count"], 1)
+        self.assertEqual(week_totals["received_organic_count"], 1)
+        self.assertGreaterEqual(week_totals["approved_loans_count"], 2)
 
     def test_staff_can_update_approved_amount_before_funding(self):
         Payment.objects.create(
