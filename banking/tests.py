@@ -10,7 +10,7 @@ from rest_framework.test import APIClient
 
 from accounts.models import Customer, User
 from activity.models import ActivityHistory
-from banking.models import BankAccount, BankConnection
+from banking.models import BankAccount, BankConnection, BankTransaction
 from banking import tasks
 
 
@@ -493,3 +493,42 @@ class ManualBankAccountStaffTests(TestCase):
                 title='Manual bank account (void cheque)',
             ).exists()
         )
+
+    def test_bank_accounts_return_transactions_newest_first(self):
+        BankTransaction.objects.create(
+            account=self.account,
+            customer=self.customer,
+            external_id='tx-old',
+            date='2026-01-01',
+            description='Older txn',
+            credit=Decimal('10.00'),
+            balance=Decimal('110.00'),
+        )
+        BankTransaction.objects.create(
+            account=self.account,
+            customer=self.customer,
+            external_id='tx-new',
+            date='2026-03-15',
+            description='Newer txn',
+            debit=Decimal('5.00'),
+            balance=Decimal('105.00'),
+        )
+        BankTransaction.objects.create(
+            account=self.account,
+            customer=self.customer,
+            external_id='tx-mid',
+            date='2026-02-10',
+            description='Middle txn',
+            credit=Decimal('1.00'),
+            balance=Decimal('111.00'),
+        )
+
+        response = self.client.get(f'/api/bank-accounts/?customer_id={self.customer.id}')
+        self.assertEqual(response.status_code, 200, response.data)
+        payload = response.data if isinstance(response.data, list) else response.data.get('results', [])
+        account_payload = next(item for item in payload if item['id'] == str(self.account.id))
+        dates = [txn['date'] for txn in account_payload['transactions']]
+        self.assertEqual(dates, ['2026-03-15', '2026-02-10', '2026-01-01'])
+        self.assertEqual(account_payload['institution_number'], '001')
+        self.assertEqual(account_payload['transit_number'], '11111')
+        self.assertEqual(account_payload['account_number'], '1111111')

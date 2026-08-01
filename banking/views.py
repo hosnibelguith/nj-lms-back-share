@@ -6,7 +6,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Prefetch, Q
 from django.utils import timezone
 
 from accounts.models import Customer
@@ -200,7 +200,12 @@ class CustomerPortalBankAccountsView(CustomerPortalBaseView):
         customer = self.get_customer(request)
         accounts = customer.bank_accounts.filter(
             connection__is_active=True
-        ).prefetch_related('transactions').order_by('-is_primary', 'name')
+        ).prefetch_related(
+            Prefetch(
+                'transactions',
+                queryset=BankTransaction.objects.order_by('-date', '-created_at'),
+            )
+        ).order_by('-is_primary', 'name')
         serializer = BankAccountSerializer(accounts, many=True)
         return Response(serializer.data)
 
@@ -210,7 +215,15 @@ class BankConnectionViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [permissions.IsAuthenticated, StaffOnlyPermission]
 
     def get_queryset(self):
-        queryset = BankConnection.objects.select_related('customer').filter(is_active=True)
+        ordered_transactions = BankTransaction.objects.order_by('-date', '-created_at')
+        queryset = BankConnection.objects.select_related('customer').filter(is_active=True).prefetch_related(
+            Prefetch(
+                'accounts',
+                queryset=BankAccount.objects.order_by('-is_primary', 'name').prefetch_related(
+                    Prefetch('transactions', queryset=ordered_transactions)
+                ),
+            )
+        )
 
         customer_id = self.request.query_params.get('customer_id')
         if customer_id:
@@ -224,8 +237,11 @@ class BankAccountViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [permissions.IsAuthenticated, StaffOnlyPermission]
 
     def get_queryset(self):
+        ordered_transactions = BankTransaction.objects.order_by('-date', '-created_at')
         queryset = BankAccount.objects.select_related('customer', 'connection').filter(
             connection__is_active=True
+        ).prefetch_related(
+            Prefetch('transactions', queryset=ordered_transactions)
         )
 
         customer_id = self.request.query_params.get('customer_id')
