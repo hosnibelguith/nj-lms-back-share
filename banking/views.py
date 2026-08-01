@@ -1,14 +1,24 @@
 import logging
 
 from rest_framework import permissions, status, viewsets
+from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+from django.db import transaction
+from django.db.models import Q
+from django.utils import timezone
+
+from accounts.models import Customer
+from activity.models import ActivityHistory
 
 from .logging_utils import mask_identifier
 from .models import BankConnection, BankAccount, BankTransaction, FinancialAnalysisReport
 from .serializers import (
     BankConnectionSerializer,
     BankAccountSerializer,
+    BankAccountManualCoordinatesSerializer,
+    ManualBankAccountCreateSerializer,
     BankTransactionSerializer,
     FinancialAnalysisReportSerializer,
     CustomerPortalBankingStatusSerializer,
@@ -16,6 +26,60 @@ from .serializers import (
 from .tasks import fetch_flinks_accounts_only, UNSUPPORTED_IBV_REASON_CODE
 
 logger = logging.getLogger(__name__)
+
+
+def _refresh_unlocked_loan_snapshots(account: BankAccount) -> None:
+    """Keep pre-funding destination snapshots in sync after manual void-cheque edits."""
+    from loans.models import Loan
+    from loans.zumrails import account_snapshot
+
+    loans = Loan.objects.filter(
+        Q(bank_account=account) | Q(collections_account=account),
+        funding_destination_locked_at__isnull=True,
+    )
+    for loan in loans:
+        destination = loan.funding_destination if isinstance(loan.funding_destination, dict) else {}
+        destination = dict(destination)
+        eft = destination.get('eft') if isinstance(destination.get('eft'), dict) else {}
+        eft = dict(eft)
+        if (
+            str(eft.get('bank_account_id') or '') == str(account.id)
+            or loan.bank_account_id == account.id
+        ):
+            eft['bank_account_id'] = str(account.id)
+            eft['account'] = account_snapshot(account)
+            destination['eft'] = eft
+            loan.funding_destination = destination
+            loan.save(update_fields=['funding_destination', 'updated_at'])
+
+
+def _log_bank_coords_activity(customer, *, title, description, user, metadata=None):
+    ActivityHistory.objects.create(
+        customer=customer,
+        type='system',
+        title=title,
+        description=description,
+        metadata=metadata or {},
+        created_by=str(getattr(user, 'id', 'staff')),
+    )
+
+
+def _get_or_create_manual_connection(customer: Customer) -> BankConnection:
+    connection = (
+        BankConnection.objects.filter(customer=customer, provider='manual', is_active=True)
+        .order_by('-created_at')
+        .first()
+    )
+    if connection:
+        return connection
+    return BankConnection.objects.create(
+        customer=customer,
+        login_id=f'manual-{customer.id}',
+        provider='manual',
+        is_active=True,
+        sync_status='synced',
+        last_synced_at=timezone.now(),
+    )
 
 
 class StaffOnlyPermission(permissions.BasePermission):
@@ -169,6 +233,136 @@ class BankAccountViewSet(viewsets.ReadOnlyModelViewSet):
             queryset = queryset.filter(customer_id=customer_id)
 
         return queryset.order_by('-is_primary', 'name')
+
+    @action(detail=True, methods=['patch'], url_path='coordinates')
+    def update_coordinates(self, request, pk=None):
+        """Staff override institution / transit / account # from a void cheque."""
+        account = self.get_object()
+        serializer = BankAccountManualCoordinatesSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        previous = {
+            'institution_number': account.institution_number,
+            'transit_number': account.transit_number,
+            'account_number': account.account_number,
+        }
+
+        account.institution_number = data['institution_number']
+        account.transit_number = data['transit_number']
+        account.account_number = data['account_number']
+        account.is_manual_entry = True
+        update_fields = [
+            'institution_number',
+            'transit_number',
+            'account_number',
+            'is_manual_entry',
+            'updated_at',
+        ]
+        if data.get('name'):
+            account.name = data['name']
+            update_fields.append('name')
+        account.save(update_fields=update_fields)
+
+        _refresh_unlocked_loan_snapshots(account)
+
+        notes = (data.get('notes') or '').strip()
+        description = (
+            f"Updated bank coordinates from void cheque. "
+            f"Institution {previous['institution_number'] or '—'}→{account.institution_number}, "
+            f"Transit {previous['transit_number'] or '—'}→{account.transit_number}, "
+            f"Account {previous['account_number'] or '—'}→{account.account_number}."
+        )
+        if notes:
+            description = f"{description} Notes: {notes}"
+        _log_bank_coords_activity(
+            account.customer,
+            title='Bank details updated (void cheque)',
+            description=description,
+            user=request.user,
+            metadata={
+                'bank_account_id': str(account.id),
+                'previous': previous,
+                'current': {
+                    'institution_number': account.institution_number,
+                    'transit_number': account.transit_number,
+                    'account_number': account.account_number,
+                },
+            },
+        )
+
+        return Response(BankAccountSerializer(account).data)
+
+    @action(detail=False, methods=['post'], url_path='manual')
+    def create_manual(self, request):
+        """Create a bank account from void-cheque details emailed to staff."""
+        serializer = ManualBankAccountCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            customer = Customer.objects.get(id=data['customer_id'])
+        except Customer.DoesNotExist:
+            return Response({'error': 'Customer not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        with transaction.atomic():
+            connection = _get_or_create_manual_connection(customer)
+            if data.get('set_as_primary', True):
+                BankAccount.objects.filter(customer=customer, is_primary=True).update(is_primary=False)
+
+            external_id = (
+                f"manual-{data['institution_number']}-"
+                f"{data['transit_number']}-{data['account_number']}"
+            )
+            account, created = BankAccount.objects.update_or_create(
+                connection=connection,
+                external_id=external_id,
+                defaults={
+                    'customer': customer,
+                    'name': data.get('name') or 'Manual / Void Cheque',
+                    'type': 'checking',
+                    'currency': 'CAD',
+                    'institution_number': data['institution_number'],
+                    'transit_number': data['transit_number'],
+                    'account_number': data['account_number'],
+                    'is_primary': data.get('set_as_primary', True),
+                    'is_manual_entry': True,
+                    'use_for_eft_funding': True,
+                    'use_for_eft_collections': True,
+                },
+            )
+            if not created:
+                account.institution_number = data['institution_number']
+                account.transit_number = data['transit_number']
+                account.account_number = data['account_number']
+                account.is_manual_entry = True
+                if data.get('name'):
+                    account.name = data['name']
+                if data.get('set_as_primary', True):
+                    account.is_primary = True
+                account.save()
+
+            _refresh_unlocked_loan_snapshots(account)
+
+        notes = (data.get('notes') or '').strip()
+        description = (
+            f"{'Created' if created else 'Updated'} manual bank account from void cheque: "
+            f"{account.institution_number} / {account.transit_number} / {account.account_number}."
+        )
+        if notes:
+            description = f"{description} Notes: {notes}"
+        _log_bank_coords_activity(
+            customer,
+            title='Manual bank account (void cheque)',
+            description=description,
+            user=request.user,
+            metadata={'bank_account_id': str(account.id), 'created': created},
+        )
+
+        return Response(
+            BankAccountSerializer(account).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
 
 
 class BankTransactionViewSet(viewsets.ReadOnlyModelViewSet):

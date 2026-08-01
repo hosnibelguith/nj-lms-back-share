@@ -31,11 +31,49 @@ class BankAccountSerializer(serializers.ModelSerializer):
             'institution_number',
             'account_number',
             'is_primary',
+            'is_manual_entry',
             'use_for_eft_funding',
             'use_for_eft_collections',
             'connection',
             'transactions',
         ]
+
+
+def _digits_only(value: str) -> str:
+    return ''.join(ch for ch in str(value or '') if ch.isdigit())
+
+
+class BankAccountManualCoordinatesSerializer(serializers.Serializer):
+    """Institution / transit / account # from a void cheque."""
+
+    institution_number = serializers.CharField(max_length=10)
+    transit_number = serializers.CharField(max_length=10)
+    account_number = serializers.CharField(max_length=20)
+    name = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    notes = serializers.CharField(required=False, allow_blank=True, max_length=500)
+
+    def validate_institution_number(self, value):
+        digits = _digits_only(value)
+        if len(digits) != 3:
+            raise serializers.ValidationError('Institution number must be 3 digits.')
+        return digits
+
+    def validate_transit_number(self, value):
+        digits = _digits_only(value)
+        if len(digits) != 5:
+            raise serializers.ValidationError('Transit number must be 5 digits.')
+        return digits
+
+    def validate_account_number(self, value):
+        digits = _digits_only(value)
+        if not (5 <= len(digits) <= 12):
+            raise serializers.ValidationError('Account number must be 5–12 digits.')
+        return digits
+
+
+class ManualBankAccountCreateSerializer(BankAccountManualCoordinatesSerializer):
+    customer_id = serializers.UUIDField()
+    set_as_primary = serializers.BooleanField(required=False, default=True)
 
 
 class BankConnectionSerializer(serializers.ModelSerializer):

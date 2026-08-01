@@ -6,6 +6,7 @@ import uuid
 class BankConnection(models.Model):
     PROVIDER_CHOICES = [
         ('flinks', 'Flinks'),
+        ('manual', 'Manual / Void Cheque'),
     ]
 
     SYNC_STATUS_CHOICES = [
@@ -71,6 +72,8 @@ class BankAccount(models.Model):
     transit_number = models.CharField(max_length=10, blank=True, null=True)
     institution_number = models.CharField(max_length=10, blank=True, null=True)
     account_number = models.CharField(max_length=20, blank=True, null=True)
+    # True when staff typed/overrode coordinates from a void cheque (vs Flinks sync).
+    is_manual_entry = models.BooleanField(default=False)
 
     is_primary = models.BooleanField(default=False)
     use_for_eft_funding = models.BooleanField(default=False)

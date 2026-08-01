@@ -377,3 +377,119 @@ class MohawkBankingAnalysisWebhookTests(TestCase):
         self.assertTrue(second.data['duplicate'])
         from banking.models import BankingAnalysisEvent
         self.assertEqual(BankingAnalysisEvent.objects.filter(event_id=payload['event_id']).count(), 1)
+
+
+@override_settings(
+    CELERY_TASK_ALWAYS_EAGER=True,
+)
+class ManualBankAccountStaffTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.staff = User.objects.create_user(
+            email='staff-bank@example.com',
+            password='password123',
+            full_name='Staff User',
+            user_type='staff',
+            is_staff=True,
+        )
+        self.portal = User.objects.create_user(
+            email='void-cheque@example.com',
+            password='password123',
+            full_name='Void Cheque Customer',
+            user_type='customer',
+        )
+        self.customer = Customer.objects.create(
+            portal_user=self.portal,
+            first_name='Void',
+            last_name='Cheque',
+            email='void-cheque@example.com',
+            phone='4165550099',
+            phone_normalized='4165550099',
+            province='ON',
+            status='pending',
+        )
+        self.connection = BankConnection.objects.create(
+            customer=self.customer,
+            login_id='flinks-login-1',
+            provider='flinks',
+            is_active=True,
+            sync_status='synced',
+        )
+        self.account = BankAccount.objects.create(
+            connection=self.connection,
+            customer=self.customer,
+            external_id='flinks-acct-1',
+            name='Chequing',
+            type='checking',
+            balance=Decimal('100.00'),
+            transit_number='11111',
+            institution_number='001',
+            account_number='1111111',
+            is_primary=True,
+        )
+        self.client.force_authenticate(user=self.staff)
+
+    def test_staff_can_update_coordinates_from_void_cheque(self):
+        response = self.client.patch(
+            f'/api/bank-accounts/{self.account.id}/coordinates/',
+            {
+                'institution_number': '004',
+                'transit_number': '12345',
+                'account_number': '987654321',
+                'notes': 'New void emailed by customer',
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.institution_number, '004')
+        self.assertEqual(self.account.transit_number, '12345')
+        self.assertEqual(self.account.account_number, '987654321')
+        self.assertTrue(self.account.is_manual_entry)
+        self.assertTrue(
+            ActivityHistory.objects.filter(
+                customer=self.customer,
+                title='Bank details updated (void cheque)',
+            ).exists()
+        )
+
+    def test_update_coordinates_rejects_invalid_institution(self):
+        response = self.client.patch(
+            f'/api/bank-accounts/{self.account.id}/coordinates/',
+            {
+                'institution_number': '12',
+                'transit_number': '12345',
+                'account_number': '987654321',
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_staff_can_create_manual_account_from_void_cheque(self):
+        response = self.client.post(
+            '/api/bank-accounts/manual/',
+            {
+                'customer_id': str(self.customer.id),
+                'institution_number': '003',
+                'transit_number': '54321',
+                'account_number': '5555555',
+                'name': 'Void Cheque Account',
+                'notes': 'Received by email',
+                'set_as_primary': True,
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertTrue(response.data['is_manual_entry'])
+        self.assertEqual(response.data['institution_number'], '003')
+        self.account.refresh_from_db()
+        self.assertFalse(self.account.is_primary)
+        manual = BankAccount.objects.get(id=response.data['id'])
+        self.assertTrue(manual.is_primary)
+        self.assertEqual(manual.connection.provider, 'manual')
+        self.assertTrue(
+            ActivityHistory.objects.filter(
+                customer=self.customer,
+                title='Manual bank account (void cheque)',
+            ).exists()
+        )
