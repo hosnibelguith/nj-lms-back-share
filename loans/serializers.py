@@ -516,6 +516,7 @@ class LoanReactivateSerializer(serializers.Serializer):
 class LoanApproveSerializer(serializers.Serializer):
     """Approve loan."""
     bank_account_id = serializers.UUIDField(required=False)
+    collections_account_id = serializers.UUIDField(required=False)
 
 
 class LoanDeclineSerializer(serializers.Serializer):

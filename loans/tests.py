@@ -192,6 +192,79 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertTrue(response.data["collections_account_configured"])
         self.assertEqual(response.data["blockers"], [])
 
+    def test_configure_accounts_allowed_before_approve(self):
+        pending_loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("400.00"),
+            fee=Decimal("80.00"),
+            total_amount=Decimal("480.00"),
+            balance=Decimal("480.00"),
+            status="pending",
+            bank_account=self.account,
+            is_active=True,
+        )
+
+        response = self.client.patch(
+            f"/api/loans/{pending_loan.id}/funding/configuration/",
+            {
+                "eft_bank_account_id": str(self.other_account.id),
+                "collections_account_id": str(self.other_account.id),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        pending_loan.refresh_from_db()
+        self.assertEqual(pending_loan.bank_account_id, self.other_account.id)
+        self.assertEqual(pending_loan.collections_account_id, self.other_account.id)
+        self.assertEqual(
+            pending_loan.funding_destination.get("eft", {}).get("bank_account_id"),
+            str(self.other_account.id),
+        )
+
+    def test_approve_persists_selected_accounts(self):
+        pending_loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("350.00"),
+            fee=Decimal("70.00"),
+            total_amount=Decimal("420.00"),
+            balance=Decimal("420.00"),
+            status="pending",
+            bank_account=self.account,
+            is_active=True,
+        )
+
+        response = self.client.post(
+            f"/api/loans/{pending_loan.id}/approve/",
+            {
+                "bank_account_id": str(self.other_account.id),
+                "collections_account_id": str(self.other_account.id),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        pending_loan.refresh_from_db()
+        self.assertEqual(pending_loan.status, "pending_funding")
+        self.assertEqual(pending_loan.bank_account_id, self.other_account.id)
+        self.assertEqual(pending_loan.collections_account_id, self.other_account.id)
+
+    def test_configure_rejected_after_funding_locked(self):
+        self.loan.funding_destination_locked_at = timezone.now()
+        self.loan.save(update_fields=["funding_destination_locked_at", "updated_at"])
+
+        response = self.client.patch(
+            f"/api/loans/{self.loan.id}/funding/configuration/",
+            {
+                "eft_bank_account_id": str(self.other_account.id),
+                "collections_account_id": str(self.other_account.id),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("locked", str(response.data.get("error", "")).lower())
+
     def test_funding_override_requires_confirmation(self):
         FundingMethodRecommendation.objects.update_or_create(
             weekday=timezone.localtime().weekday(),

@@ -315,8 +315,17 @@ class LoanViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
 
         bank_account_id = serializer.validated_data.get('bank_account_id')
-        if bank_account_id:
-            loan.bank_account_id = bank_account_id
+        collections_account_id = serializer.validated_data.get('collections_account_id')
+        if bank_account_id or collections_account_id:
+            try:
+                loan = FundingConfigurationService.configure(
+                    loan,
+                    eft_bank_account_id=bank_account_id,
+                    collections_account_id=collections_account_id,
+                    user=request.user,
+                )
+            except ValueError as exc:
+                return Response({'error': str(exc)}, status=400)
 
         loan = LoanService.approve_loan(
             loan=loan,

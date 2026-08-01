@@ -860,6 +860,11 @@ class CollectionService:
 
 
 class FundingConfigurationService:
+    # Staff may pick funding/collections accounts before approve and before fund.
+    CONFIGURABLE_STATUSES = frozenset(
+        {"ibv_pending", "pending", "pending_signature", "pending_funding"}
+    )
+
     @staticmethod
     @transaction.atomic
     def configure(
@@ -873,8 +878,11 @@ class FundingConfigurationService:
     ):
         loan = Loan.objects.select_for_update().get(pk=loan.pk)
 
-        if loan.status != "pending_funding":
-            raise ValueError("Only loans pending funding can be configured.")
+        if loan.status not in FundingConfigurationService.CONFIGURABLE_STATUSES:
+            raise ValueError(
+                "Account destinations can only be changed before funding is locked "
+                "(pending review through pending funding)."
+            )
         if loan.funding_destination_locked_at:
             raise ValueError("Funding configuration is locked.")
 
