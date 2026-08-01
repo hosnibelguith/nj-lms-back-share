@@ -463,6 +463,55 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(self.loan.balance, self.loan.total_amount - Decimal("100.00"))
         self.assertTrue(all(payment.amount <= Decimal("180.00") for payment in scheduled))
 
+    def test_adjust_schedule_can_calculate_amount_from_payment_count(self):
+        formula = LoanFormula.objects.create(
+            name="Count Schedule Adjust 500",
+            principal_amount=Decimal("500.00"),
+            brokerage_percent=Decimal("70.00"),
+            repayment_percent=Decimal("35.00"),
+            default_number_of_payments=4,
+            default_frequency_days=14,
+            is_active=True,
+        )
+        self.loan.formula = formula
+        self.loan.fee = Decimal("378.53")
+        self.loan.total_amount = Decimal("878.53")
+        self.loan.balance = Decimal("878.53")
+        self.loan.save(update_fields=["formula", "fee", "total_amount", "balance", "updated_at"])
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("219.63"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+        )
+
+        start_date = timezone.localdate() + timedelta(days=7)
+        response = self.client.patch(
+            f"/api/loans/{self.loan.id}/adjust-schedule/",
+            {
+                "calculation_mode": "number_of_payments",
+                "number_of_payments": 6,
+                "frequency": "weekly",
+                "start_date": start_date.isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.loan.refresh_from_db()
+        scheduled = list(self.loan.payments.filter(status="scheduled").order_by("scheduled_date"))
+
+        self.assertEqual(len(scheduled), 6)
+        self.assertEqual(scheduled[0].scheduled_date, start_date)
+        self.assertEqual(sum((payment.amount for payment in scheduled), Decimal("0.00")), self.loan.balance)
+        self.assertEqual(scheduled[-1].amount, self.loan.balance - sum((payment.amount for payment in scheduled[:-1]), Decimal("0.00")))
+        self.assertTrue(
+            self.loan.state_events.filter(
+                event_type="amount_updated",
+                notes__icontains="calculated payment",
+            ).exists()
+        )
+
     def test_duplicate_funding_is_blocked(self):
         FundedPayment.objects.create(
             loan=self.loan,

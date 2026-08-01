@@ -364,7 +364,9 @@ class LoanViewSet(viewsets.ModelViewSet):
         try:
             LoanService.adjust_payment_schedule(
                 loan=loan,
-                payment_amount=serializer.validated_data['payment_amount'],
+                calculation_mode=serializer.validated_data.get('calculation_mode', 'payment_amount'),
+                payment_amount=serializer.validated_data.get('payment_amount'),
+                number_of_payments=serializer.validated_data.get('number_of_payments'),
                 frequency=serializer.validated_data['frequency'],
                 start_date=serializer.validated_data['start_date'],
                 user=request.user,

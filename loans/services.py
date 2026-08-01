@@ -637,20 +637,23 @@ class LoanService:
     def adjust_payment_schedule(
         loan: Loan,
         *,
-        payment_amount: Decimal,
+        calculation_mode: str = 'payment_amount',
+        payment_amount: Decimal = None,
+        number_of_payments: int = None,
         frequency: str,
         start_date,
         user=None,
         notes: str = '',
     ) -> list:
         """
-        Reprice the loan using the staff-selected installment amount and
-        cadence, then replace only unprocessed scheduled payments.
+        Reprice the loan using the staff-selected installment amount or
+        installment count and cadence, then replace scheduled payments.
 
-        The number of installments is solved from the chosen payment amount:
-        choose the smallest schedule where payment_amount * n covers principal
-        + brokerage + daily interest for n periods. The final installment is
-        adjusted to the exact remaining balance.
+        In amount mode, choose the smallest schedule where payment_amount * n
+        covers principal + brokerage + daily interest for n periods. In count
+        mode, calculate the daily-interest total for the selected count and
+        spread the remaining balance across that count. The final installment
+        is adjusted to the exact remaining balance.
         """
         if loan.status not in [
             'pending_signature',
@@ -661,9 +664,9 @@ class LoanService:
         ]:
             raise ValueError(f"Cannot adjust schedule in status: {loan.status}")
 
-        payment_amount = LoanService.money(payment_amount)
-        if payment_amount <= 0:
-            raise ValueError('Payment amount must be greater than zero.')
+        calculation_mode = calculation_mode or 'payment_amount'
+        if calculation_mode not in ['payment_amount', 'number_of_payments']:
+            raise ValueError('Invalid schedule calculation mode.')
 
         frequency_days_by_key = {
             'weekly': 7,
@@ -696,44 +699,81 @@ class LoanService:
         total_amount = None
         balance_due = None
 
-        for candidate_count in range(1, max_payments + 1):
-            candidate_total = LoanService.calculate_schedule_total(
+        if calculation_mode == 'number_of_payments':
+            if number_of_payments is None:
+                raise ValueError('Number of payments is required.')
+            num_payments = int(number_of_payments)
+            if num_payments < 1 or num_payments > max_payments:
+                raise ValueError(f'Number of payments must be between 1 and {max_payments}.')
+
+            total_amount = LoanService.calculate_schedule_total(
                 principal_balance=priced_principal,
                 annual_rate_percent=annual_rate,
                 start_date=start_date,
-                num_payments=candidate_count,
+                num_payments=num_payments,
                 frequency_days=frequency_days,
             )
-            candidate_balance = max(
-                LoanService.money(candidate_total - paid_total),
+            balance_due = max(
+                LoanService.money(total_amount - paid_total),
                 Decimal('0.00'),
             )
-            if payment_amount * Decimal(candidate_count) >= candidate_balance:
-                num_payments = candidate_count
-                total_amount = candidate_total
-                balance_due = candidate_balance
-                break
+            payment_amount = LoanService.money(balance_due / Decimal(num_payments))
+        else:
+            if payment_amount is None:
+                raise ValueError('Payment amount is required.')
+            payment_amount = LoanService.money(payment_amount)
+            if payment_amount <= 0:
+                raise ValueError('Payment amount must be greater than zero.')
 
-        if num_payments is None or total_amount is None or balance_due is None:
-            minimum_payment = LoanService.money(
-                max(
-                    LoanService.calculate_schedule_total(
-                        principal_balance=priced_principal,
-                        annual_rate_percent=annual_rate,
-                        start_date=start_date,
-                        num_payments=max_payments,
-                        frequency_days=frequency_days,
-                    ) - paid_total,
+            for candidate_count in range(1, max_payments + 1):
+                candidate_total = LoanService.calculate_schedule_total(
+                    principal_balance=priced_principal,
+                    annual_rate_percent=annual_rate,
+                    start_date=start_date,
+                    num_payments=candidate_count,
+                    frequency_days=frequency_days,
+                )
+                candidate_balance = max(
+                    LoanService.money(candidate_total - paid_total),
                     Decimal('0.00'),
-                ) / Decimal(max_payments)
-            )
-            raise ValueError(
-                f'Payment amount is too low for this schedule. '
-                f'Use at least ${minimum_payment}.'
-            )
+                )
+                if payment_amount * Decimal(candidate_count) >= candidate_balance:
+                    num_payments = candidate_count
+                    total_amount = candidate_total
+                    balance_due = candidate_balance
+                    break
+
+            if num_payments is None or total_amount is None or balance_due is None:
+                minimum_payment = LoanService.money(
+                    max(
+                        LoanService.calculate_schedule_total(
+                            principal_balance=priced_principal,
+                            annual_rate_percent=annual_rate,
+                            start_date=start_date,
+                            num_payments=max_payments,
+                            frequency_days=frequency_days,
+                        ) - paid_total,
+                        Decimal('0.00'),
+                    ) / Decimal(max_payments)
+                )
+                raise ValueError(
+                    f'Payment amount is too low for this schedule. '
+                    f'Use at least ${minimum_payment}.'
+                )
 
         if balance_due <= 0:
             raise ValueError('This loan has no remaining balance to schedule.')
+
+        if calculation_mode == 'number_of_payments':
+            detail = (
+                f'Schedule adjusted to {num_payments} {frequency} payment(s) '
+                f'from {start_date}; calculated payment ${payment_amount}.'
+            )
+        else:
+            detail = (
+                f'Schedule adjusted to {num_payments} {frequency} payment(s) '
+                f'from {start_date}; target payment ${payment_amount}.'
+            )
 
         Payment.objects.filter(loan=loan, status='scheduled').delete()
 
@@ -760,10 +800,6 @@ class LoanService:
             schedule_total=balance_due,
         )
 
-        detail = (
-            f'Schedule adjusted to {num_payments} {frequency} payment(s) '
-            f'from {start_date}; target payment ${payment_amount}.'
-        )
         if notes:
             detail = f'{detail} {notes}'
         loan.log_state_event(

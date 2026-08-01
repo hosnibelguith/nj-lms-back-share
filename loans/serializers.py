@@ -549,10 +549,37 @@ class LoanAmountUpdateSerializer(serializers.Serializer):
 
 class LoanScheduleAdjustSerializer(serializers.Serializer):
     """Reprice and replace the scheduled repayment calendar."""
-    payment_amount = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal('0.01'))
+    calculation_mode = serializers.ChoiceField(
+        choices=['payment_amount', 'number_of_payments'],
+        required=False,
+        default='payment_amount',
+    )
+    payment_amount = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=Decimal('0.01'),
+        required=False,
+    )
+    number_of_payments = serializers.IntegerField(
+        min_value=1,
+        max_value=260,
+        required=False,
+    )
     frequency = serializers.ChoiceField(choices=['weekly', 'bi-weekly', 'monthly'])
     start_date = serializers.DateField()
     notes = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        mode = attrs.get('calculation_mode') or 'payment_amount'
+        if mode == 'payment_amount' and attrs.get('payment_amount') is None:
+            raise serializers.ValidationError({
+                'payment_amount': 'Payment amount is required when adjusting by amount.'
+            })
+        if mode == 'number_of_payments' and attrs.get('number_of_payments') is None:
+            raise serializers.ValidationError({
+                'number_of_payments': 'Number of payments is required when adjusting by payment count.'
+            })
+        return attrs
 
 
 class LoanFundSerializer(serializers.Serializer):
