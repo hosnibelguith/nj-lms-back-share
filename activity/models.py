@@ -125,12 +125,20 @@ class Comment(models.Model):
         
         # Create activity entry for new comments
         if is_new:
+            author = None
+            if self.created_by_id:
+                author = getattr(self.created_by, 'full_name', None) or getattr(
+                    self.created_by, 'email', None
+                )
             ActivityHistory.objects.create(
                 customer=self.customer,
                 loan=self.loan,
                 type='comment',
-                title='Comment Added',
+                title=f'Comment by {author or "Staff"}',
                 description=self.content[:200] + '...' if len(self.content) > 200 else self.content,
                 created_by=str(self.created_by_id) if self.created_by_id else None,
-                metadata={'comment_id': str(self.id)}
+                metadata={
+                    'comment_id': str(self.id),
+                    'loan_id': str(self.loan_id) if self.loan_id else None,
+                }
             )

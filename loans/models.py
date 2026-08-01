@@ -278,6 +278,8 @@ class Loan(models.Model):
         self.is_active = True
         self.approved_at = timezone.now()
         self.approved_by = user
+        # Richer Activity History is written by LoanService; skip generic signal row.
+        self._suppress_status_activity = True
         self.save()
 
         self.log_state_event(
@@ -299,6 +301,8 @@ class Loan(models.Model):
         self.is_active = False
         self.declined_at = timezone.now()
         self.decline_reason = reason
+        # Richer Activity History is written by LoanService; skip generic signal row.
+        self._suppress_status_activity = True
         self.save()
 
         self.log_state_event(
@@ -370,6 +374,7 @@ class Loan(models.Model):
         self.funding_method = method
         self.funding_reference = reference
         self.funded_at = timezone.now()
+        self._suppress_status_activity = True
         self.save()
 
         self.log_state_event(
@@ -390,6 +395,8 @@ class Loan(models.Model):
         if reference:
             self.funding_reference = reference
         self.funded_at = timezone.now()
+        # Funding services write a richer Activity History row.
+        self._suppress_status_activity = True
         self.save(update_fields=[
             'status',
             'is_active',

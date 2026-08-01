@@ -655,11 +655,14 @@ class FundingService:
         ])
 
         recommended_method = FundingMethodRecommendation.for_date()
+        from activity.services import actor_label
+
+        actor = actor_label(user)
         log_activity(
             loan,
             "system",
             "Funding Initiated",
-            "Funding was sent to ZūmRails for processing.",
+            f"Funding initiated by {actor} via {method.upper()} and sent to ZūmRails for processing.",
             created_by=getattr(user, "id", "system"),
             metadata={
                 "funded_payment_id": str(funding.id),
@@ -668,6 +671,7 @@ class FundingService:
                 "overrode_recommendation": bool(
                     recommended_method and recommended_method != method
                 ),
+                "loan_id": str(loan.id),
             },
         )
         FundingService._queue_funding_email(loan)
@@ -716,13 +720,15 @@ class FundingService:
             reference=funding.reference,
             user=user,
         )
+        from activity.services import actor_label
+
         log_activity(
             loan,
             "system",
             "Card Issuance Funding",
-            "Loan marked funded via Card Issuance (no LendStack EFT/EMT).",
+            f"Loan marked funded via Card Issuance by {actor_label(user)} (no LendStack EFT/EMT).",
             created_by=getattr(user, "id", "system"),
-            metadata={"funded_payment_id": str(funding.id), "method": "card_issuance"},
+            metadata={"funded_payment_id": str(funding.id), "method": "card_issuance", "loan_id": str(loan.id)},
         )
         FundingService._queue_funding_email(loan)
         return funding
@@ -848,12 +854,20 @@ class CollectionService:
             failed_payment=failed_payment,
             failure_reason=failed_payment.failure_reason or "",
         )
-        log_activity(
-            loan,
-            "system",
-            "Collections Account Changed",
-            "Collections account was changed after a failed EFT collection.",
-            created_by=getattr(user, "id", "system"),
+        from activity.services import actor_label, format_account_label, log_staff_action
+
+        actor = actor_label(user)
+        log_staff_action(
+            customer=loan.customer,
+            loan=loan,
+            user=user,
+            type_value="system",
+            title="Collections Account Changed",
+            description=(
+                f"Collections account changed from {format_account_label(previous)} "
+                f"to {format_account_label(new)} by {actor} "
+                f"(after failed EFT collection)."
+            ),
             metadata={"audit_id": str(audit.id), "failed_payment_id": str(failed_payment.id)},
         )
         return audit
@@ -864,6 +878,13 @@ class FundingConfigurationService:
     CONFIGURABLE_STATUSES = frozenset(
         {"ibv_pending", "pending", "pending_signature", "pending_funding"}
     )
+
+    @staticmethod
+    def _emt_label(destination: dict) -> str:
+        emt = destination.get("emt") if isinstance(destination.get("emt"), dict) else {}
+        email = emt.get("email") or "(none)"
+        source = emt.get("source") or ""
+        return f"{email}" + (f" ({source})" if source else "")
 
     @staticmethod
     @transaction.atomic
@@ -886,19 +907,32 @@ class FundingConfigurationService:
         if loan.funding_destination_locked_at:
             raise ValueError("Funding configuration is locked.")
 
+        from activity.services import actor_label, format_account_label, log_staff_action
+
         destination = loan.funding_destination
         if not isinstance(destination, dict):
             destination = {}
         else:
             destination = dict(destination)
 
+        previous_eft_snap = None
+        if isinstance(destination.get("eft"), dict):
+            previous_eft_snap = destination["eft"].get("account")
+        previous_eft = format_account_label(previous_eft_snap or loan.bank_account)
+        previous_collections = format_account_label(loan.collections_account)
+        previous_emt = FundingConfigurationService._emt_label(destination)
+
         update_fields = ["funding_destination", "updated_at"]
+        changes = []
 
         if emt_email:
             destination["emt"] = {
                 "email": str(emt_email),
                 "source": emt_source or "application",
             }
+            new_emt = FundingConfigurationService._emt_label(destination)
+            if new_emt != previous_emt:
+                changes.append(f"EMT destination changed from {previous_emt} to {new_emt}")
 
         if eft_bank_account_id:
             try:
@@ -909,6 +943,9 @@ class FundingConfigurationService:
                     "account": account_snapshot(account),
                 }
                 update_fields.append("bank_account")
+                new_eft = format_account_label(account)
+                if new_eft != previous_eft:
+                    changes.append(f"Funding account changed from {previous_eft} to {new_eft}")
             except BankAccount.DoesNotExist:
                 raise ValueError("Selected EFT account must belong to this customer.")
 
@@ -917,18 +954,31 @@ class FundingConfigurationService:
                 account = BankAccount.objects.get(id=collections_account_id, customer=loan.customer)
                 loan.collections_account = account
                 update_fields.append("collections_account")
+                new_collections = format_account_label(account)
+                if new_collections != previous_collections:
+                    changes.append(
+                        f"Collections account changed from {previous_collections} to {new_collections}"
+                    )
             except BankAccount.DoesNotExist:
                 raise ValueError("Selected collections account must belong to this customer.")
 
         loan.funding_destination = destination
         loan.save(update_fields=update_fields)
 
-        log_activity(
-            loan,
-            "system",
-            "Funding Configured",
-            "Funding destination and collections account selections were saved.",
-            created_by=getattr(user, "id", "system"),
+        actor = actor_label(user)
+        if changes:
+            description = f"{'; '.join(changes)} by {actor}."
+        else:
+            description = f"Funding destination and collections account selections were saved by {actor}."
+
+        log_staff_action(
+            customer=loan.customer,
+            loan=loan,
+            user=user,
+            type_value="system",
+            title="Funding Configured",
+            description=description,
+            metadata={"action": "funding_configured", "changes": changes},
         )
         return loan
 

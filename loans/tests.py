@@ -287,10 +287,78 @@ class ZumRailsWorkflowTests(APITestCase):
             ActivityHistory.objects.filter(
                 loan=pending_loan,
                 type="comment",
-                title="Decline reason",
+                title="Loan Declined",
                 description__contains="Unacceptable bank",
             ).exists()
         )
+
+    def test_staff_actions_write_detailed_activity_history(self):
+        from activity.models import ActivityHistory
+        from loans.services import LoanService
+
+        pending_loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("50.00"),
+            total_amount=Decimal("550.00"),
+            balance=Decimal("550.00"),
+            status="pending",
+            bank_account=self.account,
+            is_active=True,
+        )
+        pending_loan.contract_signed_at = timezone.now()
+        pending_loan.save(update_fields=["contract_signed_at", "updated_at"])
+
+        LoanService.approve_loan(pending_loan, approved_by=self.staff)
+        approve_log = ActivityHistory.objects.filter(
+            loan=pending_loan, title="Loan Approved"
+        ).latest("created_at")
+        self.assertIn("Approved by Agent User", approve_log.description)
+        self.assertIn("Status changed from", approve_log.description)
+        self.assertEqual(approve_log.created_by, str(self.staff.id))
+        # No vague duplicate status-only row for the same transition.
+        self.assertEqual(
+            ActivityHistory.objects.filter(loan=pending_loan, title="Loan Approved").count(),
+            1,
+        )
+
+        LoanService.update_approved_amount(
+            pending_loan, Decimal("400.00"), user=self.staff
+        )
+        amount_log = ActivityHistory.objects.filter(
+            loan=pending_loan, title="Approved Amount Changed"
+        ).latest("created_at")
+        self.assertIn("from $500.00 to $400.00", amount_log.description)
+        self.assertIn("by Agent User", amount_log.description)
+
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.patch(
+            f"/api/loans/{pending_loan.id}/funding/configuration/",
+            {
+                "eft_bank_account_id": str(self.other_account.id),
+                "collections_account_id": str(self.other_account.id),
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        config_log = ActivityHistory.objects.filter(
+            loan=pending_loan, title="Funding Configured"
+        ).latest("created_at")
+        self.assertIn("Funding account changed from", config_log.description)
+        self.assertIn("to", config_log.description)
+        self.assertIn("by Agent User", config_log.description)
+
+        timeline = self.client.get(
+            f"/api/activities/timeline/?customer_id={self.customer.id}"
+        )
+        self.assertEqual(timeline.status_code, 200)
+        titles = [row["title"] for row in timeline.data]
+        self.assertIn("Loan Approved", titles)
+        self.assertIn("Approved Amount Changed", titles)
+        self.assertIn("Funding Configured", titles)
+        approved_row = next(row for row in timeline.data if row["title"] == "Loan Approved")
+        self.assertEqual(approved_row["loan"], str(pending_loan.id))
+        self.assertEqual(approved_row["created_by_name"], "Agent User")
 
     def test_configure_rejected_after_funding_locked(self):
         self.loan.funding_destination_locked_at = timezone.now()

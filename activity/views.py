@@ -3,8 +3,6 @@ from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.db.models import Q
-from itertools import chain
-from operator import attrgetter
 from .models import ActivityHistory, Comment
 from .serializers import (
     ActivityHistorySerializer, ActivityHistoryCreateSerializer,
@@ -80,23 +78,16 @@ class ActivityHistoryViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Get activities
+        # Get activities only — Comment.save() already creates an ActivityHistory row,
+        # so merging Comment objects here would duplicate notes in the timeline.
         activities = ActivityHistory.objects.filter(customer_id=customer_id)
         if loan_id:
             activities = activities.filter(Q(loan_id=loan_id) | Q(loan__isnull=True))
-        
-        # Get comments
-        comments = Comment.objects.filter(customer_id=customer_id)
-        if loan_id:
-            comments = comments.filter(Q(loan_id=loan_id) | Q(loan__isnull=True))
-        
-        # Combine and sort
+
         activities = list(activities[:limit])
-        comments = list(comments[:limit])
-        
-        # Transform to common format
+
         timeline_items = []
-        
+
         for activity in activities:
             timeline_items.append({
                 'id': str(activity.id),
@@ -107,30 +98,17 @@ class ActivityHistoryViewSet(viewsets.ModelViewSet):
                 'created_at': activity.created_at,
                 'created_by': activity.created_by,
                 'created_by_name': self._get_user_name(activity.created_by),
-                'metadata': activity.metadata,
+                'loan': str(activity.loan_id) if activity.loan_id else None,
+                'metadata': {
+                    **(activity.metadata or {}),
+                    **({'loan_id': str(activity.loan_id)} if activity.loan_id else {}),
+                },
                 'source': 'activity',
             })
-        
-        for comment in comments:
-            timeline_items.append({
-                'id': str(comment.id),
-                'type': 'comment',
-                'type_display': 'Comment',
-                'title': f'Comment by {comment.created_by.full_name if comment.created_by else "Unknown"}',
-                'description': comment.content,
-                'created_at': comment.created_at,
-                'created_by': str(comment.created_by_id) if comment.created_by_id else None,
-                'created_by_name': comment.created_by.full_name if comment.created_by else 'Unknown',
-                'metadata': {
-                    'is_pinned': comment.is_pinned,
-                    'is_internal': comment.is_internal,
-                },
-                'source': 'comment',
-            })
-        
+
         # Sort by created_at descending
         timeline_items.sort(key=lambda x: x['created_at'], reverse=True)
-        
+
         return Response(timeline_items[:limit])
     
     def _get_user_name(self, user_id):

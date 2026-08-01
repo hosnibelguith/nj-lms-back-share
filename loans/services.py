@@ -281,11 +281,36 @@ class LoanService:
         if loan.status not in ['pending', 'pending_signature']:
             raise ValueError(f"Cannot approve loan in status: {loan.status}")
 
+        from activity.services import actor_label, log_staff_action
+
+        previous_display = loan.get_status_display()
+        previous_status = loan.status
         loan.approve(user=approved_by, source=source)
 
         if notes:
             loan.notes = ((loan.notes or '') + f"\n{notes}").strip()
             loan.save(update_fields=['notes', 'updated_at'])
+
+        actor = actor_label(approved_by)
+        description = (
+            f'Approved by {actor}. '
+            f'Status changed from {previous_display} to {loan.get_status_display()}.'
+        )
+        if notes:
+            description = f'{description} Notes: {notes.strip()}'
+        log_staff_action(
+            customer=loan.customer,
+            loan=loan,
+            user=approved_by,
+            type_value='system',
+            title='Loan Approved',
+            description=description,
+            metadata={
+                'previous_status': previous_status,
+                'new_status': loan.status,
+                'action': 'approve',
+            },
+        )
 
         # Arrive card funding is confirmed by staff via Fund Customer → Card Issuance
         # (not auto-funded here). EFT/EMT remains for non-Arrive loans.
@@ -310,26 +335,35 @@ class LoanService:
         if loan.status not in ['ibv_pending', 'pending', 'pending_signature', 'pending_funding']:
             raise ValueError(f"Cannot decline loan in status: {loan.status}")
 
+        from activity.services import actor_label, log_staff_action
+
+        previous_display = loan.get_status_display()
+        previous_status = loan.status
         loan.decline(reason=reason, user=declined_by, source=source)
 
-        # Activity timeline entry (same feed as comments) — not a filterable status.
-        from activity.models import ActivityHistory
-
         label = (reason_label or reason.split('\n', 1)[0]).strip()
-        description = f'Decline reason: {label}'
+        actor = actor_label(declined_by)
+        description = (
+            f'Declined by {actor}. '
+            f'Status changed from {previous_display} to {loan.get_status_display()}. '
+            f'Reason: {label}.'
+        )
         if comment:
-            description = f'{description}\n{comment.strip()}'
-        ActivityHistory.objects.create(
+            description = f'{description} Comment: {comment.strip()}'
+        log_staff_action(
             customer=loan.customer,
             loan=loan,
-            type='comment',
-            title='Decline reason',
+            user=declined_by,
+            type_value='comment',
+            title='Loan Declined',
             description=description,
             metadata={
                 'decline_reason': label,
                 'comment': (comment or '').strip(),
+                'previous_status': previous_status,
+                'new_status': loan.status,
+                'action': 'decline',
             },
-            created_by=str(getattr(declined_by, 'id', 'staff')),
         )
 
         from accounts.arrive_integration import queue_decision_webhook
@@ -365,7 +399,10 @@ class LoanService:
         if loan.status != 'human_declined':
             raise ValueError(f"Cannot revert decline for loan in status: {loan.status}")
 
+        from activity.services import actor_label, log_staff_action
+
         previous_status = loan.status
+        previous_display = loan.get_status_display()
         loan.status = 'pending_funding'
         loan.is_active = True
         loan.approved_at = timezone.now()
@@ -374,6 +411,7 @@ class LoanService:
         loan.decline_reason = ''
         if notes:
             loan.notes = ((loan.notes or '') + f"\n{notes}").strip()
+        loan._suppress_status_activity = True
         loan.save()
 
         loan.log_state_event(
@@ -382,6 +420,27 @@ class LoanService:
             new_status=loan.status,
             user=approved_by,
             notes=notes or 'Reverted decline to approve',
+        )
+
+        actor = actor_label(approved_by)
+        description = (
+            f'Decline reverted and approved by {actor}. '
+            f'Status changed from {previous_display} to {loan.get_status_display()}.'
+        )
+        if notes:
+            description = f'{description} Notes: {notes.strip()}'
+        log_staff_action(
+            customer=loan.customer,
+            loan=loan,
+            user=approved_by,
+            type_value='system',
+            title='Decline Reverted',
+            description=description,
+            metadata={
+                'previous_status': previous_status,
+                'new_status': loan.status,
+                'action': 'revert_decline',
+            },
         )
 
         from accounts.arrive_integration import queue_decision_webhook
@@ -399,6 +458,8 @@ class LoanService:
         if loan.funded_payments.filter(status__in=['processing', 'completed']).exists():
             raise ValueError('Cannot update approved amount after funding has started.')
 
+        from activity.services import actor_label, log_staff_action
+
         old_principal = loan.principal
         principal = LoanService.money(principal)
         if principal <= 0:
@@ -409,16 +470,33 @@ class LoanService:
         LoanService.rebuild_payment_schedule(loan, reprice=True)
         loan.refresh_from_db()
 
-        detail = f'Approved amount changed from ${old_principal} to ${loan.principal}.'
+        actor = actor_label(user)
+        detail = (
+            f'Approved amount changed from ${old_principal} to ${loan.principal} by {actor}.'
+        )
         if notes:
             loan.notes = ((loan.notes or '') + f"\n{notes}").strip()
             loan.save(update_fields=['notes', 'updated_at'])
+            detail = f'{detail} Notes: {notes.strip()}'
         loan.log_state_event(
             event_type='amount_updated',
             previous_status=loan.status,
             new_status=loan.status,
             user=user,
             notes=detail,
+        )
+        log_staff_action(
+            customer=loan.customer,
+            loan=loan,
+            user=user,
+            type_value='system',
+            title='Approved Amount Changed',
+            description=detail,
+            metadata={
+                'previous_principal': str(old_principal),
+                'new_principal': str(loan.principal),
+                'action': 'update_approved_amount',
+            },
         )
 
         return loan
@@ -431,6 +509,9 @@ class LoanService:
         if not loan.contract_signed:
             raise ValueError('Contract must be signed before funding.')
 
+        from activity.services import actor_label, log_staff_action
+
+        previous_display = loan.get_status_display()
         ref = reference or f"{method.upper()}-{timezone.now().strftime('%Y%m%d')}-{str(loan.id)[:8].upper()}"
 
         loan.fund(method, ref, user=user)
@@ -443,6 +524,21 @@ class LoanService:
             reference=ref,
             completed_at=timezone.now(),
             notes='Funding created from staff portal.',
+        )
+
+        actor = actor_label(user)
+        log_staff_action(
+            customer=loan.customer,
+            loan=loan,
+            user=user,
+            type_value='loan_funded',
+            title='Loan Funded',
+            description=(
+                f'Funded by {actor} via {method.upper()}. '
+                f'Status changed from {previous_display} to {loan.get_status_display()}. '
+                f'Reference: {ref}.'
+            ),
+            metadata={'method': method, 'reference': ref, 'action': 'fund'},
         )
 
         template_name = 'Fund/Approve Template'
@@ -808,6 +904,25 @@ class LoanService:
             new_status=loan.status,
             user=user,
             notes=detail,
+        )
+
+        from activity.services import actor_label, log_staff_action
+
+        actor = actor_label(user)
+        log_staff_action(
+            customer=loan.customer,
+            loan=loan,
+            user=user,
+            type_value='payment_scheduled',
+            title='Payment Schedule Adjusted',
+            description=f'{detail} By {actor}.',
+            metadata={
+                'action': 'adjust_schedule',
+                'num_payments': num_payments,
+                'frequency': frequency,
+                'payment_amount': str(payment_amount),
+                'start_date': str(start_date),
+            },
         )
 
         return payments
