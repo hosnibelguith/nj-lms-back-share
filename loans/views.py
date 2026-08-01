@@ -386,11 +386,17 @@ class LoanViewSet(viewsets.ModelViewSet):
         serializer = LoanDeclineSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        reason = serializer.validated_data['reason']
+        comment = (serializer.validated_data.get('comment') or '').strip()
+        combined_reason = f"{reason}\n{comment}".strip() if comment else reason
+
         loan = LoanService.decline_loan(
             loan=loan,
-            reason=serializer.validated_data['reason'],
+            reason=combined_reason,
             declined_by=request.user,
             source='human',
+            reason_label=reason,
+            comment=comment,
         )
 
         return Response(LoanSerializer(loan).data)

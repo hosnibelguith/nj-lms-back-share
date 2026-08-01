@@ -297,13 +297,40 @@ class LoanService:
     
     @staticmethod
     @transaction.atomic
-    def decline_loan(loan: Loan, reason: str, declined_by=None, source='human') -> Loan:
+    def decline_loan(
+        loan: Loan,
+        reason: str,
+        declined_by=None,
+        source='human',
+        reason_label: str | None = None,
+        comment: str = '',
+    ) -> Loan:
         if source != 'human':
             raise ValueError('AI decisions must be recorded with set_ai_decision.')
         if loan.status not in ['ibv_pending', 'pending', 'pending_signature', 'pending_funding']:
             raise ValueError(f"Cannot decline loan in status: {loan.status}")
 
         loan.decline(reason=reason, user=declined_by, source=source)
+
+        # Activity timeline entry (same feed as comments) — not a filterable status.
+        from activity.models import ActivityHistory
+
+        label = (reason_label or reason.split('\n', 1)[0]).strip()
+        description = f'Decline reason: {label}'
+        if comment:
+            description = f'{description}\n{comment.strip()}'
+        ActivityHistory.objects.create(
+            customer=loan.customer,
+            loan=loan,
+            type='comment',
+            title='Decline reason',
+            description=description,
+            metadata={
+                'decline_reason': label,
+                'comment': (comment or '').strip(),
+            },
+            created_by=str(getattr(declined_by, 'id', 'staff')),
+        )
 
         from accounts.arrive_integration import queue_decision_webhook
         queue_decision_webhook(loan, 'declined')

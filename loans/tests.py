@@ -249,6 +249,49 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(pending_loan.bank_account_id, self.other_account.id)
         self.assertEqual(pending_loan.collections_account_id, self.other_account.id)
 
+    def test_decline_requires_allowed_reason_and_logs_comment(self):
+        from activity.models import ActivityHistory
+
+        pending_loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("250.00"),
+            fee=Decimal("50.00"),
+            total_amount=Decimal("300.00"),
+            balance=Decimal("300.00"),
+            status="pending",
+            bank_account=self.account,
+            is_active=True,
+        )
+
+        bad = self.client.post(
+            f"/api/loans/{pending_loan.id}/decline/",
+            {"reason": "bankruptcy", "comment": "should fail"},
+            format="json",
+        )
+        self.assertEqual(bad.status_code, 400)
+
+        response = self.client.post(
+            f"/api/loans/{pending_loan.id}/decline/",
+            {
+                "reason": "Unacceptable bank",
+                "comment": "Void cheque shows unsupported FI",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        pending_loan.refresh_from_db()
+        self.assertEqual(pending_loan.status, "human_declined")
+        self.assertIn("Unacceptable bank", pending_loan.decline_reason)
+        self.assertIn("Void cheque shows unsupported FI", pending_loan.decline_reason)
+        self.assertTrue(
+            ActivityHistory.objects.filter(
+                loan=pending_loan,
+                type="comment",
+                title="Decline reason",
+                description__contains="Unacceptable bank",
+            ).exists()
+        )
+
     def test_configure_rejected_after_funding_locked(self):
         self.loan.funding_destination_locked_at = timezone.now()
         self.loan.save(update_fields=["funding_destination_locked_at", "updated_at"])

@@ -520,8 +520,25 @@ class LoanApproveSerializer(serializers.Serializer):
 
 
 class LoanDeclineSerializer(serializers.Serializer):
-    """Decline loan."""
-    reason = serializers.CharField(required=True)
+    """Decline loan with a fixed reason label (+ optional staff comment)."""
+
+    ALLOWED_REASONS = (
+        'too many loans',
+        'already rejected',
+        'no job',
+        'too many NSF',
+        'in collection',
+        'see comments',
+        'no capacity',
+        'loan already in progress',
+        'stopped payments',
+        'new bank account',
+        'new job',
+        'Unacceptable bank',
+    )
+
+    reason = serializers.ChoiceField(choices=[(r, r) for r in ALLOWED_REASONS])
+    comment = serializers.CharField(required=False, allow_blank=True, max_length=2000)
 
 
 class LoanAmountUpdateSerializer(serializers.Serializer):
