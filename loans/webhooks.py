@@ -15,6 +15,7 @@ from .zumrails import (
     apply_collection_failure,
     log_activity,
     payload_hash,
+    release_funding_locks,
     verify_zumrails_signature,
 )
 
@@ -66,17 +67,17 @@ def _client_transaction_uuid(event_data):
 
 def _reopen_loan_after_funding_failure(funding):
     loan = funding.loan
-    if loan.status != "active":
-        return
-    loan.status = "pending_funding"
-    loan.is_active = False
-    loan.funded_at = None
-    loan.save(update_fields=[
-        "status",
-        "is_active",
-        "funded_at",
-        "updated_at",
-    ])
+    if loan.status == "active":
+        loan.status = "pending_funding"
+        loan.is_active = False
+        loan.funded_at = None
+        loan.save(update_fields=[
+            "status",
+            "is_active",
+            "funded_at",
+            "updated_at",
+        ])
+    release_funding_locks(loan)
 
 
 class ZumRailsWebhookView(APIView):
