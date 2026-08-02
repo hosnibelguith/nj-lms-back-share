@@ -98,6 +98,7 @@ class CustomerSerializer(serializers.ModelSerializer):
             'banking_verified',
             'references_completed',
             'contract_completed',
+            'sms_opted_out',
             'job_place_name',
             'supervisor_name',
             'supervisor_phone',

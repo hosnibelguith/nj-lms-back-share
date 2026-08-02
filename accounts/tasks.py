@@ -127,18 +127,16 @@ def export_customers_report(user_id: str, filters: dict = None):
 def send_sms_otp_task(self, phone_number: str, code: str):
     try:
         from django.conf import settings
-        from twilio.rest import Client
+
+        from communications.twilio_sms import TwilioService
 
         if settings.DEBUG and getattr(settings, "DEV_OTP_CODE", ""):
             logger.warning("DEV OTP for %s is %s", phone_number, code)
             return
 
-        client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
-
-        client.messages.create(
-            body=f"Your verification code is {code}. It expires in 10 minutes.",
-            from_=settings.TWILIO_PHONE_NUMBER,
+        TwilioService.send_sms(
             to=phone_number,
+            content=f"Your verification code is {code}. It expires in 10 minutes.",
         )
 
         logger.info(f"OTP SMS sent to {phone_number}")

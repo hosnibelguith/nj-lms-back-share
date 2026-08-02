@@ -18,7 +18,15 @@ from accounts.models import Customer, User
 from banking.models import BankAccount, BankConnection
 
 from .models import CollectionPayment, CollectionsAccountChangeAudit, FundedPayment, FundingMethodRecommendation, Loan, LoanFormula, LoanStateEvent, Payment
-from .zumrails import ZumRailsRequestError, ZumRailsService
+from .webhooks import _reopen_loan_after_funding_failure
+from .zumrails import (
+    CollectionService,
+    FundingService,
+    ZumRailsConfigurationError,
+    ZumRailsRequestError,
+    ZumRailsService,
+    funding_configuration_ready,
+)
 
 
 @override_settings(
@@ -33,6 +41,7 @@ class ZumRailsWorkflowTests(APITestCase):
             full_name="Agent User",
             user_type="staff",
             is_staff=True,
+            permission_level=4,
         )
         self.portal_user = User.objects.create_user(
             email="customer@example.com",
@@ -1194,3 +1203,359 @@ class ZumRailsClientTests(APITestCase):
             mock_request.call_args_list[1].kwargs["json"]["WalletId"],
             "wallet-ca",
         )
+
+
+@override_settings(ZUMRAILS_DRY_RUN=True)
+class BlockedInstitutionFundingTests(APITestCase):
+    """Institutions 621 / 623 / 703 must never fund or collect through Zūm Rails."""
+
+    BLOCKED_INSTITUTIONS = ("621", "623", "703")
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            email="blocked-agent@example.com",
+            password="password123",
+            full_name="Agent User",
+            user_type="staff",
+            is_staff=True,
+        )
+        self.customer = Customer.objects.create(
+            first_name="Blocked",
+            last_name="Institution",
+            email="blocked@example.com",
+            phone="4165552222",
+            phone_normalized="4165552222",
+            province="ON",
+            status="pending",
+            banking_verified=True,
+        )
+        self.connection = BankConnection.objects.create(
+            customer=self.customer,
+            login_id="login-blocked",
+            sync_status="synced",
+        )
+        self.allowed_account = BankAccount.objects.create(
+            connection=self.connection,
+            customer=self.customer,
+            external_id="acct-allowed",
+            name="RBC Chequing",
+            type="checking",
+            transit_number="12345",
+            institution_number="003",
+            account_number="1234567890",
+            is_primary=True,
+        )
+        self.loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("100.00"),
+            total_amount=Decimal("600.00"),
+            balance=Decimal("600.00"),
+            status="pending_funding",
+            contract_signed_at=timezone.now(),
+            bank_account=self.allowed_account,
+            collections_account=self.allowed_account,
+            is_active=True,
+        )
+        self.client.force_authenticate(self.staff)
+
+    def blocked_account(self, institution):
+        return BankAccount.objects.create(
+            connection=self.connection,
+            customer=self.customer,
+            external_id=f"acct-{institution}",
+            name=f"Blocked {institution}",
+            type="checking",
+            transit_number="54321",
+            institution_number=institution,
+            account_number="9876543210",
+        )
+
+    def test_model_flags_blocked_institutions(self):
+        for institution in self.BLOCKED_INSTITUTIONS:
+            with self.subTest(institution=institution):
+                self.assertTrue(self.blocked_account(institution).is_payment_blocked)
+        self.assertFalse(self.allowed_account.is_payment_blocked)
+
+    def test_configuration_endpoint_rejects_blocked_funding_account(self):
+        for institution in self.BLOCKED_INSTITUTIONS:
+            with self.subTest(institution=institution):
+                account = self.blocked_account(institution)
+                response = self.client.patch(
+                    f"/api/loans/{self.loan.id}/funding/configuration/",
+                    {"eft_bank_account_id": str(account.id)},
+                    format="json",
+                )
+                self.assertEqual(response.status_code, 400, response.data)
+                self.assertIn(institution, response.data["error"])
+                self.loan.refresh_from_db()
+                self.assertEqual(self.loan.bank_account_id, self.allowed_account.id)
+                account.delete()
+
+    def test_configuration_endpoint_rejects_blocked_collections_account(self):
+        account = self.blocked_account("703")
+        response = self.client.patch(
+            f"/api/loans/{self.loan.id}/funding/configuration/",
+            {"collections_account_id": str(account.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.collections_account_id, self.allowed_account.id)
+
+    def test_configuration_endpoint_still_accepts_allowed_account(self):
+        response = self.client.patch(
+            f"/api/loans/{self.loan.id}/funding/configuration/",
+            {
+                "emt_email": self.customer.email,
+                "emt_source": "application",
+                "eft_bank_account_id": str(self.allowed_account.id),
+                "collections_account_id": str(self.allowed_account.id),
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_funding_readiness_reports_blocked_account_as_blocker(self):
+        blocked = self.blocked_account("621")
+        self.loan.collections_account = blocked
+        self.loan.save(update_fields=["collections_account"])
+
+        blockers = funding_configuration_ready(self.loan)["blockers"]
+        self.assertTrue(
+            any("621" in blocker for blocker in blockers),
+            blockers,
+        )
+
+    def test_funding_initiate_rejects_blocked_collections_account(self):
+        blocked = self.blocked_account("623")
+        with self.assertRaises(ValueError) as ctx:
+            FundingService.initiate(
+                loan=self.loan,
+                method="eft",
+                schedule_confirmed=True,
+                user=self.staff,
+                collections_account=blocked,
+            )
+        self.assertIn("623", str(ctx.exception))
+        self.assertFalse(FundedPayment.objects.filter(loan=self.loan).exists())
+
+    def test_collections_account_change_rejects_blocked_account(self):
+        failed_payment = CollectionPayment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            status="failed",
+            failure_reason="EftFailedInsufficientFunds",
+        )
+        blocked = self.blocked_account("703")
+
+        with self.assertRaises(ValueError) as ctx:
+            CollectionService.change_account(
+                self.loan,
+                new_account=blocked,
+                failed_payment=failed_payment,
+                user=self.staff,
+            )
+        self.assertIn("703", str(ctx.exception))
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.collections_account_id, self.allowed_account.id)
+
+    def test_zumrails_user_payload_is_the_final_backstop(self):
+        """Even if a blocked account slips through, coordinates never reach Zūm."""
+        for institution in self.BLOCKED_INSTITUTIONS:
+            with self.subTest(institution=institution):
+                account = self.blocked_account(institution)
+                with self.assertRaises(ZumRailsConfigurationError):
+                    ZumRailsService.user_payload(self.customer, account=account)
+                account.delete()
+
+    def test_zumrails_user_payload_allows_supported_institution(self):
+        payload = ZumRailsService.user_payload(self.customer, account=self.allowed_account)
+        self.assertEqual(
+            payload["BankAccountInformation"],
+            {
+                "InstitutionNumber": "003",
+                "TransitNumber": "12345",
+                "AccountNumber": "1234567890",
+            },
+        )
+
+
+@override_settings(ZUMRAILS_DRY_RUN=True)
+class FundingFailureRecoveryTests(APITestCase):
+    """A failed funding attempt must leave the loan fundable again."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            email="manager@example.com",
+            password="password123",
+            full_name="Manager User",
+            user_type="staff",
+            is_staff=True,
+            permission_level=4,
+        )
+        self.customer = Customer.objects.create(
+            first_name="Retry",
+            last_name="Customer",
+            email="retry@example.com",
+            phone="4165553333",
+            phone_normalized="4165553333",
+            province="ON",
+            status="pending",
+            banking_verified=True,
+        )
+        self.connection = BankConnection.objects.create(
+            customer=self.customer,
+            login_id="login-retry",
+            sync_status="synced",
+        )
+        self.account = BankAccount.objects.create(
+            connection=self.connection,
+            customer=self.customer,
+            external_id="acct-retry-1",
+            name="RBC Chequing",
+            type="checking",
+            transit_number="12345",
+            institution_number="003",
+            account_number="1234567890",
+            is_primary=True,
+        )
+        self.replacement_account = BankAccount.objects.create(
+            connection=self.connection,
+            customer=self.customer,
+            external_id="acct-retry-2",
+            name="TD Chequing",
+            type="checking",
+            transit_number="54321",
+            institution_number="004",
+            account_number="9876543210",
+        )
+        self.loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("300.00"),
+            fee=Decimal("60.00"),
+            total_amount=Decimal("360.00"),
+            balance=Decimal("360.00"),
+            status="pending_funding",
+            contract_signed_at=timezone.now(),
+            bank_account=self.account,
+            collections_account=self.account,
+            is_active=True,
+        )
+        self.client.force_authenticate(self.staff)
+
+    def attempt_funding(self):
+        return self.client.post(
+            f"/api/loans/{self.loan.id}/funding/initiate/",
+            {"method": "eft", "schedule_confirmed": True, "override_confirmed": True},
+            format="json",
+        )
+
+    @patch(
+        "loans.zumrails.ZumRailsService.initiate_transaction",
+        side_effect=ZumRailsRequestError(
+            "Unable to authenticate with ZūmRails.",
+            outcome_unknown=False,
+        ),
+    )
+    def test_failed_attempt_unlocks_destination_for_correction(self, mock_send):
+        self.assertEqual(self.attempt_funding().status_code, 502)
+
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.funded_payments.get().status, "failed")
+        self.assertIsNone(self.loan.funding_destination_locked_at)
+        self.assertIsNone(self.loan.collections_account_locked_at)
+
+        response = self.client.patch(
+            f"/api/loans/{self.loan.id}/funding/configuration/",
+            {"eft_bank_account_id": str(self.replacement_account.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.bank_account_id, self.replacement_account.id)
+
+    @patch(
+        "loans.zumrails.ZumRailsService.initiate_transaction",
+        side_effect=ZumRailsRequestError("request outcome unknown"),
+    )
+    def test_unknown_outcome_keeps_destination_locked(self, mock_send):
+        """Money may already be moving, so the destination must stay frozen."""
+        self.assertEqual(self.attempt_funding().status_code, 502)
+
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.funded_payments.get().status, "processing")
+        self.assertIsNotNone(self.loan.funding_destination_locked_at)
+        self.assertIsNotNone(self.loan.collections_account_locked_at)
+
+    @patch(
+        "loans.zumrails.ZumRailsService.initiate_transaction",
+        side_effect=ZumRailsConfigurationError("ZūmRails API is not configured."),
+    )
+    def test_configuration_error_closes_the_attempt(self, mock_send):
+        """A misconfiguration never reached Zūm, so it must not block the retry."""
+        self.assertEqual(self.attempt_funding().status_code, 400)
+
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.funded_payments.get().status, "failed")
+        self.assertIsNone(self.loan.funding_destination_locked_at)
+        self.assertNotIn(
+            "Funding already exists for this loan.",
+            funding_configuration_ready(self.loan)["blockers"],
+        )
+
+    @patch(
+        "loans.zumrails.ZumRailsService.initiate_transaction",
+        side_effect=ZumRailsRequestError("rejected", outcome_unknown=False),
+    )
+    def test_failed_attempt_leaves_no_destination_blocker(self, mock_send):
+        """The attempt must not erase the configured destination."""
+        self.client.patch(
+            f"/api/loans/{self.loan.id}/funding/configuration/",
+            {
+                "emt_email": self.customer.email,
+                "emt_source": "application",
+                "eft_bank_account_id": str(self.account.id),
+                "collections_account_id": str(self.account.id),
+            },
+            format="json",
+        )
+        self.loan.refresh_from_db()
+
+        self.assertEqual(self.attempt_funding().status_code, 502)
+
+        self.loan.refresh_from_db()
+        readiness = funding_configuration_ready(self.loan)
+        self.assertTrue(readiness["emt_configured"])
+        self.assertTrue(readiness["eft_configured"])
+        self.assertEqual(readiness["blockers"], [])
+
+    def test_eft_only_loan_is_not_blocked_on_missing_emt(self):
+        """EFT and e-Transfer are alternatives; requiring both blocked funding."""
+        readiness = funding_configuration_ready(self.loan)
+
+        self.assertFalse(readiness["emt_configured"])
+        self.assertTrue(readiness["eft_configured"])
+        self.assertEqual(readiness["blockers"], [])
+
+    def test_webhook_failure_unlocks_destination(self):
+        funding = FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="eft",
+            status="processing",
+        )
+        self.loan.funding_destination_locked_at = timezone.now()
+        self.loan.collections_account_locked_at = timezone.now()
+        self.loan.save(update_fields=[
+            "funding_destination_locked_at",
+            "collections_account_locked_at",
+            "updated_at",
+        ])
+
+        funding.mark_failed("EftFailedInsufficientFunds")
+        _reopen_loan_after_funding_failure(funding)
+
+        self.loan.refresh_from_db()
+        self.assertIsNone(self.loan.funding_destination_locked_at)
+        self.assertIsNone(self.loan.collections_account_locked_at)

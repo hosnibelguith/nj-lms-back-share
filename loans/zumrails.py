@@ -13,6 +13,7 @@ from django.core.cache import cache
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
+from banking.constants import payment_blocked_message
 from banking.models import BankAccount
 
 from .models import (
@@ -109,6 +110,19 @@ def add_business_days(start_dt, days: int):
     return current
 
 
+def assert_payment_account_allowed(account: BankAccount | None, *, role: str) -> None:
+    """Reject blocked institutions before any Zūm Rails funding/collections use.
+
+    ZumRailsConfigurationError subclasses ValueError, so existing callers that
+    handle ValueError keep their behaviour.
+    """
+    if account is None or not account.is_payment_blocked:
+        return
+    raise ZumRailsConfigurationError(
+        f"{role}: {payment_blocked_message(account.institution_number)}"
+    )
+
+
 def account_snapshot(account: BankAccount | None) -> dict:
     if not account:
         return {}
@@ -163,6 +177,48 @@ def funding_destination_snapshot(loan: Loan, method: str, destination: dict | No
     return {"method": "eft", "account": account_dict or {}}
 
 
+def merge_funding_destination(loan: Loan, snapshot: dict) -> dict:
+    """Fold the snapshot that was actually funded into the configured destination.
+
+    funding_configuration_ready() reads the nested ``emt``/``eft`` keys written by
+    FundingConfigurationService, so replacing funding_destination with the flat
+    snapshot would make an already-attempted loan report itself as unconfigured.
+    """
+    configured = loan.funding_destination if isinstance(loan.funding_destination, dict) else {}
+    previous_emt = configured.get("emt") if isinstance(configured.get("emt"), dict) else {}
+    destination = {key: configured[key] for key in ("emt", "eft") if key in configured}
+    destination.update(snapshot)
+
+    if snapshot.get("method") == "emt" and snapshot.get("email"):
+        destination["emt"] = {
+            "email": snapshot["email"],
+            "source": snapshot.get("source") or previous_emt.get("source") or "application",
+        }
+    elif snapshot.get("method") == "eft" and snapshot.get("account"):
+        destination["eft"] = {
+            "bank_account_id": snapshot["account"].get("id"),
+            "account": snapshot["account"],
+        }
+    return destination
+
+
+def release_funding_locks(loan: Loan) -> None:
+    """Re-open destination selection after a funding attempt definitively failed.
+
+    The locks stop a funded loan from having its destination rewritten. A failed
+    attempt moved no money, so staff must be able to correct the accounts and retry.
+    """
+    if not loan.funding_destination_locked_at and not loan.collections_account_locked_at:
+        return
+    loan.funding_destination_locked_at = None
+    loan.collections_account_locked_at = None
+    loan.save(update_fields=[
+        "funding_destination_locked_at",
+        "collections_account_locked_at",
+        "updated_at",
+    ])
+
+
 def is_arrive_funded_loan(loan: Loan) -> bool:
     """Arrive funds the card after our decision webhook — never LendStack EFT/EMT."""
     from accounts.models import Customer
@@ -188,7 +244,9 @@ def funding_configuration_ready(loan: Loan) -> dict:
     if loan.funded_payments.filter(status__in=["processing", "completed"]).exists():
         blockers.append("Funding already exists for this loan.")
     if not arrive_loan:
-        if not emt_configured or not eft_configured:
+        # A loan is funded by EFT or by e-Transfer, never both, so only one
+        # destination is needed here. initiate() enforces the chosen method.
+        if not emt_configured and not eft_configured:
             blockers.append("Funding destination required.")
         if not collections_configured:
             blockers.append("Collections account required.")
@@ -196,6 +254,24 @@ def funding_configuration_ready(loan: Loan) -> dict:
         # Arrive funds via Card Issuance, but staff must still pick the
         # collections (repayment) bank account when multiple chequing accounts exist.
         blockers.append("Collections account required.")
+
+    if collections_account and collections_account.is_payment_blocked:
+        blockers.append(
+            f"Collections account: {payment_blocked_message(collections_account.institution_number)}"
+        )
+    if not arrive_loan:
+        eft_account = loan.bank_account
+        eft_account_id = eft.get("bank_account_id") or (eft.get("account") or {}).get("id")
+        if eft_account_id:
+            eft_account = (
+                BankAccount.objects.filter(id=eft_account_id, customer_id=loan.customer_id).first()
+                or eft_account
+            )
+        if eft_account and eft_account.is_payment_blocked:
+            blockers.append(
+                f"Funding account: {payment_blocked_message(eft_account.institution_number)}"
+            )
+
     return {
         "emt_configured": emt_configured,
         "eft_configured": eft_configured,
@@ -447,6 +523,7 @@ class ZumRailsService:
         if phone:
             payload["PhoneNumber"] = phone
         if account:
+            assert_payment_account_allowed(account, role="Selected bank account")
             missing = [
                 label for label, value in (
                     ("institution number", account.institution_number),
@@ -563,6 +640,7 @@ class FundingService:
                 )
                 if method in ("eft", "etransfer", "card_issuance") and not collections_account:
                     raise ValueError("Collections account required")
+                assert_payment_account_allowed(collections_account, role="Collections account")
 
                 if method == "card_issuance":
                     return FundingService._complete_card_issuance(
@@ -578,8 +656,16 @@ class FundingService:
                     )
                 ):
                     raise ValueError("Funding destination required")
-                if method == "eft" and not destination_snapshot.get("account"):
-                    raise ValueError("Funding destination required")
+                if method == "eft":
+                    if not destination_snapshot.get("account"):
+                        raise ValueError("Funding destination required")
+                    assert_payment_account_allowed(
+                        BankAccount.objects.filter(
+                            id=destination_snapshot["account"].get("id"),
+                            customer=loan.customer,
+                        ).first(),
+                        role="Funding account",
+                    )
 
                 funding = FundedPayment.objects.create(
                     loan=loan,
@@ -593,7 +679,7 @@ class FundingService:
 
                 loan.funding_method = method
                 loan.funding_reference = destination_snapshot.get("email") or str(funding.id)
-                loan.funding_destination = destination_snapshot
+                loan.funding_destination = merge_funding_destination(loan, destination_snapshot)
                 loan.collections_account = collections_account
                 loan.funding_destination_locked_at = timezone.now()
                 loan.collections_account_locked_at = timezone.now()
@@ -609,25 +695,25 @@ class FundingService:
         except IntegrityError as exc:
             raise ValueError("Funding already exists for this loan.") from exc
 
-        if method == "eft":
-            destination_account_id = destination_snapshot["account"].get("id")
-            destination_account = BankAccount.objects.filter(
-                id=destination_account_id,
-                customer=loan.customer,
-            ).first()
-            if not destination_account:
-                raise ZumRailsConfigurationError("Funding destination required.")
-            zum_user = ZumRailsService.user_payload(
-                loan.customer,
-                account=destination_account,
-            )
-        else:
-            zum_user = ZumRailsService.user_payload(
-                loan.customer,
-                email=destination_snapshot["email"],
-            )
-
         try:
+            if method == "eft":
+                destination_account_id = destination_snapshot["account"].get("id")
+                destination_account = BankAccount.objects.filter(
+                    id=destination_account_id,
+                    customer=loan.customer,
+                ).first()
+                if not destination_account:
+                    raise ZumRailsConfigurationError("Funding destination required.")
+                zum_user = ZumRailsService.user_payload(
+                    loan.customer,
+                    account=destination_account,
+                )
+            else:
+                zum_user = ZumRailsService.user_payload(
+                    loan.customer,
+                    email=destination_snapshot["email"],
+                )
+
             processor_id = ZumRailsService.initiate_transaction(
                 amount=funding.amount,
                 transaction_type="AccountsPayable",
@@ -638,9 +724,14 @@ class FundingService:
                 user_payload=zum_user,
             )
         except ZumRailsError as exc:
-            if isinstance(exc, ZumRailsRequestError) and not exc.outcome_unknown:
+            # Only an unknown outcome may have moved money. Anything else never
+            # reached Zūm, so close the attempt and unlock the destination for retry.
+            if isinstance(exc, ZumRailsRequestError) and exc.outcome_unknown:
+                funding.failure_reason = str(exc)
+            else:
                 funding.status = "failed"
-            funding.failure_reason = str(exc)
+                funding.failure_reason = str(exc)
+                release_funding_locks(loan)
             funding.save(update_fields=["status", "failure_reason", "updated_at"])
             raise
 
@@ -840,6 +931,7 @@ class CollectionService:
             )
         if new_account.customer_id != loan.customer_id:
             raise ValueError("Collections account must belong to this customer.")
+        assert_payment_account_allowed(new_account, role="Collections account")
 
         previous = account_snapshot(loan.collections_account or loan.bank_account)
         new = account_snapshot(new_account)
@@ -937,6 +1029,7 @@ class FundingConfigurationService:
         if eft_bank_account_id:
             try:
                 account = BankAccount.objects.get(id=eft_bank_account_id, customer=loan.customer)
+                assert_payment_account_allowed(account, role="Funding account")
                 loan.bank_account = account
                 destination["eft"] = {
                     "bank_account_id": str(account.id),
@@ -952,6 +1045,7 @@ class FundingConfigurationService:
         if collections_account_id:
             try:
                 account = BankAccount.objects.get(id=collections_account_id, customer=loan.customer)
+                assert_payment_account_allowed(account, role="Collections account")
                 loan.collections_account = account
                 update_fields.append("collections_account")
                 new_collections = format_account_label(account)

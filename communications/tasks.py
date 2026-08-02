@@ -235,73 +235,72 @@ def send_loan_workflow_reminders():
 
 @shared_task(bind=True, max_retries=3)
 def send_sms(self, communication_id: str):
-    """
-    Send an SMS using Twilio.
-    """
+    """Send an SMS through Twilio."""
     from .models import Communication
-    
+    from .twilio_sms import (
+        TwilioConfigurationError,
+        TwilioRequestError,
+        TwilioService,
+        is_opt_out_error,
+        set_sms_opt_out,
+    )
+
     try:
         communication = Communication.objects.select_related('customer').get(id=communication_id)
-        
-        if communication.status != 'pending':
-            logger.warning(f"Communication {communication_id} not pending, skipping")
-            return
-        
-        logger.info(f"Sending SMS {communication_id} to {communication.to_phone}")
-        
-        # Send via Twilio
-        success, external_id, error = _send_sms_via_twilio(
-            to=communication.to_phone,
-            content=communication.content
-        )
-        
-        if success:
-            communication.status = 'sent'
-            communication.sent_at = timezone.now()
-            communication.external_id = external_id
-        else:
-            communication.status = 'failed'
-            communication.error_message = error
-        
-        communication.save()
-        
-        logger.info(f"SMS {communication_id} {'sent' if success else 'failed'}")
-        
     except Communication.DoesNotExist:
-        logger.error(f"Communication not found: {communication_id}")
-    except Exception as e:
-        logger.error(f"Error sending SMS {communication_id}: {str(e)}")
-        raise self.retry(exc=e, countdown=300)
+        logger.error('SMS communication not found: %s', communication_id)
+        return
 
+    if communication.status != 'pending':
+        logger.warning('Communication %s not pending, skipping', communication_id)
+        return
 
-def _send_sms_via_twilio(to: str, content: str):
-    """
-    Send SMS via Twilio.
-    Returns (success: bool, external_id: str, error: str)
-    
-    Note: This is a placeholder. Replace with actual Twilio integration.
-    """
-    # In production, integrate with Twilio:
-    """
-    from twilio.rest import Client
-    
-    client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
-    
+    customer = communication.customer
+    if customer and customer.sms_opted_out:
+        communication.status = 'failed'
+        communication.error_message = 'Customer has opted out of SMS.'
+        communication.save(update_fields=['status', 'error_message'])
+        logger.warning('SMS %s blocked: customer opted out', communication_id)
+        return
+
     try:
-        message = client.messages.create(
-            body=content,
-            from_=settings.TWILIO_PHONE_NUMBER,
-            to=to
+        external_id = TwilioService.send_sms(
+            to=communication.to_phone,
+            content=communication.content,
         )
-        return True, message.sid, None
-    except Exception as e:
-        return False, None, str(e)
-    """
-    
-    # For now, simulate success
-    import uuid
-    logger.info(f"Would send SMS to {to}: {content[:50]}...")
-    return True, f"sms-{uuid.uuid4()}", None
+    except TwilioConfigurationError as exc:
+        # Misconfiguration will not fix itself on retry.
+        communication.status = 'failed'
+        communication.error_message = str(exc)
+        communication.save(update_fields=['status', 'error_message'])
+        logger.error('SMS %s failed (configuration): %s', communication_id, exc)
+        return
+    except TwilioRequestError as exc:
+        communication.status = 'failed'
+        communication.error_message = str(exc)
+        communication.save(update_fields=['status', 'error_message'])
+        logger.error('SMS %s rejected by Twilio: %s', communication_id, exc)
+        if is_opt_out_error(exc.code):
+            # Twilio already knows this number must not be texted; mirror it
+            # locally so staff see the block instead of retrying forever.
+            set_sms_opt_out(customer, opted_out=True, reason=str(exc))
+            return
+        raise self.retry(exc=exc, countdown=300)
+    except Exception as exc:
+        communication.status = 'failed'
+        communication.error_message = str(exc)
+        communication.save(update_fields=['status', 'error_message'])
+        logger.error('SMS %s failed: %s', communication_id, exc)
+        raise self.retry(exc=exc, countdown=300)
+
+    communication.status = 'sent'
+    communication.sent_at = timezone.now()
+    communication.external_id = external_id
+    communication.error_message = None
+    communication.save(
+        update_fields=['status', 'sent_at', 'external_id', 'error_message']
+    )
+    logger.info('SMS %s sent external_id=%s', communication_id, external_id)
 
 
 @shared_task

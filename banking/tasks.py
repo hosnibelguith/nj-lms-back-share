@@ -6,6 +6,11 @@ from celery import shared_task
 from django.conf import settings
 from django.utils.timezone import now
 
+from .constants import (
+    UNSUPPORTED_IBV_INSTITUTIONS,
+    is_payment_blocked_institution,
+    normalize_institution_number as _normalize_institution_number,
+)
 from .logging_utils import mask_identifier
 from .models import BankConnection, BankAccount, BankTransaction
 
@@ -20,7 +25,6 @@ ZERO_TRANSACTIONS_MESSAGE = (
 NO_ACCOUNTS_MESSAGE = (
     'No bank accounts were returned. Please reconnect your bank account.'
 )
-UNSUPPORTED_IBV_INSTITUTIONS = {'621', '623'}
 UNSUPPORTED_INSTITUTION_MESSAGE = (
     'We could not complete banking verification with this financial institution. '
     'Please reconnect using a supported bank account.'
@@ -37,11 +41,6 @@ def _normalize_account_type(raw_type):
     if value in {'credit', 'loan', 'investment'}:
         return value
     return 'other'
-
-
-def _normalize_institution_number(raw_value):
-    value = ''.join(ch for ch in str(raw_value or '') if ch.isdigit())
-    return value[-3:] if len(value) >= 3 else value
 
 
 def _unsupported_institutions(accounts_data):
@@ -233,7 +232,11 @@ def _persist_accounts(connection, customer, accounts_data):
             },
         )
 
-        if not primary_assigned and normalized_type in {'checking', 'savings'}:
+        if (
+            not primary_assigned
+            and normalized_type in {'checking', 'savings'}
+            and not is_payment_blocked_institution(acc.get('InstitutionNumber'))
+        ):
             account_obj.is_primary = True
             account_obj.save(update_fields=['is_primary', 'updated_at'])
             primary_assigned = True
@@ -344,7 +347,7 @@ def send_banking_retry_email(customer_id, failure_reason=''):
                 f'{failure_reason}\n\n'
                 f'{action_copy}\n\n'
                 f'Refill IBV here:\n{banking_url}\n\n'
-                f'Thank you,\nLendStack'
+                f'Thank you,\n{settings.LENDER_BRAND_NAME}'
             ),
             from_email=settings.DEFAULT_FROM_EMAIL,
             recipient_list=[customer.email],

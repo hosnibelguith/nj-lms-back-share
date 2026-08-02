@@ -90,6 +90,13 @@ class BankAccount(models.Model):
     def __str__(self):
         return f"{self.name} ({self.currency})"
 
+    @property
+    def is_payment_blocked(self) -> bool:
+        """True when this account's institution may not move money via Zūm Rails."""
+        from .constants import is_payment_blocked_institution
+
+        return is_payment_blocked_institution(self.institution_number)
+
 
 class BankTransaction(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

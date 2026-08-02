@@ -161,6 +161,11 @@ class Customer(models.Model):
     phone_verified = models.BooleanField(default=False, db_index=True)
     phone_verified_at = models.DateTimeField(null=True, blank=True)
 
+    # Set by a STOP reply or an unsubscribe delivery status; blocks all outbound SMS.
+    sms_opted_out = models.BooleanField(default=False, db_index=True)
+    sms_opted_out_at = models.DateTimeField(null=True, blank=True)
+    sms_opt_out_reason = models.CharField(max_length=255, blank=True, null=True)
+
     requested_loan_amount = models.DecimalField(
         max_digits=10,
         decimal_places=2,

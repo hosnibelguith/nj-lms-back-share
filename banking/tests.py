@@ -532,3 +532,142 @@ class ManualBankAccountStaffTests(TestCase):
         self.assertEqual(account_payload['institution_number'], '001')
         self.assertEqual(account_payload['transit_number'], '11111')
         self.assertEqual(account_payload['account_number'], '1111111')
+        self.assertFalse(account_payload['is_payment_blocked'])
+
+    def test_void_cheque_entry_rejects_blocked_institutions(self):
+        for institution in ('621', '623', '703'):
+            with self.subTest(institution=institution):
+                update = self.client.patch(
+                    f'/api/bank-accounts/{self.account.id}/coordinates/',
+                    {
+                        'institution_number': institution,
+                        'transit_number': '12345',
+                        'account_number': '987654321',
+                    },
+                    format='json',
+                )
+                self.assertEqual(update.status_code, 400, update.data)
+
+                create = self.client.post(
+                    '/api/bank-accounts/manual/',
+                    {
+                        'customer_id': str(self.customer.id),
+                        'institution_number': institution,
+                        'transit_number': '54321',
+                        'account_number': '5555555',
+                    },
+                    format='json',
+                )
+                self.assertEqual(create.status_code, 400, create.data)
+
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.institution_number, '001')
+
+
+@override_settings(
+    CELERY_TASK_ALWAYS_EAGER=True,
+    EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend',
+    MOHAWK_BANKING_ANALYSIS_API_KEY='test-mohawk-key',
+)
+class BlockedInstitutionBankingTests(TestCase):
+    """703 is accepted for IBV but may never become a funding/collections account."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.login_id = str(uuid4())
+        self.portal = User.objects.create_user(
+            email='blocked-banking@example.com',
+            password='password123',
+            full_name='Blocked Banking',
+            user_type='customer',
+        )
+        self.customer = Customer.objects.create(
+            portal_user=self.portal,
+            first_name='Blocked',
+            last_name='Banking',
+            email='blocked-banking@example.com',
+            phone='4165550088',
+            phone_normalized='4165550088',
+            province='ON',
+            status='pending',
+        )
+        self.connection = BankConnection.objects.create(
+            customer=self.customer,
+            login_id=self.login_id,
+            provider='flinks',
+            is_active=True,
+            sync_status='synced',
+        )
+
+    def test_flinks_sync_never_marks_blocked_account_primary(self):
+        tasks._persist_accounts(
+            self.connection,
+            self.customer,
+            [
+                {
+                    'Id': 'acct-703',
+                    'Title': 'Blocked 703',
+                    'Type': 'Chequing',
+                    'Currency': 'CAD',
+                    'InstitutionNumber': '703',
+                    'TransitNumber': '11111',
+                    'AccountNumber': '1111111',
+                    'Transactions': [],
+                },
+                {
+                    'Id': 'acct-001',
+                    'Title': 'Operational Chequing',
+                    'Type': 'Chequing',
+                    'Currency': 'CAD',
+                    'InstitutionNumber': '001',
+                    'TransitNumber': '12345',
+                    'AccountNumber': '1234567',
+                    'Transactions': [],
+                },
+            ],
+        )
+
+        blocked = BankAccount.objects.get(connection=self.connection, external_id='acct-703')
+        allowed = BankAccount.objects.get(connection=self.connection, external_id='acct-001')
+        self.assertFalse(blocked.is_primary)
+        self.assertTrue(blocked.is_payment_blocked)
+        self.assertTrue(allowed.is_primary)
+
+    def test_mohawk_webhook_flags_blocked_primary_instead_of_using_it(self):
+        response = self.client.post(
+            '/api/integrations/mohawk/banking-analysis/',
+            {
+                'schema_version': '1.0',
+                'event': 'banking_analysis.completed',
+                'event_id': 'blocked-primary-1',
+                'login_id': self.login_id,
+                'tag': 'Mohawk',
+                'primary_bank_account': {
+                    'institution_number': '703',
+                    'transit_number': '12345',
+                    'account_number': '1234567',
+                },
+            },
+            format='json',
+            HTTP_AUTHORIZATION='Token test-mohawk-key',
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        from banking.models import BankingAnalysisEvent
+
+        event = BankingAnalysisEvent.objects.get(event_id='blocked-primary-1')
+        self.assertTrue(event.eft_setup_incomplete)
+        self.assertIn('703', event.exception_note)
+        self.assertIsNone(event.primary_account)
+        self.assertFalse(
+            BankAccount.objects.filter(
+                connection=self.connection,
+                use_for_eft_funding=True,
+            ).exists()
+        )
+        self.assertFalse(
+            BankAccount.objects.filter(
+                connection=self.connection,
+                use_for_eft_collections=True,
+            ).exists()
+        )

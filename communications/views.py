@@ -1,4 +1,6 @@
 # communications/views.py
+import logging
+
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -16,6 +18,8 @@ from .serializers import (
     ReplyCommunicationSerializer
 )
 from .tasks import send_email as send_email_task, send_sms
+
+logger = logging.getLogger(__name__)
 
 
 class CommunicationViewSet(viewsets.ModelViewSet):
@@ -386,8 +390,19 @@ class CommunicationViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
         
+        if customer.sms_opted_out:
+            return Response(
+                {'error': 'Customer has opted out of SMS and cannot be texted.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         to_phone = data.get('to_phone') or customer.phone
-        
+        if not to_phone:
+            return Response(
+                {'error': 'Customer has no phone number on file.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         # Create communication record
         communication = Communication.objects.create(
             customer=customer,
@@ -493,70 +508,147 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
 
 
 class TwilioWebhookView(APIView):
-    """Handle incoming webhooks from Twilio (SMS status updates, inbound SMS)."""
+    """Delivery receipts and inbound replies from Twilio.
+
+    Twilio posts form-encoded data signed with X-Twilio-Signature, so the
+    endpoint is gated on that signature rather than DRF authentication.
+    """
+
     permission_classes = [permissions.AllowAny]
-    
+    authentication_classes = []
+
+    def _signature_valid(self, request) -> bool:
+        from twilio.request_validator import RequestValidator
+
+        from .twilio_sms import TwilioConfigurationError, TwilioService
+
+        try:
+            auth_token = TwilioService.auth_token()
+        except TwilioConfigurationError:
+            logger.error('Twilio webhook rejected: auth token is not configured')
+            return False
+
+        signature = request.headers.get('X-Twilio-Signature') or ''
+        if not signature:
+            return False
+
+        params = request.data
+        params = params.dict() if hasattr(params, 'dict') else dict(params)
+        return RequestValidator(auth_token).validate(
+            request.build_absolute_uri(), params, signature
+        )
+
     def post(self, request):
-        """Process Twilio webhook."""
-        message_sid = request.data.get('MessageSid')
-        message_status = request.data.get('MessageStatus')
-        from_number = request.data.get('From')
-        to_number = request.data.get('To')
-        body = request.data.get('Body')
-        
-        if message_sid and message_status:
-            # Status update for outbound message
-            try:
-                communication = Communication.objects.get(external_id=message_sid)
-                
-                status_mapping = {
-                    'queued': 'pending',
-                    'sent': 'sent',
-                    'delivered': 'delivered',
-                    'read': 'read',
-                    'failed': 'failed',
-                    'undelivered': 'failed',
-                }
-                
-                communication.status = status_mapping.get(message_status, communication.status)
-                
-                from django.utils import timezone
-                if message_status == 'delivered':
-                    communication.delivered_at = timezone.now()
-                elif message_status == 'read':
-                    communication.read_at = timezone.now()
-                
-                communication.save()
-                
-            except Communication.DoesNotExist:
-                pass
-        
-        elif body and from_number:
-            # Inbound SMS
-            # Find customer by phone number
-            from accounts.models import Customer
-            
-            customer = Customer.objects.filter(phone__icontains=from_number[-10:]).first()
-            
-            if customer:
-                Communication.objects.create(
-                    customer=customer,
-                    type='sms',
-                    direction='inbound',
-                    from_phone=from_number,
-                    to_phone=to_number,
-                    content=body,
-                    status='delivered',
-                    external_id=message_sid
-                )
-                
-                # Log activity
-                from activity.models import ActivityHistory
-                ActivityHistory.objects.create(
-                    customer=customer,
-                    type='sms_received',
-                    title='SMS Received',
-                    description=f'Received: {body[:100]}...' if len(body) > 100 else f'Received: {body}'
-                )
-        
-        return Response({'status': 'received'})
+        if not self._signature_valid(request):
+            logger.warning('Twilio webhook rejected: invalid signature')
+            return Response(
+                {'error': 'invalid_signature'}, status=status.HTTP_403_FORBIDDEN
+            )
+
+        message_status = str(
+            request.data.get('MessageStatus') or request.data.get('SmsStatus') or ''
+        ).strip().lower()
+
+        if message_status == 'received':
+            handled = self._handle_inbound(request.data)
+        elif message_status:
+            handled = self._handle_status(request.data)
+        else:
+            logger.info('Twilio webhook ignored: no message status in payload')
+            handled = False
+
+        return Response({'status': 'received', 'handled': handled})
+
+    def _handle_status(self, payload):
+        from .twilio_sms import is_opt_out_error, map_message_status, set_sms_opt_out
+
+        message_sid = payload.get('MessageSid') or payload.get('SmsSid')
+        if not message_sid:
+            return False
+
+        communication = Communication.objects.filter(external_id=message_sid).first()
+        if communication is None:
+            logger.info('Twilio status for unknown message sid=%s', message_sid)
+            return False
+
+        mapped = map_message_status(
+            payload.get('MessageStatus') or payload.get('SmsStatus')
+        )
+        error_code = payload.get('ErrorCode')
+        failure_reason = payload.get('ErrorMessage') or (
+            f'Twilio error {error_code}'
+            if error_code
+            else 'Twilio reported the message as undeliverable.'
+        )
+        update_fields = []
+
+        if mapped:
+            communication.status = mapped
+            update_fields.append('status')
+            if mapped == 'delivered' and not communication.delivered_at:
+                communication.delivered_at = timezone.now()
+                update_fields.append('delivered_at')
+            elif mapped == 'read' and not communication.read_at:
+                communication.read_at = timezone.now()
+                update_fields.append('read_at')
+            if mapped == 'failed':
+                communication.error_message = failure_reason
+                update_fields.append('error_message')
+
+        if update_fields:
+            communication.save(update_fields=update_fields)
+
+        if is_opt_out_error(error_code):
+            set_sms_opt_out(
+                communication.customer, opted_out=True, reason=failure_reason
+            )
+        return True
+
+    def _handle_inbound(self, payload):
+        from accounts.models import Customer
+        from activity.models import ActivityHistory
+
+        from .twilio_sms import (
+            classify_inbound_keyword,
+            phone_last10,
+            set_sms_opt_out,
+        )
+
+        from_phone = payload.get('From') or ''
+        body = payload.get('Body') or ''
+        last10 = phone_last10(from_phone)
+        if not last10:
+            return False
+
+        customer = Customer.objects.filter(phone_normalized__endswith=last10).first()
+        if customer is None:
+            customer = Customer.objects.filter(phone__contains=last10).first()
+
+        Communication.objects.create(
+            customer=customer,
+            type='sms',
+            direction='inbound',
+            from_phone=from_phone,
+            to_phone=payload.get('To') or '',
+            content=body,
+            status='delivered',
+            external_id=payload.get('MessageSid') or None,
+            incoming_status='new',
+            is_unknown_sender=customer is None,
+        )
+
+        keyword = classify_inbound_keyword(body)
+        if keyword == 'stop':
+            set_sms_opt_out(customer, opted_out=True, reason='Customer replied STOP')
+        elif keyword == 'start':
+            set_sms_opt_out(customer, opted_out=False)
+
+        if customer:
+            preview = body if len(body) <= 100 else f'{body[:100]}...'
+            ActivityHistory.objects.create(
+                customer=customer,
+                type='sms_received',
+                title='SMS Received',
+                description=f'Received: {preview}',
+            )
+        return True

@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from .constants import is_payment_blocked_institution, payment_blocked_message
 from .models import BankConnection, BankAccount, BankTransaction, FinancialAnalysisReport
 
 
@@ -18,6 +19,7 @@ class BankTransactionSerializer(serializers.ModelSerializer):
 
 class BankAccountSerializer(serializers.ModelSerializer):
     transactions = BankTransactionSerializer(many=True, read_only=True)
+    is_payment_blocked = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = BankAccount
@@ -32,6 +34,7 @@ class BankAccountSerializer(serializers.ModelSerializer):
             'account_number',
             'is_primary',
             'is_manual_entry',
+            'is_payment_blocked',
             'use_for_eft_funding',
             'use_for_eft_collections',
             'connection',
@@ -56,6 +59,8 @@ class BankAccountManualCoordinatesSerializer(serializers.Serializer):
         digits = _digits_only(value)
         if len(digits) != 3:
             raise serializers.ValidationError('Institution number must be 3 digits.')
+        if is_payment_blocked_institution(digits):
+            raise serializers.ValidationError(payment_blocked_message(digits))
         return digits
 
     def validate_transit_number(self, value):

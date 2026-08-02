@@ -9,6 +9,7 @@ from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from .constants import is_payment_blocked_institution, normalize_institution_number
 from .models import (
     BankAccount,
     BankConnection,
@@ -195,7 +196,8 @@ def process_banking_analysis_payload(payload: dict):
         bool(connection),
     )
 
-    eft_incomplete = not _coords_complete(primary)
+    primary_blocked = is_payment_blocked_institution(primary.get('institution_number'))
+    eft_incomplete = not _coords_complete(primary) or primary_blocked
     exception_note = ''
     primary_account = None
 
@@ -203,6 +205,12 @@ def process_banking_analysis_payload(payload: dict):
         exception_note = 'Missing login_id'
     elif connection is None:
         exception_note = 'No bank connection found for login_id'
+    elif primary_blocked:
+        exception_note = (
+            'Primary bank account institution '
+            f"{normalize_institution_number(primary.get('institution_number'))} "
+            'is not allowed for funding or collections'
+        )
     elif eft_incomplete:
         exception_note = 'Primary bank account coordinates incomplete'
     else:

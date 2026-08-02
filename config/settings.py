@@ -333,6 +333,10 @@ GRAPH_MAILBOX = os.environ.get("GRAPH_MAILBOX", INBOUND_EMAIL_USER)
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")
+# Optional: a Messaging Service takes precedence over the single sending number.
+TWILIO_MESSAGING_SERVICE_SID = os.environ.get("TWILIO_MESSAGING_SERVICE_SID", "")
+# Optional: per-message delivery receipt URL when it is not set on the number.
+TWILIO_STATUS_CALLBACK_URL = os.environ.get("TWILIO_STATUS_CALLBACK_URL", "")
 DEV_OTP_CODE = os.environ.get("DEV_OTP_CODE", "123456" if DEBUG else "")
 
 
@@ -393,6 +397,9 @@ FRONTEND_URL = os.environ.get(
     "FRONTEND_URL",
     "http://localhost:3000" if DEBUG else "https://app.mohawkloans.com",
 )
+
+# Lender-facing brand used in customer communications and the customer/IBV iframe.
+LENDER_BRAND_NAME = os.environ.get("LENDER_BRAND_NAME", "MohawkLoans")
 
 
 # -------------------------------------------------------------------
