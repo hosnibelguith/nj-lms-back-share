@@ -7,6 +7,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.db.models import Q
 from django.conf import settings
+from django.http import HttpResponse
 from django.utils import timezone
 from email.utils import parseaddr
 from .models import Communication, CommunicationTemplate
@@ -538,6 +539,17 @@ class TwilioWebhookView(APIView):
             request.build_absolute_uri(), params, signature
         )
 
+    @staticmethod
+    def _empty_twiml():
+        """Acknowledge an inbound message without sending an auto-reply.
+
+        Twilio's incoming-message webhook (number or TwiML App) expects TwiML;
+        answering with JSON makes every inbound text log error 12300.
+        """
+        from twilio.twiml.messaging_response import MessagingResponse
+
+        return HttpResponse(str(MessagingResponse()), content_type='text/xml')
+
     def post(self, request):
         if not self._signature_valid(request):
             logger.warning('Twilio webhook rejected: invalid signature')
@@ -550,14 +562,16 @@ class TwilioWebhookView(APIView):
         ).strip().lower()
 
         if message_status == 'received':
-            handled = self._handle_inbound(request.data)
-        elif message_status:
-            handled = self._handle_status(request.data)
+            self._handle_inbound(request.data)
+            return self._empty_twiml()
+
+        if message_status:
+            self._handle_status(request.data)
         else:
             logger.info('Twilio webhook ignored: no message status in payload')
-            handled = False
 
-        return Response({'status': 'received', 'handled': handled})
+        # Status callbacks ignore the body; 204 keeps the ack cheap.
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     def _handle_status(self, payload):
         from .twilio_sms import is_opt_out_error, map_message_status, set_sms_opt_out

@@ -240,7 +240,7 @@ class TwilioWebhookTests(TestCase):
             'MessageStatus': 'delivered',
             'To': '+14165559999',
         })
-        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.status_code, 204)
 
         self.communication.refresh_from_db()
         self.assertEqual(self.communication.status, 'delivered')
@@ -272,6 +272,22 @@ class TwilioWebhookTests(TestCase):
         self.assertTrue(self.customer.sms_opted_out)
         self.assertIsNotNone(self.customer.sms_opted_out_at)
 
+    def test_inbound_reply_answers_with_empty_twiml(self):
+        """A TwiML App / number webhook logs error 12300 unless it gets TwiML."""
+        response = self._post({
+            'MessageSid': 'SM-inbound-twiml',
+            'SmsStatus': 'received',
+            'From': '+14165559999',
+            'To': '+14165550000',
+            'Body': 'hello',
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], 'text/xml')
+        body = response.content.decode()
+        self.assertIn('<Response', body)
+        self.assertNotIn('<Message', body)
+
     def test_inbound_reply_is_stored_against_the_customer(self):
         response = self._post({
             'MessageSid': 'SM-inbound-1',
@@ -280,7 +296,7 @@ class TwilioWebhookTests(TestCase):
             'To': '+14165550000',
             'Body': 'when is my payment due',
         })
-        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.status_code, 200)
 
         inbound = Communication.objects.get(direction='inbound', type='sms')
         self.assertEqual(inbound.customer_id, self.customer.id)
