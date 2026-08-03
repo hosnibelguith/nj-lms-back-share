@@ -209,13 +209,7 @@ class LoanService:
         Create the customer's first pending loan application after signup.
         Prevents duplicate active/pending applications.
         """
-        blocking_statuses = [
-            'ibv_pending',
-            'pending',
-            'pending_signature',
-            'pending_funding',
-            'active',
-        ]
+        blocking_statuses = list(LoanService.BLOCKING_APPLICATION_STATUSES)
 
         existing_loan = customer.loans.filter(
             status__in=blocking_statuses
@@ -272,7 +266,77 @@ class LoanService:
             )
 
         return loan
-    
+
+    BLOCKING_APPLICATION_STATUSES = (
+        'ibv_pending',
+        'pending',
+        'pending_signature',
+        'pending_funding',
+        'active',
+    )
+
+    @staticmethod
+    def can_start_new_application(customer: Customer) -> bool:
+        """Denied applicants only — no open application or active loan."""
+        loans = customer.loans.all()
+        if loans.filter(status__in=LoanService.BLOCKING_APPLICATION_STATUSES).exists():
+            return False
+        return loans.filter(status='human_declined').exists()
+
+    @staticmethod
+    @transaction.atomic
+    def start_new_application(customer: Customer) -> Loan:
+        """
+        Open a fresh application for a declined customer.
+
+        Previous loans are kept. Customer onboarding is reset so IBV and
+        contract run again on the new loan.
+        """
+        if customer.loans.filter(
+            status__in=LoanService.BLOCKING_APPLICATION_STATUSES
+        ).exists():
+            raise ValueError(
+                'A new application cannot be started while another '
+                'application or loan is in progress.'
+            )
+        if not customer.loans.filter(status='human_declined').exists():
+            raise ValueError('Only declined applicants can start a new application.')
+
+        from banking.models import BankConnection
+        from activity.services import log_staff_action
+
+        BankConnection.objects.filter(customer=customer, is_active=True).update(
+            is_active=False
+        )
+
+        customer.banking_verified = False
+        customer.contract_completed = False
+        customer.onboarding_stage = 'banking_verification'
+        customer.save(
+            update_fields=[
+                'banking_verified',
+                'contract_completed',
+                'onboarding_stage',
+                'updated_at',
+            ]
+        )
+
+        loan = LoanService.create_initial_application(customer)
+
+        log_staff_action(
+            customer=customer,
+            loan=loan,
+            user=getattr(customer, 'portal_user', None),
+            type_value='system',
+            title='New Application Started',
+            description=(
+                'Customer started a new application after a previous decline. '
+                'Previous loans were kept. Banking and contract must be completed again.'
+            ),
+            metadata={'action': 'start_new_application'},
+        )
+        return loan
+
     @staticmethod
     @transaction.atomic
     def approve_loan(loan: Loan, approved_by=None, notes: str = None, source='human') -> Loan:

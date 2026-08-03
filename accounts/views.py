@@ -536,6 +536,19 @@ class CustomerPortalLoginView(APIView):
 class CustomerPortalBaseView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    # In-progress applications must outrank terminal states so a re-application
+    # is visible while a previous declined loan still exists.
+    APPLICATION_PRIORITY = [
+        'pending_signature',
+        'ibv_pending',
+        'pending',
+        'pending_funding',
+        'active',
+        'defaulted',
+        'human_declined',
+        'paid_off',
+    ]
+
     def get_customer(self, request):
         if request.user.user_type != 'customer':
             return None, Response(
@@ -551,6 +564,13 @@ class CustomerPortalBaseView(APIView):
                 {'error': 'Customer profile not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
+
+    def get_current_application(self, customer):
+        for status_value in self.APPLICATION_PRIORITY:
+            loan = customer.loans.filter(status=status_value).order_by('-created_at').first()
+            if loan:
+                return loan
+        return None
 
 
 class CustomerPortalMeView(CustomerPortalBaseView):
@@ -598,34 +618,13 @@ class CustomerPortalCurrentApplicationView(CustomerPortalBaseView):
     Return the customer's most relevant current loan/application.
     """
 
-    APPLICATION_PRIORITY = [
-        'pending_signature',
-        'pending_funding',
-        'active',
-        'defaulted',
-        'human_declined',
-        'paid_off',
-        'ibv_pending',
-        'pending',
-    ]
-
     def get(self, request):
         customer, error_response = self.get_customer(request)
 
         if error_response:
             return error_response
 
-        loans = customer.loans.all()
-
-        selected_loan = None
-
-        for status_value in self.APPLICATION_PRIORITY:
-            selected_loan = loans.filter(
-                status=status_value
-            ).order_by('-created_at').first()
-
-            if selected_loan:
-                break
+        selected_loan = self.get_current_application(customer)
 
         if not selected_loan:
             return Response(
@@ -643,31 +642,19 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
     Single source of truth for customer portal routing/state.
     """
 
-    APPLICATION_PRIORITY = [
-        'pending_signature',
-        'pending_funding',
-        'active',
-        'defaulted',
-        'human_declined',
-        'paid_off',
-        'ibv_pending',
-        'pending',
-    ]
-
-    def get_current_application(self, customer):
-        for status_value in self.APPLICATION_PRIORITY:
-            loan = customer.loans.filter(status=status_value).order_by('-created_at').first()
-            if loan:
-                return loan
-        return None
-
     def get(self, request):
         customer, error_response = self.get_customer(request)
         if error_response:
             return error_response
 
+        from loans.services import LoanService
+
         loan = self.get_current_application(customer)
-        connection = customer.bank_connections.order_by('-created_at').first()
+        connection = (
+            customer.bank_connections.filter(is_active=True)
+            .order_by('-created_at')
+            .first()
+        )
 
         banking = {
             'verified': customer.banking_verified,
@@ -687,6 +674,7 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
         can_appeal = False
         can_renew = False
         can_refinance = False
+        can_start_new_application = LoanService.can_start_new_application(customer)
 
         if not loan:
             portal_state = 'no_application'
@@ -695,7 +683,7 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
 
         elif loan.status == 'human_declined':
             portal_state = 'declined'
-            next_step = 'appeal'
+            next_step = 'start_new_application' if can_start_new_application else 'appeal'
             next_url = '/customer/loans'
             can_appeal = True
 
@@ -763,11 +751,42 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
             'can_appeal': can_appeal,
             'can_renew': can_renew,
             'can_refinance': can_refinance,
+            'can_start_new_application': can_start_new_application,
             'banking': banking,
         }
 
         serializer = CustomerPortalDashboardSerializer(payload)
         return Response(serializer.data)
+
+
+class CustomerPortalStartNewApplicationView(CustomerPortalBaseView):
+    """
+    Declined customers only: keep prior loans and open a fresh IBV + contract path.
+    """
+
+    def post(self, request):
+        customer, error_response = self.get_customer(request)
+        if error_response:
+            return error_response
+
+        from loans.services import LoanService
+
+        try:
+            loan = LoanService.start_new_application(customer)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        customer.refresh_from_db()
+        return Response(
+            {
+                'message': 'New application started. Please complete banking verification.',
+                'loan_id': str(loan.id),
+                'next_url': '/customer/banking',
+                'current_application': CurrentApplicationSerializer(loan).data,
+                'can_start_new_application': LoanService.can_start_new_application(customer),
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class CustomerPortalContractPreviewView(CustomerPortalBaseView):

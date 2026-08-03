@@ -53,6 +53,11 @@ urlpatterns = [
         name='customer-portal-dashboard',
     ),
     path(
+        'portal/me/start-new-application/',
+        views.CustomerPortalStartNewApplicationView.as_view(),
+        name='customer-portal-start-new-application',
+    ),
+    path(
         'portal/me/contract-preview/',
         views.CustomerPortalContractPreviewView.as_view(),
         name='customer-portal-contract-preview',

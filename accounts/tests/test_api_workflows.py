@@ -587,3 +587,126 @@ class BackendApiWorkflowTests(APITestCase):
         result = send_loan_workflow_reminders()
 
         self.assertEqual(result["ibv_sent"], 0)
+
+
+class StartNewApplicationTests(APITestCase):
+    """Declined customers can open a second loan while keeping the old one."""
+
+    def setUp(self):
+        self.portal_user = User.objects.create_user(
+            email="declined@example.com",
+            password="Password123!",
+            full_name="Declined Customer",
+            user_type="customer",
+            phone="4165550199",
+            phone_normalized="+14165550199",
+        )
+        self.customer = Customer.objects.create(
+            portal_user=self.portal_user,
+            first_name="Declined",
+            last_name="Customer",
+            email="declined@example.com",
+            phone="4165550199",
+            phone_normalized="+14165550199",
+            province="ON",
+            status="active",
+            onboarding_stage="portal_active",
+            banking_verified=True,
+            contract_completed=True,
+            requested_loan_amount=Decimal("500.00"),
+        )
+        self.declined_loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("100.00"),
+            total_amount=Decimal("600.00"),
+            balance=Decimal("600.00"),
+            status="human_declined",
+            is_active=False,
+            declined_at=timezone.now(),
+            decline_reason="Unacceptable bank",
+        )
+        self.client.force_authenticate(self.portal_user)
+
+    def test_dashboard_exposes_start_new_application_when_declined(self):
+        response = self.client.get("/api/portal/me/dashboard/")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["portal_state"], "declined")
+        self.assertTrue(response.data["can_start_new_application"])
+        self.assertEqual(response.data["current_application"]["id"], str(self.declined_loan.id))
+
+    def test_start_new_application_keeps_declined_loan_and_resets_onboarding(self):
+        from banking.models import BankConnection
+
+        connection = BankConnection.objects.create(
+            customer=self.customer,
+            login_id="old-login",
+            sync_status="synced",
+            is_active=True,
+        )
+
+        response = self.client.post("/api/portal/me/start-new-application/", {}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["next_url"], "/customer/banking")
+        self.assertFalse(response.data["can_start_new_application"])
+
+        self.customer.refresh_from_db()
+        self.declined_loan.refresh_from_db()
+        connection.refresh_from_db()
+
+        self.assertEqual(self.declined_loan.status, "human_declined")
+        self.assertFalse(self.customer.banking_verified)
+        self.assertFalse(self.customer.contract_completed)
+        self.assertEqual(self.customer.onboarding_stage, "banking_verification")
+        self.assertFalse(connection.is_active)
+
+        new_loan = Loan.objects.get(id=response.data["loan_id"])
+        self.assertEqual(new_loan.status, "ibv_pending")
+        self.assertNotEqual(new_loan.id, self.declined_loan.id)
+        self.assertEqual(self.customer.loans.count(), 2)
+
+        dashboard = self.client.get("/api/portal/me/dashboard/")
+        self.assertEqual(dashboard.status_code, 200, dashboard.data)
+        self.assertEqual(dashboard.data["portal_state"], "awaiting_banking")
+        self.assertEqual(
+            dashboard.data["current_application"]["id"],
+            str(new_loan.id),
+        )
+        self.assertEqual(
+            dashboard.data["current_application"]["status"],
+            "ibv_pending",
+        )
+
+    def test_start_new_application_blocked_when_active_loan_exists(self):
+        Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("400.00"),
+            fee=Decimal("80.00"),
+            total_amount=Decimal("480.00"),
+            balance=Decimal("480.00"),
+            status="active",
+            is_active=True,
+        )
+
+        response = self.client.post("/api/portal/me/start-new-application/", {}, format="json")
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("in progress", response.data["error"].lower())
+
+        dashboard = self.client.get("/api/portal/me/dashboard/")
+        self.assertEqual(dashboard.data["portal_state"], "active_loan")
+        self.assertFalse(dashboard.data["can_start_new_application"])
+
+    def test_non_declined_customer_cannot_start_new_application(self):
+        self.declined_loan.status = "paid_off"
+        self.declined_loan.is_active = False
+        self.declined_loan.declined_at = None
+        self.declined_loan.decline_reason = None
+        self.declined_loan.save()
+
+        response = self.client.post("/api/portal/me/start-new-application/", {}, format="json")
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("declined", response.data["error"].lower())
+        self.assertFalse(
+            self.client.get("/api/portal/me/dashboard/").data["can_start_new_application"]
+        )
+

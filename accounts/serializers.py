@@ -716,6 +716,7 @@ class CustomerPortalDashboardSerializer(serializers.Serializer):
     can_appeal = serializers.BooleanField()
     can_renew = serializers.BooleanField()
     can_refinance = serializers.BooleanField()
+    can_start_new_application = serializers.BooleanField()
 
     banking = serializers.DictField()
 
