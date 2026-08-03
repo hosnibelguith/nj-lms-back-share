@@ -187,3 +187,22 @@ def send_arrive_decision_webhook_task(self, loan_id: str, decision: str):
             self.request.retries,
         )
         raise self.retry(exc=exc, countdown=min(300, 30 * (2 ** self.request.retries)))
+
+
+@shared_task(bind=True, max_retries=5, default_retry_delay=30)
+def send_arrive_funding_webhook_task(self, loan_id: str, funded_payment_id: str):
+    from accounts.arrive_integration import deliver_funding_webhook
+
+    try:
+        ok = deliver_funding_webhook(loan_id, funded_payment_id)
+        if not ok:
+            raise RuntimeError(f"Arrive funding webhook delivery failed for loan {loan_id}")
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Arrive funding webhook attempt failed loan=%s funded_payment=%s retry=%s",
+            loan_id,
+            funded_payment_id,
+            self.request.retries,
+        )
+        raise self.retry(exc=exc, countdown=min(300, 30 * (2 ** self.request.retries)))

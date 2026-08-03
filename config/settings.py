@@ -378,6 +378,12 @@ ARRIVE_WEBHOOK_URL = os.environ.get(
     "ARRIVE_WEBHOOK_URL",
     "https://app.arrivecard.ca/api/webhooks/lendstack/decision/",
 )
+# Sent separately from the decision: final authorization for Arrive to move
+# money from the lender wallet onto the customer's card.
+ARRIVE_FUNDING_WEBHOOK_URL = os.environ.get(
+    "ARRIVE_FUNDING_WEBHOOK_URL",
+    "https://app.arrivecard.ca/api/webhooks/lendstack/funding/",
+)
 ARRIVE_WEBHOOK_SECRET = os.environ.get("ARRIVE_WEBHOOK_SECRET", "")
 ARRIVE_PORTAL_BASE_URL = os.environ.get(
     "ARRIVE_PORTAL_BASE_URL",

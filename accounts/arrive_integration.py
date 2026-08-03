@@ -54,6 +54,13 @@ def get_arrive_webhook_url() -> str:
     )
 
 
+def get_arrive_funding_webhook_url() -> str:
+    return _get_setting(
+        "ARRIVE_FUNDING_WEBHOOK_URL",
+        getattr(settings, "ARRIVE_FUNDING_WEBHOOK_URL", "https://app.arrivecard.ca/api/webhooks/lendstack/funding/"),
+    )
+
+
 def get_arrive_webhook_secret() -> str:
     return _get_setting("ARRIVE_WEBHOOK_SECRET", getattr(settings, "ARRIVE_WEBHOOK_SECRET", ""))
 
@@ -86,6 +93,13 @@ def _money(value) -> Decimal:
         return Decimal(str(value)).quantize(Decimal("0.01"))
     except (InvalidOperation, TypeError, ValueError):
         return Decimal("0.00")
+
+
+def _utc_iso(value: datetime | None) -> str:
+    moment = value or timezone.now()
+    if timezone.is_naive(moment):
+        moment = timezone.make_aware(moment, timezone.get_current_timezone())
+    return moment.astimezone(dt_timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _handoff_ttl() -> timedelta:
@@ -406,10 +420,6 @@ def build_decision_payload(loan: Loan, *, decision: str) -> dict[str, Any]:
     else:
         decline_reasons = _decline_reasons(loan)
 
-    decided_at = loan.approved_at or loan.declined_at or timezone.now()
-    if timezone.is_naive(decided_at):
-        decided_at = timezone.make_aware(decided_at, timezone.get_current_timezone())
-
     return {
         "event_id": str(uuid.uuid4()),
         "event": "loan.decision",
@@ -422,7 +432,30 @@ def build_decision_payload(loan: Loan, *, decision: str) -> dict[str, Any]:
         "approved_amount": approved_amount,
         "currency": "CAD",
         "decline_reasons": decline_reasons,
-        "decided_at": decided_at.astimezone(dt_timezone.utc).isoformat().replace("+00:00", "Z"),
+        "decided_at": _utc_iso(loan.approved_at or loan.declined_at),
+    }
+
+
+def build_funding_payload(loan: Loan, funding) -> dict[str, Any]:
+    """
+    Final authorization for Arrive to move money from the lender wallet onto the
+    card. The event_id is derived from the funded payment so Celery retries
+    re-send the same event and Arrive can deduplicate instead of double-funding.
+    """
+    customer = loan.customer
+
+    return {
+        "event_id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"lendstack:loan.funding:{funding.id}")),
+        "event": "loan.funding",
+        "arrive_application_id": customer.arrive_application_id,
+        "lendstack_customer_id": str(customer.id),
+        "loan_id": str(loan.id),
+        "zum_user_id": customer.arrive_zum_user_id,
+        "card_id": customer.arrive_zum_user_card_id or None,
+        "funding_amount": f"{_money(funding.amount):.2f}",
+        "currency": "CAD",
+        "funding_authorized_at": _utc_iso(funding.completed_at or funding.created_at),
+        "funding_reference_id": str(funding.id),
     }
 
 
@@ -432,25 +465,32 @@ def sign_arrive_webhook(raw_body: bytes, timestamp: str, secret: str) -> str:
     return base64.b64encode(digest).decode("ascii")
 
 
-def deliver_decision_webhook(loan_id: str, decision: str) -> bool:
+def _load_arrive_loan(loan_id: str, *, kind: str) -> Loan | None:
+    """Return the loan only when it is an Arrive-sourced application."""
     try:
         loan = Loan.objects.select_related("customer").get(id=loan_id)
     except Loan.DoesNotExist:
-        logger.error("Arrive decision webhook: loan %s not found", loan_id)
-        return False
+        logger.error("Arrive %s webhook: loan %s not found", kind, loan_id)
+        return None
 
     customer = loan.customer
     if customer.source != Customer.SOURCE_ARRIVE or not customer.arrive_application_id:
-        logger.info("Skipping Arrive webhook for non-Arrive loan %s", loan_id)
-        return False
+        logger.info("Skipping Arrive %s webhook for non-Arrive loan %s", kind, loan_id)
+        return None
+    return loan
 
-    url = get_arrive_webhook_url()
+
+def _post_arrive_webhook(url: str, payload: dict[str, Any], *, kind: str, loan_id: str) -> bool:
+    """Sign and POST one Arrive webhook. Raises so Celery can retry."""
     secret = get_arrive_webhook_secret()
     if not url or not secret:
-        logger.error("Arrive webhook URL/secret not configured; cannot notify for loan %s", loan_id)
+        logger.error(
+            "Arrive %s webhook URL/secret not configured; cannot notify for loan %s",
+            kind,
+            loan_id,
+        )
         return False
 
-    payload = build_decision_payload(loan, decision=decision)
     raw_body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     timestamp = str(int(timezone.now().timestamp()))
     signature = sign_arrive_webhook(raw_body, timestamp, secret)
@@ -466,34 +506,84 @@ def deliver_decision_webhook(loan_id: str, decision: str) -> bool:
         response = requests.post(url, data=raw_body, headers=headers, timeout=20)
         if 200 <= response.status_code < 300:
             logger.info(
-                "Arrive decision webhook delivered loan=%s decision=%s event_id=%s",
+                "Arrive %s webhook delivered loan=%s event_id=%s",
+                kind,
                 loan_id,
-                decision,
                 payload["event_id"],
             )
             return True
         logger.warning(
-            "Arrive decision webhook failed loan=%s status=%s body=%s",
+            "Arrive %s webhook failed loan=%s status=%s body=%s",
+            kind,
             loan_id,
             response.status_code,
             response.text[:500],
         )
         response.raise_for_status()
     except Exception:
-        logger.exception("Arrive decision webhook error for loan %s", loan_id)
+        logger.exception("Arrive %s webhook error for loan %s", kind, loan_id)
         raise
 
     return False
 
 
-def queue_decision_webhook(loan: Loan, decision: str) -> None:
+def deliver_decision_webhook(loan_id: str, decision: str) -> bool:
+    loan = _load_arrive_loan(loan_id, kind="decision")
+    if loan is None:
+        return False
+
+    return _post_arrive_webhook(
+        get_arrive_webhook_url(),
+        build_decision_payload(loan, decision=decision),
+        kind="decision",
+        loan_id=loan_id,
+    )
+
+
+def deliver_funding_webhook(loan_id: str, funded_payment_id: str) -> bool:
+    loan = _load_arrive_loan(loan_id, kind="funding")
+    if loan is None:
+        return False
+
+    funding = loan.funded_payments.filter(id=funded_payment_id).first()
+    if funding is None:
+        logger.error(
+            "Arrive funding webhook: funded payment %s not found on loan %s",
+            funded_payment_id,
+            loan_id,
+        )
+        return False
+
+    return _post_arrive_webhook(
+        get_arrive_funding_webhook_url(),
+        build_funding_payload(loan, funding),
+        kind="funding",
+        loan_id=loan_id,
+    )
+
+
+def _queue_arrive_webhook(loan: Loan, task, *task_args) -> None:
     if not loan.customer_id:
         return
-    customer = loan.customer
-    if customer.source != Customer.SOURCE_ARRIVE:
+    if loan.customer.source != Customer.SOURCE_ARRIVE:
         return
     from django.db import transaction
+
+    transaction.on_commit(lambda: task.delay(*task_args))
+
+
+def queue_decision_webhook(loan: Loan, decision: str) -> None:
     from accounts.tasks import send_arrive_decision_webhook_task
 
-    loan_id = str(loan.id)
-    transaction.on_commit(lambda: send_arrive_decision_webhook_task.delay(loan_id, decision))
+    _queue_arrive_webhook(
+        loan, send_arrive_decision_webhook_task, str(loan.id), decision
+    )
+
+
+def queue_funding_webhook(loan: Loan, funding) -> None:
+    """Authorize Arrive to fund the card. Only fires once the DB commit lands."""
+    from accounts.tasks import send_arrive_funding_webhook_task
+
+    _queue_arrive_webhook(
+        loan, send_arrive_funding_webhook_task, str(loan.id), str(funding.id)
+    )

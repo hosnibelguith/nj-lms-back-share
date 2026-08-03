@@ -220,7 +220,7 @@ def release_funding_locks(loan: Loan) -> None:
 
 
 def is_arrive_funded_loan(loan: Loan) -> bool:
-    """Arrive funds the card after our decision webhook — never LendStack EFT/EMT."""
+    """Arrive funds the card after our funding webhook — never LendStack EFT/EMT."""
     from accounts.models import Customer
 
     customer = getattr(loan, "customer", None)
@@ -822,6 +822,10 @@ class FundingService:
             metadata={"funded_payment_id": str(funding.id), "method": "card_issuance", "loan_id": str(loan.id)},
         )
         FundingService._queue_funding_email(loan)
+
+        from accounts.arrive_integration import queue_funding_webhook
+
+        queue_funding_webhook(loan, funding)
         return funding
 
     @staticmethod
