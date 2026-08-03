@@ -151,23 +151,26 @@ class TwilioService:
         """
         Resolve the sender for a role.
 
-        OTP uses TWILIO_OTP_PHONE_NUMBER when configured so verification codes
-        keep their dedicated number, and falls back to the conversational sender
-        when it is not set. Conversational traffic prefers a Messaging Service,
-        then the single sending number.
+        Conversations prefer a Messaging Service, then TWILIO_MESSAGING_PHONE_NUMBER.
+        Verification codes stay on TWILIO_PHONE_NUMBER and never route through the
+        Messaging Service, so a shared service cannot rotate the number a customer
+        sees for a login code. Either number covers the other when only one is set.
         """
+        messaging_number = normalize_e164(
+            cls._setting('TWILIO_MESSAGING_PHONE_NUMBER', '')
+        )
+        otp_number = normalize_e164(cls._setting('TWILIO_PHONE_NUMBER', ''))
+
         if role == SENDER_OTP:
-            otp_number = normalize_e164(cls._setting('TWILIO_OTP_PHONE_NUMBER', ''))
-            if otp_number:
-                return {'from_': otp_number}
+            from_number = otp_number or messaging_number
+        else:
+            messaging_service_sid = str(
+                cls._setting('TWILIO_MESSAGING_SERVICE_SID', '')
+            ).strip()
+            if messaging_service_sid:
+                return {'messaging_service_sid': messaging_service_sid}
+            from_number = messaging_number or otp_number
 
-        messaging_service_sid = str(
-            cls._setting('TWILIO_MESSAGING_SERVICE_SID', '')
-        ).strip()
-        if messaging_service_sid:
-            return {'messaging_service_sid': messaging_service_sid}
-
-        from_number = normalize_e164(cls._setting('TWILIO_PHONE_NUMBER', ''))
         if not from_number:
             raise TwilioConfigurationError(
                 'Twilio phone number or messaging service SID is not configured.'
