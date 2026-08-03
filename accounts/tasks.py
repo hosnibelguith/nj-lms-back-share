@@ -128,7 +128,7 @@ def send_sms_otp_task(self, phone_number: str, code: str):
     try:
         from django.conf import settings
 
-        from communications.twilio_sms import TwilioService
+        from communications.twilio_sms import SENDER_OTP, TwilioService
 
         if settings.DEBUG and getattr(settings, "DEV_OTP_CODE", ""):
             logger.warning("DEV OTP for %s is %s", phone_number, code)
@@ -137,6 +137,7 @@ def send_sms_otp_task(self, phone_number: str, code: str):
         TwilioService.send_sms(
             to=phone_number,
             content=f"Your verification code is {code}. It expires in 10 minutes.",
+            sender=SENDER_OTP,
         )
 
         logger.info(f"OTP SMS sent to {phone_number}")

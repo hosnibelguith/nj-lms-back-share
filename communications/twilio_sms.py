@@ -39,6 +39,11 @@ OPT_OUT_ERROR_CODES = {
 STOP_KEYWORDS = {'STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT', 'ARRET'}
 START_KEYWORDS = {'START', 'YES', 'UNSTOP'}
 
+# Sender roles. Conversations go out on the number wired to the inbound reply
+# webhook; one-time codes stay on their own number so the two never mix.
+SENDER_MESSAGING = 'messaging'
+SENDER_OTP = 'otp'
+
 
 class TwilioError(ValueError):
     """Base error for failures communicating with Twilio."""
@@ -142,8 +147,20 @@ class TwilioService:
         return cls._credentials()[1]
 
     @classmethod
-    def _sender(cls) -> dict:
-        """Prefer a Messaging Service; fall back to the single sending number."""
+    def _sender(cls, role: str = SENDER_MESSAGING) -> dict:
+        """
+        Resolve the sender for a role.
+
+        OTP uses TWILIO_OTP_PHONE_NUMBER when configured so verification codes
+        keep their dedicated number, and falls back to the conversational sender
+        when it is not set. Conversational traffic prefers a Messaging Service,
+        then the single sending number.
+        """
+        if role == SENDER_OTP:
+            otp_number = normalize_e164(cls._setting('TWILIO_OTP_PHONE_NUMBER', ''))
+            if otp_number:
+                return {'from_': otp_number}
+
         messaging_service_sid = str(
             cls._setting('TWILIO_MESSAGING_SERVICE_SID', '')
         ).strip()
@@ -174,7 +191,7 @@ class TwilioService:
         return Client(account_sid, auth_token)
 
     @classmethod
-    def send_sms(cls, *, to: str, content: str):
+    def send_sms(cls, *, to: str, content: str, sender: str = SENDER_MESSAGING):
         """Send one SMS. Returns the Twilio message SID."""
         from twilio.base.exceptions import TwilioException, TwilioRestException
 
@@ -184,7 +201,7 @@ class TwilioService:
         if not str(content or '').strip():
             raise TwilioConfigurationError('SMS content is required.')
 
-        payload = {'to': destination, 'body': content, **cls._sender()}
+        payload = {'to': destination, 'body': content, **cls._sender(sender)}
         status_callback = str(cls._setting('TWILIO_STATUS_CALLBACK_URL', '')).strip()
         if status_callback:
             payload['status_callback'] = status_callback

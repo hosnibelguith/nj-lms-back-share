@@ -6,6 +6,7 @@ from twilio.base.exceptions import TwilioRestException
 from twilio.request_validator import RequestValidator
 
 from accounts.models import Customer, User
+from accounts.tasks import send_sms_otp_task
 from activity.models import ActivityHistory
 from communications.models import Communication
 from communications.tasks import send_sms
@@ -120,6 +121,55 @@ class TwilioSendTests(TestCase):
         payload = mock_client.return_value.messages.create.call_args.kwargs
         self.assertEqual(payload['messaging_service_sid'], 'MG1')
         self.assertNotIn('from_', payload)
+
+    @override_settings(TWILIO_OTP_PHONE_NUMBER='+14388083102')
+    @patch('twilio.rest.Client')
+    def test_staff_sms_never_sends_from_the_otp_number(self, mock_client):
+        mock_client.return_value.messages.create.return_value = _twilio_message()
+
+        send_sms(str(self._communication().id))
+
+        payload = mock_client.return_value.messages.create.call_args.kwargs
+        self.assertEqual(payload['from_'], '+14165550000')
+
+    @override_settings(TWILIO_OTP_PHONE_NUMBER='+1 (438) 808-3102')
+    @patch('twilio.rest.Client')
+    def test_otp_sends_from_its_dedicated_number(self, mock_client):
+        mock_client.return_value.messages.create.return_value = _twilio_message()
+
+        send_sms_otp_task('4165551234', '123456')
+
+        payload = mock_client.return_value.messages.create.call_args.kwargs
+        self.assertEqual(payload['from_'], '+14388083102')
+        self.assertNotIn('messaging_service_sid', payload)
+
+    @override_settings(TWILIO_OTP_PHONE_NUMBER='')
+    @patch('twilio.rest.Client')
+    def test_otp_falls_back_to_conversational_sender(self, mock_client):
+        mock_client.return_value.messages.create.return_value = _twilio_message()
+
+        send_sms_otp_task('4165551234', '123456')
+
+        payload = mock_client.return_value.messages.create.call_args.kwargs
+        self.assertEqual(payload['from_'], '+14165550000')
+
+    @override_settings(
+        TWILIO_OTP_PHONE_NUMBER='+14388083102',
+        TWILIO_MESSAGING_SERVICE_SID='MG1',
+    )
+    @patch('twilio.rest.Client')
+    def test_otp_number_outranks_the_messaging_service(self, mock_client):
+        mock_client.return_value.messages.create.return_value = _twilio_message()
+
+        send_sms_otp_task('4165551234', '123456')
+
+        payload = mock_client.return_value.messages.create.call_args.kwargs
+        self.assertEqual(payload['from_'], '+14388083102')
+
+        send_sms(str(self._communication().id))
+
+        payload = mock_client.return_value.messages.create.call_args.kwargs
+        self.assertEqual(payload['messaging_service_sid'], 'MG1')
 
     @override_settings(TWILIO_STATUS_CALLBACK_URL=WEBHOOK_URL)
     @patch('twilio.rest.Client')

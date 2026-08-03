@@ -332,7 +332,11 @@ GRAPH_MAILBOX = os.environ.get("GRAPH_MAILBOX", INBOUND_EMAIL_USER)
 # -------------------------------------------------------------------
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+# Conversational sender: staff SMS in the communications tab and customer replies.
 TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")
+# Optional: dedicated sender for verification codes. Falls back to the
+# conversational sender when blank.
+TWILIO_OTP_PHONE_NUMBER = os.environ.get("TWILIO_OTP_PHONE_NUMBER", "")
 # Optional: a Messaging Service takes precedence over the single sending number.
 TWILIO_MESSAGING_SERVICE_SID = os.environ.get("TWILIO_MESSAGING_SERVICE_SID", "")
 # Optional: per-message delivery receipt URL when it is not set on the number.
