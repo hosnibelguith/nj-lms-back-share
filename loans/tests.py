@@ -1204,6 +1204,73 @@ class ZumRailsClientTests(APITestCase):
             "wallet-ca",
         )
 
+    @override_settings(ZUMRAILS_WALLET_ID="", ZUMRAILS_FUNDING_SOURCE_ID="funding-source-1")
+    @patch("loans.zumrails.requests.request")
+    @patch("loans.zumrails.requests.post")
+    def test_uses_funding_source_when_wallet_unset(self, mock_post, mock_request):
+        mock_post.return_value = self.response({"result": {"Token": "token-1"}})
+        mock_request.return_value = self.response({"result": {"Id": "transaction-1"}})
+
+        ZumRailsService.initiate_transaction(
+            amount=Decimal("10.00"),
+            transaction_type="AccountsReceivable",
+            method="Eft",
+            memo="Loan 1",
+            client_transaction_id=uuid.uuid4(),
+            user_payload={"FirstName": "Jane", "LastName": "Doe", "Email": "jane@example.com"},
+        )
+
+        payload = mock_request.call_args.kwargs["json"]
+        self.assertEqual(payload["FundingSourceId"], "funding-source-1")
+        self.assertNotIn("WalletId", payload)
+
+    @patch("loans.zumrails.requests.request")
+    @patch("loans.zumrails.requests.post")
+    def test_validate_and_process_ar_batch_payload(self, mock_post, mock_request):
+        mock_post.return_value = self.response({"result": {"Token": "token-1"}})
+        mock_request.side_effect = [
+            self.response({"result": {"Status": "Ok", "InvalidTransactions": 0}}),
+            self.response({"result": {"Id": "batch-1", "Status": "Ok"}}),
+        ]
+        csv_content = ZumRailsService.build_accounts_receivable_csv([
+            {
+                "first_name": "Jane",
+                "last_name": "Example",
+                "institution_number": "3",
+                "transit_number": "45",
+                "account_number": "1234567",
+                "amount": "125.00",
+                "comment": "Invoice 1001",
+                "memo": "INV 1001",
+            }
+        ])
+        self.assertIn("003;00045;1234567;12500;", csv_content.replace("\n", ""))
+
+        result = ZumRailsService.process_accounts_receivable_batch(
+            csv_content,
+            idempotency_key=str(uuid.uuid4()),
+            filename="batch_ar.csv",
+        )
+
+        self.assertEqual(result["result"]["Id"], "batch-1")
+        self.assertEqual(
+            mock_request.call_args_list[0].args[:2],
+            ("POST", "https://sandbox.example/api/transaction/ValidateBatchFile"),
+        )
+        self.assertEqual(
+            mock_request.call_args_list[1].args[:2],
+            ("POST", "https://sandbox.example/api/transaction/ProcessBatchFile"),
+        )
+        process_payload = mock_request.call_args_list[1].kwargs["json"]
+        self.assertEqual(process_payload["TransactionType"], "AccountsReceivable")
+        self.assertEqual(process_payload["WalletId"], "wallet-1")
+        self.assertTrue(process_payload["SkipFileAlreadyProcessedInLast24Hours"])
+        self.assertEqual(process_payload["TransactionMethod"], "Eft")
+        self.assertEqual(
+            mock_request.call_args_list[0].kwargs["json"]["Bytes"],
+            process_payload["Bytes"],
+        )
+
 
 @override_settings(ZUMRAILS_DRY_RUN=True)
 class BlockedInstitutionFundingTests(APITestCase):
@@ -1377,6 +1444,28 @@ class BlockedInstitutionFundingTests(APITestCase):
                 "InstitutionNumber": "003",
                 "TransitNumber": "12345",
                 "AccountNumber": "1234567890",
+            },
+        )
+
+    def test_zumrails_user_payload_zero_pads_bank_routing(self):
+        account = BankAccount.objects.create(
+            connection=self.connection,
+            customer=self.customer,
+            external_id="acct-unpadded",
+            name="Unpadded",
+            type="checking",
+            transit_number="45",
+            institution_number="3",
+            account_number="999888",
+            is_primary=False,
+        )
+        payload = ZumRailsService.user_payload(self.customer, account=account)
+        self.assertEqual(
+            payload["BankAccountInformation"],
+            {
+                "InstitutionNumber": "003",
+                "TransitNumber": "00045",
+                "AccountNumber": "999888",
             },
         )
 

@@ -1,4 +1,5 @@
 import base64
+import csv
 import hashlib
 import hmac
 import logging
@@ -6,6 +7,8 @@ import re
 import threading
 import uuid
 from datetime import timedelta
+from decimal import Decimal, ROUND_HALF_UP
+from io import StringIO
 
 import requests
 from django.conf import settings
@@ -66,6 +69,19 @@ COLLECTION_SETTLEMENT_BUSINESS_DAYS = 4
 ZUMRAILS_TOKEN_TTL_SECONDS = 55 * 60
 ZUMRAILS_REQUEST_TIMEOUT_SECONDS = 15
 ZUMRAILS_MEMO_PATTERN = re.compile(r"^[A-Za-z0-9 _-]{1,15}$")
+# Canadian EFT AccountsReceivable batch CSV (semicolon-delimited, amounts in cents).
+CANADA_AR_HEADERS = (
+    "first_name*",
+    "last_name*",
+    "business_name",
+    "institution_number*",
+    "branch_number*",
+    "account_number*",
+    "amount_in_cents*",
+    "transaction_comment",
+    "memo*",
+    "scheduled_date",
+)
 
 
 class ZumRailsError(ValueError):
@@ -480,7 +496,7 @@ class ZumRailsService:
 
             try:
                 response.raise_for_status()
-                return response.json()
+                data = response.json()
             except requests.RequestException as exc:
                 raise ZumRailsRequestError(
                     f"ZūmRails rejected the request with HTTP {response.status_code}.",
@@ -493,6 +509,18 @@ class ZumRailsService:
                 raise ZumRailsRequestError(
                     "ZūmRails returned an invalid JSON response."
                 ) from exc
+
+            if isinstance(data, dict) and data.get("isError") is True:
+                message = (
+                    data.get("responseException")
+                    or data.get("message")
+                    or "request failed"
+                )
+                raise ZumRailsRequestError(
+                    f"ZūmRails rejected the request: {message}",
+                    outcome_unknown=False,
+                )
+            return data
 
         raise ZumRailsRequestError(
             "ZūmRails authentication failed.",
@@ -531,6 +559,31 @@ class ZumRailsService:
         cache.set(cache_key, wallet_id, ZUMRAILS_TOKEN_TTL_SECONDS)
         return wallet_id
 
+    @classmethod
+    def _funds_destination(cls) -> dict:
+        """Exactly one of WalletId or FundingSourceId for single AR/AP transactions."""
+        wallet_id = str(cls._setting("ZUMRAILS_WALLET_ID", "")).strip()
+        if wallet_id:
+            return {"WalletId": wallet_id}
+        funding_source_id = str(cls._setting("ZUMRAILS_FUNDING_SOURCE_ID", "")).strip()
+        if funding_source_id:
+            return {"FundingSourceId": funding_source_id}
+        return {"WalletId": cls.get_wallet_id()}
+
+    @staticmethod
+    def _money(amount) -> float:
+        return float(
+            Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        )
+
+    @staticmethod
+    def _cents(amount) -> int:
+        return int(
+            (Decimal(str(amount)) * Decimal("100")).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
+
     @staticmethod
     def _memo(value: str) -> str:
         memo = re.sub(r"[^A-Za-z0-9 _-]", "", str(value or ""))[:15].strip()
@@ -563,10 +616,11 @@ class ZumRailsService:
                 raise ZumRailsConfigurationError(
                     f"Selected EFT account is missing {', '.join(missing)}."
                 )
+            # Zūm requires zero-padded institution (3) and transit/branch (5).
             payload["BankAccountInformation"] = {
-                "InstitutionNumber": account.institution_number,
-                "TransitNumber": account.transit_number,
-                "AccountNumber": account.account_number,
+                "InstitutionNumber": str(account.institution_number).strip().zfill(3),
+                "TransitNumber": str(account.transit_number).strip().zfill(5),
+                "AccountNumber": str(account.account_number).strip(),
             }
         return payload
 
@@ -589,11 +643,11 @@ class ZumRailsService:
         payload = {
             "ZumRailsType": transaction_type,
             "TransactionMethod": method,
-            "Amount": float(amount),
+            "Amount": cls._money(amount),
             "Memo": cls._memo(memo),
             "ClientTransactionId": str(client_transaction_id),
             "User": user_payload,
-            "WalletId": cls.get_wallet_id(),
+            **cls._funds_destination(),
         }
         if comment:
             payload["Comment"] = comment
@@ -621,6 +675,136 @@ class ZumRailsService:
         if not transaction_id:
             raise ZumRailsRequestError("ZūmRails did not return a transaction ID.")
         return transaction_id
+
+    @classmethod
+    def _batch_destination(cls, destination: str | None = None) -> dict:
+        if destination == "funding":
+            funding_source_id = str(cls._setting("ZUMRAILS_FUNDING_SOURCE_ID", "")).strip()
+            if not funding_source_id:
+                raise ZumRailsConfigurationError(
+                    "ZUMRAILS_FUNDING_SOURCE_ID is required for a funding-source destination."
+                )
+            return {"FundingSourceId": funding_source_id}
+        if destination == "wallet":
+            return {"WalletId": cls.get_wallet_id()}
+        return cls._funds_destination()
+
+    @classmethod
+    def build_accounts_receivable_csv(cls, rows) -> str:
+        """Build Zūm Canadian EFT AR batch CSV (semicolon-delimited, cents)."""
+        buffer = StringIO()
+        writer = csv.DictWriter(
+            buffer,
+            fieldnames=CANADA_AR_HEADERS,
+            delimiter=";",
+            lineterminator="\n",
+            extrasaction="raise",
+        )
+        writer.writeheader()
+        for source in rows:
+            first_name = str(source.get("first_name", "")).strip()
+            last_name = str(source.get("last_name", "")).strip()
+            business_name = str(source.get("business_name", "")).strip()
+            if not business_name and not (first_name and last_name):
+                raise ZumRailsConfigurationError(
+                    "Each AR batch row needs first+last name or business_name."
+                )
+            writer.writerow({
+                "first_name*": first_name,
+                "last_name*": last_name,
+                "business_name": business_name,
+                "institution_number*": str(source["institution_number"]).strip().zfill(3),
+                "branch_number*": str(source["transit_number"]).strip().zfill(5),
+                "account_number*": str(source["account_number"]).strip(),
+                "amount_in_cents*": cls._cents(source["amount"]),
+                "transaction_comment": str(source.get("comment", "")),
+                "memo*": cls._memo(str(source["memo"])),
+                "scheduled_date": str(source.get("scheduled_date", "")),
+            })
+        return buffer.getvalue()
+
+    @classmethod
+    def _ar_batch_base_payload(cls, csv_bytes: bytes, *, destination: str | None = None) -> dict:
+        return {
+            "TransactionType": "AccountsReceivable",
+            "Bytes": base64.b64encode(csv_bytes).decode("ascii"),
+            **cls._batch_destination(destination),
+        }
+
+    @classmethod
+    def _validate_ar_batch_payload(cls, payload: dict) -> dict:
+        response = cls._request("POST", "/transaction/ValidateBatchFile", json_payload=payload)
+        result = cls._result(response)
+        if not isinstance(result, dict):
+            raise ZumRailsRequestError(
+                "ZūmRails batch validation returned an unexpected result.",
+                outcome_unknown=False,
+            )
+        invalid = int(result.get("InvalidTransactions", 0) or 0)
+        status = str(result.get("Status", ""))
+        if invalid or status.lower() != "ok":
+            raise ZumRailsRequestError(
+                f"ZūmRails batch validation failed: status={status!r}, invalid={invalid}.",
+                outcome_unknown=False,
+            )
+        return response
+
+    @classmethod
+    def validate_accounts_receivable_batch(
+        cls,
+        csv_content: str | bytes,
+        *,
+        destination: str | None = None,
+    ) -> dict:
+        """Validate a Canadian EFT AR CSV without processing (ValidateBatchFile)."""
+        csv_bytes = (
+            csv_content.encode("utf-8") if isinstance(csv_content, str) else csv_content
+        )
+        return cls._validate_ar_batch_payload(
+            cls._ar_batch_base_payload(csv_bytes, destination=destination)
+        )
+
+    @classmethod
+    def process_accounts_receivable_batch(
+        cls,
+        csv_content: str | bytes,
+        *,
+        idempotency_key: str,
+        filename: str = "accounts_receivable.csv",
+        destination: str | None = None,
+    ) -> dict:
+        """Validate then process a Canadian EFT AR batch (ProcessBatchFile).
+
+        Scheduled collections continue to use initiate_transaction so webhooks can
+        match ClientTransactionId. Call this only for intentional batch ops.
+        """
+        if cls._is_dry_run():
+            return {
+                "result": {
+                    "Id": f"dryrun-batch-{uuid.uuid4().hex}",
+                    "Status": "Ok",
+                }
+            }
+
+        csv_bytes = (
+            csv_content.encode("utf-8") if isinstance(csv_content, str) else csv_content
+        )
+        base_payload = cls._ar_batch_base_payload(csv_bytes, destination=destination)
+        # Validate and process the exact same Base64 bytes.
+        cls._validate_ar_batch_payload(base_payload)
+        payload = {
+            **base_payload,
+            "FileName": filename,
+            "SkipFileAlreadyProcessedInLast24Hours": True,
+            "WithdrawSumTotalFromFundingSource": False,
+            "TransactionMethod": "Eft",
+        }
+        return cls._request(
+            "POST",
+            "/transaction/ProcessBatchFile",
+            json_payload=payload,
+            headers={"idempotency-key": str(idempotency_key)[:36]},
+        )
 
 
 class FundingService:

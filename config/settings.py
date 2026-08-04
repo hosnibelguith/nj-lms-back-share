@@ -363,7 +363,10 @@ MOHAWK_BANKING_ANALYSIS_API_KEY = os.environ.get("MOHAWK_BANKING_ANALYSIS_API_KE
 ZUMRAILS_API_BASE_URL = os.environ.get("ZUMRAILS_API_BASE_URL", "")
 ZUMRAILS_USERNAME = os.environ.get("ZUMRAILS_USERNAME", "")
 ZUMRAILS_PASSWORD = os.environ.get("ZUMRAILS_PASSWORD", "")
+# Optional: leave blank to discover the account's CAD wallet through the API.
 ZUMRAILS_WALLET_ID = os.environ.get("ZUMRAILS_WALLET_ID", "")
+# Optional alternative to wallet for EFT destination/source (AccountsReceivable / Payable).
+ZUMRAILS_FUNDING_SOURCE_ID = os.environ.get("ZUMRAILS_FUNDING_SOURCE_ID", "")
 ZUMRAILS_WEBHOOK_SECRET = os.environ.get("ZUMRAILS_WEBHOOK_SECRET", "")
 ZUMRAILS_DRY_RUN = os.environ.get("ZUMRAILS_DRY_RUN", "True" if DEBUG else "False").lower() == "true"
 

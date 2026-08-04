@@ -50,6 +50,8 @@ class ApiIntegrationsView(APIView):
             'ZUMRAILS_API_BASE_URL': 'zum_api_base_url',
             'ZUMRAILS_USERNAME': 'zum_username',
             'ZUMRAILS_PASSWORD': 'zum_password',
+            'ZUMRAILS_WALLET_ID': 'zum_wallet_id',
+            'ZUMRAILS_FUNDING_SOURCE_ID': 'zum_funding_source_id',
             'ZUMRAILS_WEBHOOK_SECRET': 'zum_webhook_secret',
             'WEBHOOK_URL': 'webhook_url',
             'ARRIVE_API_KEY': 'arrive_api_key',
