@@ -1559,3 +1559,43 @@ class FundingFailureRecoveryTests(APITestCase):
         self.loan.refresh_from_db()
         self.assertIsNone(self.loan.funding_destination_locked_at)
         self.assertIsNone(self.loan.collections_account_locked_at)
+
+    def test_stale_lock_after_failed_attempt_allows_configuration(self):
+        """UI keys off funded-payment status; leftover locks must not win."""
+        FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="eft",
+            status="failed",
+            failure_reason="Unable to authenticate with ZūmRails.",
+        )
+        self.loan.funding_destination_locked_at = timezone.now()
+        self.loan.collections_account_locked_at = timezone.now()
+        self.loan.funding_destination = {
+            "method": "eft",
+            "eft": {
+                "bank_account_id": str(self.account.id),
+                "account": {
+                    "id": str(self.account.id),
+                    "institution_number": self.account.institution_number,
+                    "transit_number": self.account.transit_number,
+                    "account_number": self.account.account_number,
+                },
+            },
+        }
+        self.loan.save(update_fields=[
+            "funding_destination",
+            "funding_destination_locked_at",
+            "collections_account_locked_at",
+            "updated_at",
+        ])
+
+        response = self.client.patch(
+            f"/api/loans/{self.loan.id}/funding/configuration/",
+            {"eft_bank_account_id": str(self.replacement_account.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.loan.refresh_from_db()
+        self.assertIsNone(self.loan.funding_destination_locked_at)
+        self.assertEqual(self.loan.bank_account_id, self.replacement_account.id)

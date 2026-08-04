@@ -219,6 +219,24 @@ def release_funding_locks(loan: Loan) -> None:
     ])
 
 
+def has_active_funding_attempt(loan: Loan) -> bool:
+    return loan.funded_payments.filter(status__in=["processing", "completed"]).exists()
+
+
+def assert_funding_configuration_editable(loan: Loan) -> None:
+    """Locks only apply while money may be moving.
+
+    A failed/returned attempt (or a leftover lock from an older code path) must
+    not permanently freeze destination selection — that is what the staff UI
+    already assumes when it keys off funded-payment status.
+    """
+    if not loan.funding_destination_locked_at:
+        return
+    if has_active_funding_attempt(loan):
+        raise ValueError("Funding configuration is locked.")
+    release_funding_locks(loan)
+
+
 def is_arrive_funded_loan(loan: Loan) -> bool:
     """Arrive funds the card after our funding webhook — never LendStack EFT/EMT."""
     from accounts.models import Customer
@@ -241,7 +259,7 @@ def funding_configuration_ready(loan: Loan) -> dict:
         blockers.append("Loan is not pending funding.")
     if not loan.contract_signed:
         blockers.append("Contract must be signed before funding.")
-    if loan.funded_payments.filter(status__in=["processing", "completed"]).exists():
+    if has_active_funding_attempt(loan):
         blockers.append("Funding already exists for this loan.")
     if not arrive_loan:
         # A loan is funded by EFT or by e-Transfer, never both, so only one
@@ -276,7 +294,7 @@ def funding_configuration_ready(loan: Loan) -> dict:
         "emt_configured": emt_configured,
         "eft_configured": eft_configured,
         "collections_account_configured": collections_configured,
-        "has_active_funding": loan.funded_payments.filter(status__in=["processing", "completed"]).exists(),
+        "has_active_funding": has_active_funding_attempt(loan),
         "arrive_external_funding": arrive_loan,
         "recommended_method_override": "card_issuance" if arrive_loan else None,
         "allowed_methods": (
@@ -406,9 +424,18 @@ class ZumRailsService:
                 )
                 response.raise_for_status()
                 data = cls._result(response.json())
+            except requests.HTTPError as exc:
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                detail = f" HTTP {status_code}." if status_code else ""
+                raise ZumRailsRequestError(
+                    f"Unable to authenticate with ZūmRails.{detail} "
+                    "Check Zūm API base URL, username, and password in API Integrations.",
+                    outcome_unknown=False,
+                ) from exc
             except (requests.RequestException, ValueError) as exc:
                 raise ZumRailsRequestError(
-                    "Unable to authenticate with ZūmRails.",
+                    "Unable to authenticate with ZūmRails. "
+                    "Check Zūm API base URL, username, and password in API Integrations.",
                     outcome_unknown=False,
                 ) from exc
 
@@ -618,8 +645,11 @@ class FundingService:
                     raise ValueError("Contract must be signed before funding.")
                 if not schedule_confirmed:
                     raise ValueError("Schedule confirmation required")
-                if loan.funded_payments.filter(status__in=["processing", "completed"]).exists():
+                if has_active_funding_attempt(loan):
                     raise ValueError("Funding already exists for this loan.")
+                # Clear leftover locks from a prior failed attempt so destination
+                # edits and retries stay consistent with funded-payment status.
+                assert_funding_configuration_editable(loan)
 
                 readiness = funding_configuration_ready(loan)
                 if (
@@ -1000,8 +1030,7 @@ class FundingConfigurationService:
                 "Account destinations can only be changed before funding is locked "
                 "(pending review through pending funding)."
             )
-        if loan.funding_destination_locked_at:
-            raise ValueError("Funding configuration is locked.")
+        assert_funding_configuration_editable(loan)
 
         from activity.services import actor_label, format_account_label, log_staff_action
 
