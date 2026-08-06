@@ -1112,6 +1112,15 @@ class LoanService:
         return payment
 
     DEFERRAL_FEE_AMOUNT = Decimal('35.00')
+    DEFERRAL_FEE_NOTE = 'Deferral fee $35'
+
+    @staticmethod
+    def is_deferral_fee_payment(payment: Payment) -> bool:
+        notes = (payment.notes or '').strip()
+        return (
+            payment.amount == LoanService.DEFERRAL_FEE_AMOUNT
+            and notes.startswith('Deferral fee')
+        )
 
     @staticmethod
     def _schedule_frequency_days(loan: Loan) -> int:
@@ -1135,23 +1144,12 @@ class LoanService:
 
     @staticmethod
     @transaction.atomic
-    def defer_scheduled_payment(
-        payment: Payment,
-        *,
-        fee_collection: str,
-        user=None,
-    ) -> tuple:
-        """Defer one open installment to the end of the schedule and charge $35.
+    def defer_scheduled_payment(payment: Payment, *, user=None) -> tuple:
+        """Defer one open installment to schedule end and add a $35 fee payment.
 
-        fee_collection:
-          - ``schedule``: create a scheduled $35 fee on the original payment date
-          - ``interac_paid``: create the $35 fee on that date and mark it paid (Interac)
+        The fee is always created as a normal scheduled Payment on the original
+        date; staff can mark that fee paid later (Interac / manual).
         """
-        if fee_collection not in ('schedule', 'interac_paid'):
-            raise ValueError(
-                'Choose how to collect the $35 deferral fee: schedule or interac_paid.'
-            )
-
         payment = Payment.objects.select_for_update().select_related(
             'loan', 'loan__customer', 'loan__formula'
         ).get(pk=payment.pk)
@@ -1168,6 +1166,9 @@ class LoanService:
 
         if payment.status not in ('scheduled', 'pending', 'failed', 'nsf'):
             raise ValueError('Only open schedule installments can be deferred.')
+
+        if LoanService.is_deferral_fee_payment(payment):
+            raise ValueError('Deferral fee payments cannot be deferred again.')
 
         if payment.collection_attempts.filter(status__in=['processing', 'completed']).exists():
             raise ValueError(
@@ -1211,31 +1212,20 @@ class LoanService:
         fee_payment = Payment.objects.create(
             loan=loan,
             amount=fee_amount,
-            type='etransfer' if fee_collection == 'interac_paid' else 'scheduled',
+            type='scheduled',
             status='scheduled',
             scheduled_date=previous_date,
-            notes='Deferral fee $35',
+            notes=LoanService.DEFERRAL_FEE_NOTE,
             created_by=user,
         )
-
-        if fee_collection == 'interac_paid':
-            fee_payment.status = 'completed'
-            fee_payment.processed_at = timezone.now()
-            fee_payment.reference = 'INTERAC-DEFERRAL-FEE'
-            fee_payment.save(update_fields=['status', 'processed_at', 'reference'])
-            loan.apply_payment(fee_amount, user=user)
 
         from activity.services import actor_label, log_staff_action
 
         actor = actor_label(user)
-        fee_mode = (
-            'marked paid via Interac'
-            if fee_collection == 'interac_paid'
-            else f'scheduled on {previous_date}'
-        )
         detail = (
             f'Payment deferred by {actor}: installment ${previous_amount} moved from '
-            f'{previous_date} to {end_date}; $35 deferral fee {fee_mode}.'
+            f'{previous_date} to {end_date}; $35 deferral fee scheduled as payment on '
+            f'{previous_date}.'
         )
         log_staff_action(
             customer=loan.customer,
@@ -1251,10 +1241,81 @@ class LoanService:
                 'previous_date': str(previous_date),
                 'new_date': str(end_date),
                 'fee_amount': str(fee_amount),
-                'fee_collection': fee_collection,
                 'frequency_days': frequency_days,
             },
         )
         payment.refresh_from_db()
         fee_payment.refresh_from_db()
         return payment, fee_payment
+
+    @staticmethod
+    @transaction.atomic
+    def mark_deferral_fee_paid(
+        payment: Payment,
+        *,
+        method: str = 'etransfer',
+        reference: str = '',
+        user=None,
+    ) -> Payment:
+        """Mark a $35 deferral-fee Payment as paid (Interac or manual)."""
+        if method not in ('etransfer', 'manual'):
+            raise ValueError('Fee payment method must be etransfer or manual.')
+
+        payment = Payment.objects.select_for_update().select_related(
+            'loan', 'loan__customer'
+        ).get(pk=payment.pk)
+
+        if not LoanService.is_deferral_fee_payment(payment):
+            raise ValueError('Only the $35 deferral fee payment can be marked paid here.')
+
+        if payment.status == 'completed':
+            raise ValueError('This deferral fee is already marked paid.')
+
+        if payment.status not in ('scheduled', 'pending', 'failed', 'nsf'):
+            raise ValueError('This deferral fee cannot be marked paid in its current status.')
+
+        if payment.collection_attempts.filter(status__in=['processing', 'completed']).exists():
+            raise ValueError(
+                'This deferral fee has an active collection and cannot be marked paid manually.'
+            )
+
+        payment.type = method
+        payment.status = 'completed'
+        payment.processed_at = timezone.now()
+        payment.failure_reason = None
+        payment.reference = (reference or '').strip() or (
+            'INTERAC-DEFERRAL-FEE' if method == 'etransfer' else 'MANUAL-DEFERRAL-FEE'
+        )
+        payment.save(update_fields=[
+            'type',
+            'status',
+            'processed_at',
+            'failure_reason',
+            'reference',
+        ])
+        payment.loan.apply_payment(payment.amount, user=user)
+
+        from activity.services import actor_label, log_staff_action
+
+        actor = actor_label(user)
+        method_label = 'Interac' if method == 'etransfer' else 'manual'
+        log_staff_action(
+            customer=payment.loan.customer,
+            loan=payment.loan,
+            user=user,
+            type_value='payment_completed',
+            title='Deferral Fee Marked Paid',
+            description=(
+                f'$35 deferral fee marked paid ({method_label}) by {actor} '
+                f'for {payment.scheduled_date}.'
+            ),
+            metadata={
+                'action': 'mark_deferral_fee_paid',
+                'payment_id': str(payment.id),
+                'method': method,
+                'amount': str(payment.amount),
+                'reference': payment.reference,
+            },
+        )
+        payment.refresh_from_db()
+        return payment

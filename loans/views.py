@@ -47,6 +47,7 @@ from .serializers import (
     LoanScheduleAdjustSerializer,
     PaymentScheduleItemUpdateSerializer,
     PaymentDeferSerializer,
+    PaymentMarkPaidSerializer,
     LoanDeclineSerializer,
     LoanFundSerializer,
     LoanFundingConfigurationSerializer,
@@ -884,14 +885,13 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def defer(self, request, pk=None):
-        """Move installment to schedule end and collect the mandatory $35 deferral fee."""
+        """Move installment to schedule end and add a scheduled $35 fee payment."""
         payment = self.get_object()
-        serializer = PaymentDeferSerializer(data=request.data)
+        serializer = PaymentDeferSerializer(data=request.data or {})
         serializer.is_valid(raise_exception=True)
         try:
             payment, fee_payment = LoanService.defer_scheduled_payment(
                 payment,
-                fee_collection=serializer.validated_data['fee_collection'],
                 user=request.user,
             )
         except ValueError as exc:
@@ -900,6 +900,23 @@ class PaymentViewSet(viewsets.ModelViewSet):
             'payment': PaymentSerializer(payment).data,
             'deferral_fee': PaymentSerializer(fee_payment).data,
         })
+
+    @action(detail=True, methods=['post'], url_path='mark-paid')
+    def mark_paid(self, request, pk=None):
+        """Mark a $35 deferral-fee payment as paid (Interac or manual)."""
+        payment = self.get_object()
+        serializer = PaymentMarkPaidSerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+        try:
+            payment = LoanService.mark_deferral_fee_paid(
+                payment,
+                method=serializer.validated_data.get('method') or 'etransfer',
+                reference=serializer.validated_data.get('reference') or '',
+                user=request.user,
+            )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
+        return Response(PaymentSerializer(payment).data)
 
     @action(detail=True, methods=['post'])
     def complete(self, request, pk=None):

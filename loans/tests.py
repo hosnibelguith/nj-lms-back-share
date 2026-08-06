@@ -654,11 +654,7 @@ class ZumRailsWorkflowTests(APITestCase):
         second_date = second.scheduled_date
         third_date = third.scheduled_date
 
-        response = self.client.post(
-            f"/api/payments/{first.id}/defer/",
-            {"fee_collection": "schedule"},
-            format="json",
-        )
+        response = self.client.post(f"/api/payments/{first.id}/defer/", {}, format="json")
 
         self.assertEqual(response.status_code, 200, response.data)
         first.refresh_from_db()
@@ -679,42 +675,32 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(fee.type, "scheduled")
         self.assertEqual(response.data["deferral_fee"]["id"], str(fee.id))
 
-    def test_defer_scheduled_payment_marks_fee_paid_via_interac(self):
+    def test_mark_deferral_fee_paid_via_interac(self):
         payment = Payment.objects.create(
             loan=self.loan,
             amount=Decimal("100.00"),
             scheduled_date=timezone.localdate(),
             status="scheduled",
         )
-        later = Payment.objects.create(
-            loan=self.loan,
-            amount=Decimal("100.00"),
-            scheduled_date=timezone.localdate() + timedelta(days=14),
-            status="scheduled",
-        )
-        original_balance = self.loan.balance
+        defer = self.client.post(f"/api/payments/{payment.id}/defer/", {}, format="json")
+        self.assertEqual(defer.status_code, 200, defer.data)
+        fee_id = defer.data["deferral_fee"]["id"]
+        balance_after_defer = Loan.objects.get(pk=self.loan.pk).balance
 
         response = self.client.post(
-            f"/api/payments/{payment.id}/defer/",
-            {"fee_collection": "interac_paid"},
+            f"/api/payments/{fee_id}/mark-paid/",
+            {"method": "etransfer"},
             format="json",
         )
 
         self.assertEqual(response.status_code, 200, response.data)
-        payment.refresh_from_db()
-        later.refresh_from_db()
+        fee = Payment.objects.get(pk=fee_id)
         self.loan.refresh_from_db()
-
-        self.assertEqual(payment.scheduled_date, later.scheduled_date + timedelta(days=14))
-        fee = self.loan.payments.get(notes__icontains="Deferral fee")
-        self.assertEqual(fee.amount, Decimal("35.00"))
         self.assertEqual(fee.status, "completed")
         self.assertEqual(fee.type, "etransfer")
-        self.assertEqual(fee.scheduled_date, timezone.localdate())
-        # Fee charged then immediately paid — balance unchanged.
-        self.assertEqual(self.loan.balance, original_balance)
+        self.assertEqual(self.loan.balance, balance_after_defer - Decimal("35.00"))
 
-    def test_defer_scheduled_payment_requires_fee_collection(self):
+    def test_mark_paid_rejects_non_deferral_fee(self):
         payment = Payment.objects.create(
             loan=self.loan,
             amount=Decimal("100.00"),
@@ -722,9 +708,14 @@ class ZumRailsWorkflowTests(APITestCase):
             status="scheduled",
         )
 
-        response = self.client.post(f"/api/payments/{payment.id}/defer/", {}, format="json")
+        response = self.client.post(
+            f"/api/payments/{payment.id}/mark-paid/",
+            {"method": "manual"},
+            format="json",
+        )
 
         self.assertEqual(response.status_code, 400)
+        self.assertIn("deferral fee", response.data["error"])
 
     def test_defer_scheduled_payment_rejects_completed(self):
         payment = Payment.objects.create(
@@ -735,11 +726,7 @@ class ZumRailsWorkflowTests(APITestCase):
             processed_at=timezone.now(),
         )
 
-        response = self.client.post(
-            f"/api/payments/{payment.id}/defer/",
-            {"fee_collection": "schedule"},
-            format="json",
-        )
+        response = self.client.post(f"/api/payments/{payment.id}/defer/", {}, format="json")
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("deferred", response.data["error"])

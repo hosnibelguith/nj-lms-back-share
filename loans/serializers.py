@@ -105,6 +105,7 @@ class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
     method = serializers.CharField(source='get_type_display', read_only=True)
     balance_after = serializers.SerializerMethodField()
     original_amount = serializers.SerializerMethodField()
+    is_deferral_fee = serializers.SerializerMethodField()
 
     class Meta:
         model = Payment
@@ -120,11 +121,17 @@ class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
             'reference',
             'method',
             'balance_after',
+            'is_deferral_fee',
+            'notes',
         ]
 
     def get_original_amount(self, obj):
         """Installment amount before the current edit session (defaults to amount)."""
         return obj.amount
+
+    def get_is_deferral_fee(self, obj):
+        from .services import LoanService
+        return LoanService.is_deferral_fee_payment(obj)
 
     def get_balance_after(self, obj):
         """
@@ -607,8 +614,17 @@ class PaymentScheduleItemUpdateSerializer(serializers.Serializer):
 
 
 class PaymentDeferSerializer(serializers.Serializer):
-    """Defer an installment and collect the mandatory $35 deferral fee."""
-    fee_collection = serializers.ChoiceField(choices=['schedule', 'interac_paid'])
+    """Body is optional; defer always creates a scheduled $35 fee payment."""
+
+
+class PaymentMarkPaidSerializer(serializers.Serializer):
+    """Mark a $35 deferral-fee payment as paid."""
+    method = serializers.ChoiceField(
+        choices=['etransfer', 'manual'],
+        required=False,
+        default='etransfer',
+    )
+    reference = serializers.CharField(required=False, allow_blank=True)
 
 
 class LoanFundSerializer(serializers.Serializer):
