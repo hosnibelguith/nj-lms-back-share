@@ -433,11 +433,38 @@ class CommunicationViewSet(viewsets.ModelViewSet):
         return Response(CommunicationSerializer(communication).data, status=status.HTTP_201_CREATED)
 
 
+# Name-based lookups used by loan/account workflow automation — keep these intact.
+WORKFLOW_TEMPLATE_NAMES = frozenset({
+    'Deny Template',
+    'Fund/Approve Template',
+    'We Have Received Your Request Template',
+    'IBV Reminder Template',
+    'Contract Signature Reminder Template',
+})
+
+
 class CommunicationTemplateViewSet(viewsets.ModelViewSet):
     """ViewSet for managing communication templates."""
     queryset = CommunicationTemplate.objects.all()
     serializer_class = CommunicationTemplateSerializer
     permission_classes = [permissions.IsAuthenticated]
+    # Full list is small and used by the composer dropdown — avoid page truncation.
+    pagination_class = None
+
+    def destroy(self, request, *args, **kwargs):
+        template = self.get_object()
+        if template.name in WORKFLOW_TEMPLATE_NAMES:
+            return Response(
+                {
+                    'error': (
+                        'This template is used by loan workflow automation and '
+                        'cannot be deleted. Deactivate it only if you intend to '
+                        'stop those automated messages.'
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().destroy(request, *args, **kwargs)
     
     def get_queryset(self):
         queryset = CommunicationTemplate.objects.all()
@@ -451,6 +478,18 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
         trigger = self.request.query_params.get('trigger')
         if trigger:
             queryset = queryset.filter(trigger=trigger)
+
+        hot_key = (self.request.query_params.get('hot_key') or '').strip()
+        if hot_key:
+            queryset = queryset.filter(hot_key__iexact=hot_key)
+
+        search = (self.request.query_params.get('search') or '').strip()
+        if search:
+            queryset = queryset.filter(
+                Q(name__icontains=search) |
+                Q(subject__icontains=search) |
+                Q(hot_key__icontains=search)
+            )
         
         # Filter active only
         active_only = self.request.query_params.get('active_only', 'true')
@@ -458,6 +497,26 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(is_active=True)
         
         return queryset
+
+    @action(detail=False, methods=['get'], url_path='by-hot-key')
+    def by_hot_key(self, request):
+        """Resolve a single active template by Hot Key code."""
+        hot_key = (request.query_params.get('hot_key') or '').strip()
+        if not hot_key:
+            return Response(
+                {'error': 'hot_key is required'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        template = CommunicationTemplate.objects.filter(
+            hot_key__iexact=hot_key,
+            is_active=True,
+        ).first()
+        if not template:
+            return Response(
+                {'error': 'Template not found for that Hot Key.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(CommunicationTemplateSerializer(template).data)
     
     @action(detail=True, methods=['post'])
     def preview(self, request, pk=None):
@@ -487,7 +546,7 @@ class CommunicationTemplateViewSet(viewsets.ModelViewSet):
             try:
                 loan = Loan.objects.get(id=loan_id)
                 context.update({
-                    'loan_amount': str(loan.amount),
+                    'loan_amount': str(loan.principal),
                     'loan_balance': str(loan.balance),
                     'loan_type': loan.type,
                 })

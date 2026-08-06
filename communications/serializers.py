@@ -128,10 +128,16 @@ class CommunicationTemplateSerializer(serializers.ModelSerializer):
         model = CommunicationTemplate
         fields = [
             'id', 'name', 'type', 'type_display', 'trigger', 'trigger_display',
-            'subject', 'content', 'html_content', 'is_active',
+            'hot_key', 'subject', 'content', 'html_content', 'is_active',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate_hot_key(self, value):
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
 
 
 class PreviewTemplateSerializer(serializers.Serializer):

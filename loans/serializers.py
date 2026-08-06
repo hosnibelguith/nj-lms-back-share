@@ -403,6 +403,8 @@ class LoanListSerializer(serializers.ModelSerializer):
     ibv_status = serializers.SerializerMethodField()
     ibv_status_display = serializers.SerializerMethodField()
     contract_signed = serializers.SerializerMethodField()
+    has_funding_failure = serializers.SerializerMethodField()
+    funding_failure_reason = serializers.SerializerMethodField()
 
     class Meta:
         model = Loan
@@ -434,6 +436,8 @@ class LoanListSerializer(serializers.ModelSerializer):
             'contract_signed',
             'contract_signed_at',
             'is_active',
+            'has_funding_failure',
+            'funding_failure_reason',
             'created_at',
         ]
 
@@ -472,6 +476,25 @@ class LoanListSerializer(serializers.ModelSerializer):
 
     def get_contract_signed(self, obj):
         return obj.contract_signed
+
+    def get_has_funding_failure(self, obj):
+        # Only surface on loans still awaiting funding (not after a later success).
+        if obj.status != 'pending_funding':
+            return False
+        status_value = getattr(obj, 'funding_failure_status', None)
+        reason = getattr(obj, 'funding_failure_reason', None)
+        return bool(status_value or reason)
+
+    def get_funding_failure_reason(self, obj):
+        if obj.status != 'pending_funding':
+            return None
+        reason = getattr(obj, 'funding_failure_reason', None)
+        status_value = getattr(obj, 'funding_failure_status', None)
+        if reason:
+            return reason
+        if status_value:
+            return str(status_value).capitalize()
+        return None
 
 
 class LoanCreateSerializer(serializers.ModelSerializer):

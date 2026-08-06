@@ -16,8 +16,8 @@ class CommunicationAdmin(admin.ModelAdmin):
 
 @admin.register(CommunicationTemplate)
 class CommunicationTemplateAdmin(admin.ModelAdmin):
-    list_display = ("name", "type", "trigger", "is_active", "created_at")
+    list_display = ("name", "hot_key", "type", "trigger", "is_active", "created_at")
     list_filter = ("type", "trigger", "is_active", "created_at")
-    search_fields = ("name", "subject")
+    search_fields = ("name", "subject", "hot_key")
     ordering = ("name",)
     readonly_fields = ("id", "created_at", "updated_at")

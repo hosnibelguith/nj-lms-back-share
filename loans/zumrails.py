@@ -383,7 +383,12 @@ def apply_funded_payment_zum_status(
                 "system",
                 "Funding Returned",
                 display_reason,
-                metadata={"funded_payment_id": str(funding.id)},
+                metadata={
+                    "funded_payment_id": str(funding.id),
+                    "staff_alert": True,
+                    "alert_kind": "funding_failure",
+                    "failure_reason": display_reason,
+                },
             )
         else:
             funding.save(update_fields=["zum_status", "updated_at"])
@@ -408,7 +413,12 @@ def apply_funded_payment_zum_status(
                 "system",
                 "Funding Cancelled",
                 display_reason,
-                metadata={"funded_payment_id": str(funding.id)},
+                metadata={
+                    "funded_payment_id": str(funding.id),
+                    "staff_alert": True,
+                    "alert_kind": "funding_failure",
+                    "failure_reason": display_reason,
+                },
             )
         else:
             funding.save(update_fields=["zum_status", "failure_reason", "updated_at"])
@@ -425,7 +435,12 @@ def apply_funded_payment_zum_status(
                 "system",
                 "Funding Failed",
                 display_reason,
-                metadata={"funded_payment_id": str(funding.id)},
+                metadata={
+                    "funded_payment_id": str(funding.id),
+                    "staff_alert": True,
+                    "alert_kind": "funding_failure",
+                    "failure_reason": display_reason,
+                },
             )
         else:
             funding.failure_reason = display_reason

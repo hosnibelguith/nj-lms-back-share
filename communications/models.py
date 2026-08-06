@@ -131,6 +131,14 @@ class CommunicationTemplate(models.Model):
     name = models.CharField(max_length=255)
     type = models.CharField(max_length=10, choices=TYPE_CHOICES)
     trigger = models.CharField(max_length=50, choices=TRIGGER_CHOICES, default='manual')
+    # Short staff shortcut (e.g. "061") for Hot Key lookup in the composer.
+    hot_key = models.CharField(
+        max_length=20,
+        blank=True,
+        null=True,
+        unique=True,
+        help_text="Optional shortcut code for staff Hot Key selection (e.g. 061).",
+    )
     
     # Email specific
     subject = models.CharField(max_length=500, blank=True, null=True)

@@ -7,7 +7,7 @@ from rest_framework.response import Response
 
 from django.utils import timezone
 from django.utils.dateparse import parse_date
-from django.db.models import Q, Sum, Count, F, Value, CharField
+from django.db.models import Q, Sum, Count, F, Value, CharField, Exists, OuterRef, Subquery
 from django.db.models.functions import TruncDate, Concat
 
 from banking.models import BankAccount
@@ -136,6 +136,35 @@ class LoanViewSet(viewsets.ModelViewSet):
     # -------------------------
     # QUERY FILTERING
     # -------------------------
+    TERMINAL_FUNDING_FAILURE_STATUSES = ('failed', 'returned', 'cancelled')
+
+    @staticmethod
+    def _exclude_active_funding(qs):
+        """Hide loans that already have funding processing/completed at Zūm."""
+        active_funding = FundedPayment.objects.filter(
+            loan_id=OuterRef('pk'),
+            status__in=['processing', 'completed'],
+        )
+        return qs.exclude(Exists(active_funding))
+
+    @classmethod
+    def _failed_funding_exists(cls):
+        return FundedPayment.objects.filter(
+            loan_id=OuterRef('pk'),
+            status__in=cls.TERMINAL_FUNDING_FAILURE_STATUSES,
+        )
+
+    @classmethod
+    def _annotate_funding_failure(cls, qs):
+        latest_failed = FundedPayment.objects.filter(
+            loan_id=OuterRef('pk'),
+            status__in=cls.TERMINAL_FUNDING_FAILURE_STATUSES,
+        ).order_by('-created_at')
+        return qs.annotate(
+            funding_failure_reason=Subquery(latest_failed.values('failure_reason')[:1]),
+            funding_failure_status=Subquery(latest_failed.values('status')[:1]),
+        )
+
     def _filtered_queryset(self, *, ignore_status=False):
         qs = super().get_queryset()
 
@@ -146,6 +175,14 @@ class LoanViewSet(viewsets.ModelViewSet):
                 qs = qs.filter(status=statuses[0])
             elif statuses:
                 qs = qs.filter(status__in=statuses)
+            # Pending Funding tab = still needs funding (not already sent / in progress).
+            if statuses == ['pending_funding']:
+                qs = self._exclude_active_funding(qs)
+
+        needs_retry = (self.request.query_params.get('needs_funding_retry') or '').strip().lower()
+        if needs_retry in ('true', '1', 'yes'):
+            qs = qs.filter(status='pending_funding').filter(Exists(self._failed_funding_exists()))
+            qs = self._exclude_active_funding(qs)
 
         ai_decision_param = self.request.query_params.get('ai_decision')
         if ai_decision_param:
@@ -277,7 +314,9 @@ class LoanViewSet(viewsets.ModelViewSet):
         return qs
 
     def get_queryset(self):
-        return self._filtered_queryset(ignore_status=False)
+        return self._annotate_funding_failure(
+            self._filtered_queryset(ignore_status=False)
+        )
 
     @action(detail=False, methods=['get'], url_path='status-summary')
     def status_summary(self, request):
@@ -291,12 +330,20 @@ class LoanViewSet(viewsets.ModelViewSet):
             row['status']: row['count']
             for row in qs.values('status').annotate(count=Count('id'))
         }
+        pending_funding_qs = self._exclude_active_funding(
+            qs.filter(status='pending_funding')
+        )
+        pending_funding_count = pending_funding_qs.count()
+        funding_failed_count = pending_funding_qs.filter(
+            Exists(self._failed_funding_exists())
+        ).count()
 
         return Response({
             'ibv_pending': by_status.get('ibv_pending', 0),
             'pending': by_status.get('pending', 0),
             'pending_signature': by_status.get('pending_signature', 0),
-            'pending_funding': by_status.get('pending_funding', 0),
+            'pending_funding': pending_funding_count,
+            'funding_failed': funding_failed_count,
             'active': by_status.get('active', 0),
             'declined': by_status.get('human_declined', 0),
             'paid_off': by_status.get('paid_off', 0),

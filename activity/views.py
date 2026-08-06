@@ -1,12 +1,21 @@
 # activity/views.py
+from datetime import timedelta
+
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.db.models import Q
+from django.utils import timezone
 from .models import ActivityHistory, Comment
 from .serializers import (
     ActivityHistorySerializer, ActivityHistoryCreateSerializer,
     CommentSerializer, CommentCreateSerializer
+)
+
+FUNDING_ALERT_TITLES = (
+    'Funding Failed',
+    'Funding Returned',
+    'Funding Cancelled',
 )
 
 
@@ -62,6 +71,28 @@ class ActivityHistoryViewSet(viewsets.ModelViewSet):
     
     def perform_create(self, serializer):
         serializer.save(created_by=str(self.request.user.id))
+
+    @action(detail=False, methods=['get'], url_path='funding-alerts')
+    def funding_alerts(self, request):
+        """Recent funding failure/return/cancel events for the staff notification bell."""
+        try:
+            limit = min(int(request.query_params.get('limit', 30)), 100)
+        except (TypeError, ValueError):
+            limit = 30
+        try:
+            days = min(int(request.query_params.get('days', 14)), 60)
+        except (TypeError, ValueError):
+            days = 14
+
+        qs = (
+            ActivityHistory.objects.filter(
+                title__in=FUNDING_ALERT_TITLES,
+                created_at__gte=timezone.now() - timedelta(days=days),
+            )
+            .select_related('customer', 'loan')
+            .order_by('-created_at')[:limit]
+        )
+        return Response(ActivityHistorySerializer(qs, many=True).data)
     
     @action(detail=False, methods=['get'])
     def timeline(self, request):

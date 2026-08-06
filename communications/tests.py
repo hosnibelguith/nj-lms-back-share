@@ -451,3 +451,79 @@ class SendSmsEndpointTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn('opted out', response.data['error'])
         self.assertFalse(Communication.objects.filter(type='sms').exists())
+
+
+class CommunicationTemplateApiTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.staff = User.objects.create_user(
+            email='template-staff@example.com',
+            password='password123',
+            full_name='Template Staff',
+            user_type='staff',
+            is_staff=True,
+        )
+        self.customer = Customer.objects.create(
+            first_name='Shane',
+            last_name='Cote',
+            email='shane@example.com',
+            phone='4165557777',
+            phone_normalized='4165557777',
+            province='ON',
+            status='pending',
+        )
+        from communications.models import CommunicationTemplate
+        self.template, _ = CommunicationTemplate.objects.update_or_create(
+            name='Template API Test Email',
+            type='email',
+            defaults={
+                'trigger': 'manual',
+                'hot_key': '099',
+                'subject': 'Funds sent',
+                'content': 'Hi {{customer_first_name}}, funds were sent by EFT.',
+                'is_active': True,
+            },
+        )
+        self.client.force_authenticate(self.staff)
+
+    def test_list_includes_hot_key_and_supports_lookup(self):
+        listed = self.client.get('/api/communication-templates/', {'type': 'email'})
+        self.assertEqual(listed.status_code, 200)
+        self.assertTrue(isinstance(listed.data, list))
+        names = {row['name'] for row in listed.data}
+        self.assertIn('Template API Test Email', names)
+
+        by_key = self.client.get(
+            '/api/communication-templates/by-hot-key/',
+            {'hot_key': '099'},
+        )
+        self.assertEqual(by_key.status_code, 200)
+        self.assertEqual(by_key.data['id'], str(self.template.id))
+        self.assertEqual(by_key.data['hot_key'], '099')
+
+    def test_preview_renders_customer_placeholders(self):
+        response = self.client.post(
+            f'/api/communication-templates/{self.template.id}/preview/',
+            {'customer_id': str(self.customer.id)},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('Shane', response.data['content'])
+        self.assertEqual(response.data['subject'], 'Funds sent')
+
+    def test_create_normalizes_blank_hot_key(self):
+        response = self.client.post(
+            '/api/communication-templates/',
+            {
+                'name': 'Custom Manual',
+                'type': 'email',
+                'trigger': 'manual',
+                'hot_key': '   ',
+                'subject': 'Hello',
+                'content': 'Body',
+                'is_active': True,
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertIsNone(response.data['hot_key'])

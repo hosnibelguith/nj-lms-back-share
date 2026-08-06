@@ -1018,6 +1018,8 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertIsNone(self.loan.funded_at)
 
     def test_funding_failure_webhook_stores_zum_reason_and_allows_retry(self):
+        from activity.models import ActivityHistory
+
         funding = FundedPayment.objects.create(
             loan=self.loan,
             amount=self.loan.principal,
@@ -1048,6 +1050,13 @@ class ZumRailsWorkflowTests(APITestCase):
             "Funding already exists for this loan.",
             readiness["blockers"],
         )
+        alert = ActivityHistory.objects.filter(
+            loan=self.loan,
+            title="Funding Failed",
+        ).latest("created_at")
+        self.assertEqual(alert.description, "EftFailedInsufficientFunds")
+        self.assertTrue(alert.metadata.get("staff_alert"))
+        self.assertEqual(alert.metadata.get("alert_kind"), "funding_failure")
 
     @patch("loans.zumrails.ZumRailsService.get_transaction")
     def test_funding_options_syncs_failed_zum_status_and_unlocks_retry(self, mock_get_tx):
@@ -1074,6 +1083,101 @@ class ZumRailsWorkflowTests(APITestCase):
         )
         self.assertEqual(self.loan.funded_payments.get().status, "failed")
         mock_get_tx.assert_called_once_with("662cec6c-f516-45ee-adad-c9fb660cf558")
+
+    def test_pending_funding_list_excludes_loans_with_active_funding(self):
+        FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="eft",
+            status="processing",
+            processor_transaction_id="in-progress-tx-1",
+            zum_status="InProgress",
+        )
+        still_needs_funding = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("200.00"),
+            fee=Decimal("40.00"),
+            total_amount=Decimal("240.00"),
+            balance=Decimal("240.00"),
+            status="pending_funding",
+            contract_signed_at=timezone.now(),
+            bank_account=self.account,
+            collections_account=self.account,
+        )
+
+        listed = self.client.get("/api/loans/", {"status": "pending_funding"})
+        self.assertEqual(listed.status_code, 200)
+        listed_ids = {row["id"] for row in listed.data["results"]}
+        self.assertNotIn(str(self.loan.id), listed_ids)
+        self.assertIn(str(still_needs_funding.id), listed_ids)
+
+        summary = self.client.get("/api/loans/status-summary/")
+        self.assertEqual(summary.status_code, 200)
+        self.assertEqual(summary.data["pending_funding"], 1)
+
+    def test_funding_failure_list_alerts_and_retry_filter(self):
+        from activity.models import ActivityHistory
+
+        FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="eft",
+            status="failed",
+            processor_transaction_id="funding-fail-list-1",
+            zum_status="Failed",
+            failure_reason="EftFailedInsufficientFunds",
+        )
+        ActivityHistory.objects.create(
+            customer=self.customer,
+            loan=self.loan,
+            type="system",
+            title="Funding Failed",
+            description="EftFailedInsufficientFunds",
+            created_by="system",
+            metadata={
+                "staff_alert": True,
+                "alert_kind": "funding_failure",
+                "failure_reason": "EftFailedInsufficientFunds",
+            },
+        )
+        clean_pending = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("200.00"),
+            fee=Decimal("40.00"),
+            total_amount=Decimal("240.00"),
+            balance=Decimal("240.00"),
+            status="pending_funding",
+            contract_signed_at=timezone.now(),
+            bank_account=self.account,
+            collections_account=self.account,
+        )
+
+        listed = self.client.get("/api/loans/", {"needs_funding_retry": "true"})
+        self.assertEqual(listed.status_code, 200)
+        listed_ids = {row["id"] for row in listed.data["results"]}
+        self.assertIn(str(self.loan.id), listed_ids)
+        self.assertNotIn(str(clean_pending.id), listed_ids)
+
+        failed_row = next(
+            row for row in listed.data["results"] if row["id"] == str(self.loan.id)
+        )
+        self.assertTrue(failed_row["has_funding_failure"])
+        self.assertEqual(failed_row["funding_failure_reason"], "EftFailedInsufficientFunds")
+
+        summary = self.client.get("/api/loans/status-summary/")
+        self.assertEqual(summary.status_code, 200)
+        self.assertEqual(summary.data["funding_failed"], 1)
+        self.assertEqual(summary.data["pending_funding"], 2)
+
+        alerts = self.client.get("/api/activities/funding-alerts/")
+        self.assertEqual(alerts.status_code, 200)
+        self.assertGreaterEqual(len(alerts.data), 1)
+        self.assertEqual(alerts.data[0]["title"], "Funding Failed")
+        self.assertEqual(alerts.data[0]["description"], "EftFailedInsufficientFunds")
+        self.assertEqual(
+            alerts.data[0]["metadata"].get("failure_reason"),
+            "EftFailedInsufficientFunds",
+        )
 
     def test_funding_cancelled_webhook_unlocks_fund_customer(self):
         funding = FundedPayment.objects.create(
