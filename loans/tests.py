@@ -768,7 +768,7 @@ class ZumRailsWorkflowTests(APITestCase):
         )
 
         self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.data["error"], "Funding already exists for this loan.")
+        self.assertIn("Funding already exists for this loan.", response.data["error"])
 
     def test_database_constraint_blocks_concurrent_active_funding(self):
         FundedPayment.objects.create(
@@ -849,8 +849,33 @@ class ZumRailsWorkflowTests(APITestCase):
             format="json",
         )
         self.assertEqual(duplicate.status_code, 400)
-        self.assertEqual(duplicate.data["error"], "Funding already exists for this loan.")
+        self.assertIn("Previous funding attempt did not complete at Zūm", duplicate.data["error"])
+        self.assertIn("request outcome unknown", duplicate.data["error"])
         self.assertEqual(mock_send.call_count, 1)
+
+        options = self.client.get(f"/api/loans/{self.loan.id}/funding/options/")
+        self.assertEqual(options.status_code, 200)
+        self.assertTrue(options.data["can_release_stuck_funding"])
+        self.assertEqual(options.data["active_funding_failure_reason"], "request outcome unknown")
+
+        release = self.client.post(
+            f"/api/loans/{self.loan.id}/funding/release-stuck/",
+            {},
+            format="json",
+        )
+        self.assertEqual(release.status_code, 200, release.data)
+        funding.refresh_from_db()
+        self.assertEqual(funding.status, "failed")
+        self.assertIn("Released for retry", funding.failure_reason)
+
+        retry = self.client.post(
+            f"/api/loans/{self.loan.id}/funding/initiate/",
+            {"method": "eft", "schedule_confirmed": True, "override_confirmed": True},
+            format="json",
+        )
+        # Still mocked to unknown outcome for initiate_transaction — expect 502, not 400 block.
+        self.assertEqual(retry.status_code, 502)
+        self.assertEqual(mock_send.call_count, 2)
 
     @patch(
         "loans.zumrails.ZumRailsService.initiate_transaction",

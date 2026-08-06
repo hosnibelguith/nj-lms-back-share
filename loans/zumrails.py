@@ -239,6 +239,52 @@ def has_active_funding_attempt(loan: Loan) -> bool:
     return loan.funded_payments.filter(status__in=["processing", "completed"]).exists()
 
 
+def get_active_funding_attempt(loan: Loan) -> FundedPayment | None:
+    return (
+        loan.funded_payments.filter(status__in=["processing", "completed"])
+        .order_by("-created_at")
+        .first()
+    )
+
+
+def is_unsubmitted_funding_attempt(funding: FundedPayment) -> bool:
+    """True when an attempt is still `processing` but Zūm never assigned a tx id."""
+    return (
+        funding.status == "processing"
+        and not (funding.processor_transaction_id or "").strip()
+    )
+
+
+def active_funding_block_message(loan: Loan) -> str | None:
+    """Human-readable funding block including Zūm failure/status when available."""
+    attempt = get_active_funding_attempt(loan)
+    if not attempt:
+        return None
+    if attempt.status == "completed":
+        return "Funding already exists for this loan."
+
+    zum_reason = (attempt.failure_reason or attempt.zum_status or "").strip()
+    if is_unsubmitted_funding_attempt(attempt):
+        if zum_reason:
+            return (
+                f"Previous funding attempt did not complete at Zūm: {zum_reason}. "
+                "Release the stuck attempt to fund again."
+            )
+        return (
+            "A funding attempt is stuck before Zūm accepted it. "
+            "Release the stuck attempt to fund again."
+        )
+    if zum_reason:
+        return f"Funding already exists for this loan. Zūm reason: {zum_reason}."
+    tx_id = (attempt.processor_transaction_id or "").strip()
+    if tx_id:
+        return (
+            f"Funding already exists for this loan. "
+            f"Zūm transaction {tx_id} is still processing."
+        )
+    return "Funding already exists for this loan."
+
+
 def assert_funding_configuration_editable(loan: Loan) -> None:
     """Locks only apply while money may be moving.
 
@@ -271,12 +317,14 @@ def funding_configuration_ready(loan: Loan) -> dict:
     collections_configured = bool(collections_account)
     blockers = []
     arrive_loan = is_arrive_funded_loan(loan)
+    active_funding = get_active_funding_attempt(loan)
     if loan.status != "pending_funding":
         blockers.append("Loan is not pending funding.")
     if not loan.contract_signed:
         blockers.append("Contract must be signed before funding.")
-    if has_active_funding_attempt(loan):
-        blockers.append("Funding already exists for this loan.")
+    funding_block = active_funding_block_message(loan)
+    if funding_block:
+        blockers.append(funding_block)
     if not arrive_loan:
         # A loan is funded by EFT or by e-Transfer, never both, so only one
         # destination is needed here. initiate() enforces the chosen method.
@@ -306,11 +354,22 @@ def funding_configuration_ready(loan: Loan) -> dict:
                 f"Funding account: {payment_blocked_message(eft_account.institution_number)}"
             )
 
+    active_reason = None
+    if active_funding:
+        active_reason = (
+            (active_funding.failure_reason or active_funding.zum_status or "").strip()
+            or None
+        )
     return {
         "emt_configured": emt_configured,
         "eft_configured": eft_configured,
         "collections_account_configured": collections_configured,
-        "has_active_funding": has_active_funding_attempt(loan),
+        "has_active_funding": bool(active_funding),
+        "can_release_stuck_funding": bool(
+            active_funding and is_unsubmitted_funding_attempt(active_funding)
+        ),
+        "active_funding_status": active_funding.status if active_funding else None,
+        "active_funding_failure_reason": active_reason,
         "arrive_external_funding": arrive_loan,
         "recommended_method_override": "card_issuance" if arrive_loan else None,
         "allowed_methods": (
@@ -829,8 +888,9 @@ class FundingService:
                     raise ValueError("Contract must be signed before funding.")
                 if not schedule_confirmed:
                     raise ValueError("Schedule confirmation required")
-                if has_active_funding_attempt(loan):
-                    raise ValueError("Funding already exists for this loan.")
+                funding_block = active_funding_block_message(loan)
+                if funding_block:
+                    raise ValueError(funding_block)
                 # Clear leftover locks from a prior failed attempt so destination
                 # edits and retries stay consistent with funded-payment status.
                 assert_funding_configuration_editable(loan)
@@ -980,6 +1040,59 @@ class FundingService:
             },
         )
         FundingService._queue_funding_email(loan)
+        return funding
+
+    @staticmethod
+    @transaction.atomic
+    def release_stuck_funding(loan: Loan, *, user=None) -> FundedPayment:
+        """Mark an unsubmitted processing attempt failed so staff can fund again.
+
+        Only allowed when Zūm never returned a processor transaction id. Attempts
+        that already have a Zūm id stay blocked until a webhook settles them.
+        """
+        loan = Loan.objects.select_for_update().get(pk=loan.pk)
+        funding = (
+            FundedPayment.objects.select_for_update()
+            .filter(loan=loan, status="processing")
+            .order_by("-created_at")
+            .first()
+        )
+        if not funding:
+            raise ValueError("No stuck funding attempt to release.")
+        if not is_unsubmitted_funding_attempt(funding):
+            raise ValueError(
+                "Only funding attempts that never received a Zūm transaction id "
+                "can be released. Wait for the Zūm webhook or contact support."
+            )
+
+        reason = (funding.failure_reason or "").strip() or (
+            "Stuck funding attempt released for retry"
+        )
+        if "Released for retry" not in reason:
+            reason = f"{reason} (Released for retry)"
+        funding.status = "failed"
+        funding.failure_reason = reason
+        funding.save(update_fields=["status", "failure_reason", "updated_at"])
+        release_funding_locks(loan)
+
+        from activity.services import actor_label
+
+        actor = actor_label(user)
+        log_activity(
+            loan,
+            "system",
+            "Stuck Funding Released",
+            (
+                f"Stuck funding attempt released by {actor} so funding can be retried. "
+                f"Zūm reason: {funding.failure_reason}."
+            ),
+            created_by=getattr(user, "id", "system"),
+            metadata={
+                "funded_payment_id": str(funding.id),
+                "failure_reason": funding.failure_reason,
+                "loan_id": str(loan.id),
+            },
+        )
         return funding
 
     @staticmethod

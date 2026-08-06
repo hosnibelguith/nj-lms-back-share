@@ -511,6 +511,29 @@ class LoanViewSet(viewsets.ModelViewSet):
     def initiate_funding(self, request, pk=None):
         return self.fund(request, pk=pk)
 
+    @action(detail=True, methods=['post'], url_path='funding/release-stuck')
+    def release_stuck_funding(self, request, pk=None):
+        """Release an unsubmitted stuck funding attempt so staff can fund again."""
+        if not ManagerOrAdminPermission().has_permission(request, self):
+            return Response(
+                {'error': 'Only Manager or Admin can release stuck funding.'},
+                status=403,
+            )
+
+        loan = self.get_object()
+        try:
+            funding = FundingService.release_stuck_funding(loan, user=request.user)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
+
+        loan.refresh_from_db()
+        readiness = funding_configuration_ready(loan)
+        return Response({
+            'loan': LoanSerializer(loan).data,
+            'funded_payment': FundedPaymentSerializer(funding).data,
+            **readiness,
+        })
+
     @action(detail=True, methods=['get'], url_path='funding/options')
     def funding_options(self, request, pk=None):
         loan = self.get_object()
