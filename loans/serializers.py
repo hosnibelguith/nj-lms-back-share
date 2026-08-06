@@ -104,12 +104,14 @@ class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     method = serializers.CharField(source='get_type_display', read_only=True)
     balance_after = serializers.SerializerMethodField()
+    original_amount = serializers.SerializerMethodField()
 
     class Meta:
         model = Payment
         fields = [
             'id',
             'amount',
+            'original_amount',
             'status',
             'status_display',
             'scheduled_date',
@@ -119,6 +121,10 @@ class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
             'method',
             'balance_after',
         ]
+
+    def get_original_amount(self, obj):
+        """Installment amount before the current edit session (defaults to amount)."""
+        return obj.amount
 
     def get_balance_after(self, obj):
         """
@@ -579,6 +585,24 @@ class LoanScheduleAdjustSerializer(serializers.Serializer):
             raise serializers.ValidationError({
                 'number_of_payments': 'Number of payments is required when adjusting by payment count.'
             })
+        return attrs
+
+
+class PaymentScheduleItemUpdateSerializer(serializers.Serializer):
+    """Edit a single open installment (date and/or amount)."""
+    scheduled_date = serializers.DateField(required=False)
+    amount = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=Decimal('0.01'),
+        required=False,
+    )
+
+    def validate(self, attrs):
+        if attrs.get('scheduled_date') is None and attrs.get('amount') is None:
+            raise serializers.ValidationError(
+                'Provide scheduled_date and/or amount to update.'
+            )
         return attrs
 
 

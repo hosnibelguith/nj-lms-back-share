@@ -45,6 +45,7 @@ from .serializers import (
     LoanApproveSerializer,
     LoanAmountUpdateSerializer,
     LoanScheduleAdjustSerializer,
+    PaymentScheduleItemUpdateSerializer,
     LoanDeclineSerializer,
     LoanFundSerializer,
     LoanFundingConfigurationSerializer,
@@ -855,7 +856,30 @@ class PaymentViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         if self.action == 'create':
             return PaymentCreateSerializer
+        if self.action in ('update', 'partial_update'):
+            return PaymentScheduleItemUpdateSerializer
         return PaymentSerializer
+
+    def update(self, request, *args, **kwargs):
+        return self._update_schedule_item(request)
+
+    def partial_update(self, request, *args, **kwargs):
+        return self._update_schedule_item(request)
+
+    def _update_schedule_item(self, request):
+        payment = self.get_object()
+        serializer = PaymentScheduleItemUpdateSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        try:
+            payment = LoanService.update_scheduled_payment(
+                payment,
+                scheduled_date=serializer.validated_data.get('scheduled_date'),
+                amount=serializer.validated_data.get('amount'),
+                user=request.user,
+            )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
+        return Response(PaymentSerializer(payment).data)
 
     @action(detail=True, methods=['post'])
     def complete(self, request, pk=None):

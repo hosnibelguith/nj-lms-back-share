@@ -589,6 +589,47 @@ class ZumRailsWorkflowTests(APITestCase):
             ).exists()
         )
 
+    def test_update_scheduled_payment_date_and_amount(self):
+        payment = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+        )
+        new_date = timezone.localdate() + timedelta(days=10)
+
+        response = self.client.patch(
+            f"/api/payments/{payment.id}/",
+            {
+                "scheduled_date": new_date.isoformat(),
+                "amount": "125.50",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        payment.refresh_from_db()
+        self.assertEqual(payment.scheduled_date, new_date)
+        self.assertEqual(payment.amount, Decimal("125.50"))
+
+    def test_update_scheduled_payment_rejects_completed(self):
+        payment = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate(),
+            status="completed",
+            processed_at=timezone.now(),
+        )
+
+        response = self.client.patch(
+            f"/api/payments/{payment.id}/",
+            {"amount": "90.00"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("open schedule", response.data["error"])
+
     def test_duplicate_funding_is_blocked(self):
         FundedPayment.objects.create(
             loan=self.loan,

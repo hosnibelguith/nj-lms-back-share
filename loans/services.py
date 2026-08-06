@@ -1019,3 +1019,94 @@ class LoanService:
             current_date += timedelta(days=frequency_days)
         
         return payments
+
+    @staticmethod
+    @transaction.atomic
+    def update_scheduled_payment(
+        payment: Payment,
+        *,
+        scheduled_date=None,
+        amount: Decimal = None,
+        user=None,
+    ) -> Payment:
+        """Edit one open installment's date and/or amount without rebuilding the schedule."""
+        payment = Payment.objects.select_for_update().select_related('loan', 'loan__customer').get(
+            pk=payment.pk
+        )
+        loan = payment.loan
+
+        if loan.status not in [
+            'pending_signature',
+            'pending',
+            'pending_funding',
+            'active',
+            'defaulted',
+        ]:
+            raise ValueError(f'Cannot edit payments for loan in status: {loan.status}')
+
+        if payment.status not in ('scheduled', 'pending', 'failed', 'nsf'):
+            raise ValueError('Only open schedule installments can be edited.')
+
+        if payment.collection_attempts.filter(status__in=['processing', 'completed']).exists():
+            raise ValueError(
+                'This installment has an active collection and cannot be edited.'
+            )
+
+        if scheduled_date is None and amount is None:
+            raise ValueError('Select modify date and/or modify payment before saving.')
+
+        previous_date = payment.scheduled_date
+        previous_amount = payment.amount
+        update_fields = []
+
+        if scheduled_date is not None and scheduled_date != payment.scheduled_date:
+            payment.scheduled_date = scheduled_date
+            update_fields.append('scheduled_date')
+
+        if amount is not None:
+            amount = LoanService.money(amount)
+            if amount <= 0:
+                raise ValueError('Payment amount must be greater than zero.')
+            if amount != payment.amount:
+                payment.amount = amount
+                update_fields.append('amount')
+
+        if not update_fields:
+            return payment
+
+        # Failed/NSF rows that staff re-date or re-amount become collectible again.
+        if payment.status in ('failed', 'nsf'):
+            payment.status = 'scheduled'
+            payment.failure_reason = None
+            payment.processed_at = None
+            update_fields.extend(['status', 'failure_reason', 'processed_at'])
+
+        payment.save(update_fields=list(dict.fromkeys(update_fields)))
+
+        from activity.services import actor_label, log_staff_action
+
+        actor = actor_label(user)
+        changes = []
+        if 'scheduled_date' in update_fields:
+            changes.append(f'date {previous_date} → {payment.scheduled_date}')
+        if 'amount' in update_fields:
+            changes.append(f'amount ${previous_amount} → ${payment.amount}')
+        detail = f'Schedule installment updated by {actor}: {", ".join(changes)}.'
+        log_staff_action(
+            customer=loan.customer,
+            loan=loan,
+            user=user,
+            type_value='payment_scheduled',
+            title='Payment Installment Updated',
+            description=detail,
+            metadata={
+                'action': 'update_scheduled_payment',
+                'payment_id': str(payment.id),
+                'previous_date': str(previous_date),
+                'new_date': str(payment.scheduled_date),
+                'previous_amount': str(previous_amount),
+                'new_amount': str(payment.amount),
+                'original_amount': str(previous_amount),
+            },
+        )
+        return payment
