@@ -304,14 +304,51 @@ def is_zum_failed_status(status_value) -> bool:
     return isinstance(status_value, str) and "Failed" in status_value
 
 
+def normalize_zum_status(status_value: str | None) -> str | None:
+    """Normalize Zum status spelling so Cancelled/Canceled both close the attempt."""
+    if not status_value or not isinstance(status_value, str):
+        return None
+    value = status_value.strip()
+    if not value:
+        return None
+    aliases = {
+        "canceled": "Cancelled",
+        "cancelled": "Cancelled",
+        "returned": "Returned",
+        "rejected": "Rejected",
+        "completed": "Completed",
+        "failed": "Failed",
+        "inprogress": "InProgress",
+        "in progress": "InProgress",
+        "pending cancellation": "Pending Cancellation",
+        "pendingcancellation": "Pending Cancellation",
+    }
+    return aliases.get(value.lower(), value)
+
+
+def is_zum_cancelled_status(status_value) -> bool:
+    return normalize_zum_status(status_value) == "Cancelled"
+
+
+def is_terminal_zum_funding_status(status_value) -> bool:
+    """Statuses that must close the local attempt and allow Fund Customer again."""
+    normalized = normalize_zum_status(status_value)
+    if not normalized:
+        return False
+    return (
+        normalized in ("Returned", "Rejected", "Cancelled")
+        or is_zum_failed_status(normalized)
+    )
+
+
 def apply_funded_payment_zum_status(
     funding: FundedPayment,
     *,
     status_value: str | None,
     reason: str | None = None,
 ) -> FundedPayment:
-    """Apply a Zum transaction status to funding; unlocks retry on failed/returned."""
-    status_value = (status_value or "").strip() or None
+    """Apply a Zum transaction status to funding; unlocks retry on failed/returned/cancelled."""
+    status_value = normalize_zum_status(status_value)
     reason = (reason or "").strip() or None
     display_reason = reason or status_value or "Failed"
 
@@ -352,6 +389,31 @@ def apply_funded_payment_zum_status(
             funding.save(update_fields=["zum_status", "updated_at"])
         return funding
 
+    if status_value == "Cancelled":
+        # Terminal at Zum — no money moving; unlock so staff can fund again.
+        was_cancelled = funding.status == "cancelled"
+        funding.zum_status = status_value
+        funding.failure_reason = display_reason
+        if not was_cancelled:
+            funding.status = "cancelled"
+            funding.save(update_fields=[
+                "status",
+                "zum_status",
+                "failure_reason",
+                "updated_at",
+            ])
+            _reopen_loan_after_funding_failure_safe(funding)
+            log_activity(
+                funding.loan,
+                "system",
+                "Funding Cancelled",
+                display_reason,
+                metadata={"funded_payment_id": str(funding.id)},
+            )
+        else:
+            funding.save(update_fields=["zum_status", "failure_reason", "updated_at"])
+        return funding
+
     if status_value and (is_zum_failed_status(status_value) or status_value == "Rejected"):
         was_failed = funding.status == "failed"
         funding.zum_status = status_value
@@ -370,7 +432,7 @@ def apply_funded_payment_zum_status(
             funding.save(update_fields=["zum_status", "failure_reason", "updated_at"])
         return funding
 
-    # Still in flight (InProgress / Scheduled / InReview / etc.)
+    # Still in flight (InProgress / Pending Cancellation / Scheduled / InReview / etc.)
     update_fields = ["updated_at"]
     if status_value:
         funding.zum_status = status_value
@@ -1218,6 +1280,23 @@ class FundingService:
         funding = get_active_funding_attempt(loan)
         if not funding or funding.status != "processing":
             return funding
+
+        # Heal rows that already stored a terminal Zum status but stayed processing
+        # (e.g. Cancelled was saved only on zum_status before unlock logic existed).
+        local_zum_status = normalize_zum_status(funding.zum_status)
+        if local_zum_status and is_terminal_zum_funding_status(local_zum_status):
+            with transaction.atomic():
+                funding = FundedPayment.objects.select_for_update().select_related(
+                    "loan"
+                ).get(pk=funding.pk)
+                if funding.status == "processing":
+                    return apply_funded_payment_zum_status(
+                        funding,
+                        status_value=local_zum_status,
+                        reason=funding.failure_reason or local_zum_status,
+                    )
+            return funding
+
         tx_id = (funding.processor_transaction_id or "").strip()
         if not tx_id:
             return funding

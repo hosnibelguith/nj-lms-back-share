@@ -1075,6 +1075,55 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(self.loan.funded_payments.get().status, "failed")
         mock_get_tx.assert_called_once_with("662cec6c-f516-45ee-adad-c9fb660cf558")
 
+    def test_funding_cancelled_webhook_unlocks_fund_customer(self):
+        funding = FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="eft",
+            status="processing",
+            processor_transaction_id="662cec6c-f516-45ee-adad-c9fb660cf558",
+        )
+
+        response = self.post_webhook({
+            "Type": "Transaction",
+            "Data": {
+                "Id": funding.processor_transaction_id,
+                "TransactionStatus": "Cancelled",
+            },
+        })
+
+        self.assertEqual(response.status_code, 200)
+        funding.refresh_from_db()
+        self.assertEqual(funding.status, "cancelled")
+        self.assertEqual(funding.zum_status, "Cancelled")
+        readiness = funding_configuration_ready(self.loan)
+        self.assertFalse(readiness["has_active_funding"])
+        self.assertNotIn(
+            "Funding already exists for this loan.",
+            readiness["blockers"],
+        )
+
+    @patch("loans.zumrails.ZumRailsService.get_transaction")
+    def test_funding_options_heals_stale_cancelled_zum_status(self, mock_get_tx):
+        """zum_status Cancelled but status still processing must unlock retry."""
+        FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="eft",
+            status="processing",
+            processor_transaction_id="662cec6c-f516-45ee-adad-c9fb660cf558",
+            zum_status="Cancelled",
+            failure_reason="Cancelled",
+        )
+
+        response = self.client.get(f"/api/loans/{self.loan.id}/funding/options/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data["has_active_funding"])
+        funding = self.loan.funded_payments.get()
+        self.assertEqual(funding.status, "cancelled")
+        mock_get_tx.assert_not_called()
+
     def test_documented_failure_event_outside_legacy_list_is_processed(self):
         self.loan.status = "active"
         self.loan.save(update_fields=["status", "updated_at"])
