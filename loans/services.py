@@ -1030,10 +1030,10 @@ class LoanService:
         user=None,
     ) -> Payment:
         """Edit one open installment's date and/or amount without rebuilding the schedule."""
-        payment = Payment.objects.select_for_update().select_related('loan', 'loan__customer').get(
+        payment = Payment.objects.select_for_update().select_related('loan').get(
             pk=payment.pk
         )
-        loan = payment.loan
+        loan = Loan.objects.select_for_update().get(pk=payment.loan_id)
 
         if loan.status not in [
             'pending_signature',
@@ -1092,23 +1092,28 @@ class LoanService:
         if 'amount' in update_fields:
             changes.append(f'amount ${previous_amount} → ${payment.amount}')
         detail = f'Schedule installment updated by {actor}: {", ".join(changes)}.'
-        log_staff_action(
-            customer=loan.customer,
-            loan=loan,
-            user=user,
-            type_value='payment_scheduled',
-            title='Payment Installment Updated',
-            description=detail,
-            metadata={
-                'action': 'update_scheduled_payment',
-                'payment_id': str(payment.id),
-                'previous_date': str(previous_date),
-                'new_date': str(payment.scheduled_date),
-                'previous_amount': str(previous_amount),
-                'new_amount': str(payment.amount),
-                'original_amount': str(previous_amount),
-            },
-        )
+        try:
+            customer = Customer.objects.get(pk=loan.customer_id)
+        except Exception:
+            customer = None
+        if customer is not None:
+            log_staff_action(
+                customer=customer,
+                loan=loan,
+                user=user,
+                type_value='payment_scheduled',
+                title='Payment Installment Updated',
+                description=detail,
+                metadata={
+                    'action': 'update_scheduled_payment',
+                    'payment_id': str(payment.id),
+                    'previous_date': str(previous_date),
+                    'new_date': str(payment.scheduled_date),
+                    'previous_amount': str(previous_amount),
+                    'new_amount': str(payment.amount),
+                    'original_amount': str(previous_amount),
+                },
+            )
         return payment
 
     DEFERRAL_FEE_AMOUNT = Decimal('35.00')
@@ -1150,9 +1155,10 @@ class LoanService:
         The fee is always created as a normal scheduled Payment on the original
         date; staff can mark that fee paid later (Interac / manual).
         """
-        payment = Payment.objects.select_for_update().select_related(
-            'loan', 'loan__formula'
-        ).get(pk=payment.pk)
+        # Avoid select_related on nullable FKs under FOR UPDATE (Postgres rejects outer joins).
+        payment = Payment.objects.select_for_update().select_related('loan').get(
+            pk=payment.pk
+        )
         loan = Loan.objects.select_for_update().get(pk=payment.loan_id)
 
         if loan.status not in [
