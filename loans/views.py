@@ -46,6 +46,7 @@ from .serializers import (
     LoanAmountUpdateSerializer,
     LoanScheduleAdjustSerializer,
     PaymentScheduleItemUpdateSerializer,
+    PaymentDeferSerializer,
     LoanDeclineSerializer,
     LoanFundSerializer,
     LoanFundingConfigurationSerializer,
@@ -678,8 +679,8 @@ class LoanViewSet(viewsets.ModelViewSet):
     def reactivate(self, request, pk=None):
         loan = self.get_object()
 
-        if loan.is_active:
-            return Response({'error': 'Loan already active'}, status=400)
+        if loan.status != 'defaulted':
+            return Response({'error': 'Only stopped loans can be reactivated'}, status=400)
 
         serializer = LoanReactivateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -883,13 +884,22 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def defer(self, request, pk=None):
-        """Defer this open installment by one schedule period (and later open ones)."""
+        """Move installment to schedule end and collect the mandatory $35 deferral fee."""
         payment = self.get_object()
+        serializer = PaymentDeferSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         try:
-            payment = LoanService.defer_scheduled_payment(payment, user=request.user)
+            payment, fee_payment = LoanService.defer_scheduled_payment(
+                payment,
+                fee_collection=serializer.validated_data['fee_collection'],
+                user=request.user,
+            )
         except ValueError as exc:
             return Response({'error': str(exc)}, status=400)
-        return Response(PaymentSerializer(payment).data)
+        return Response({
+            'payment': PaymentSerializer(payment).data,
+            'deferral_fee': PaymentSerializer(fee_payment).data,
+        })
 
     @action(detail=True, methods=['post'])
     def complete(self, request, pk=None):

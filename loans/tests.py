@@ -630,7 +630,7 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("open schedule", response.data["error"])
 
-    def test_defer_scheduled_payment_shifts_this_and_later_open(self):
+    def test_defer_scheduled_payment_moves_to_end_and_schedules_fee(self):
         first = Payment.objects.create(
             loan=self.loan,
             amount=Decimal("100.00"),
@@ -643,24 +643,88 @@ class ZumRailsWorkflowTests(APITestCase):
             scheduled_date=timezone.localdate() + timedelta(days=14),
             status="scheduled",
         )
-        completed = Payment.objects.create(
+        third = Payment.objects.create(
             loan=self.loan,
-            amount=Decimal("50.00"),
-            scheduled_date=timezone.localdate() - timedelta(days=14),
-            status="completed",
-            processed_at=timezone.now(),
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate() + timedelta(days=28),
+            status="scheduled",
         )
-        completed_date = completed.scheduled_date
+        original_balance = self.loan.balance
+        original_total = self.loan.total_amount
+        second_date = second.scheduled_date
+        third_date = third.scheduled_date
 
-        response = self.client.post(f"/api/payments/{first.id}/defer/", {}, format="json")
+        response = self.client.post(
+            f"/api/payments/{first.id}/defer/",
+            {"fee_collection": "schedule"},
+            format="json",
+        )
 
         self.assertEqual(response.status_code, 200, response.data)
         first.refresh_from_db()
         second.refresh_from_db()
-        completed.refresh_from_db()
-        self.assertEqual(first.scheduled_date, timezone.localdate() + timedelta(days=14))
-        self.assertEqual(second.scheduled_date, timezone.localdate() + timedelta(days=28))
-        self.assertEqual(completed.scheduled_date, completed_date)
+        third.refresh_from_db()
+        self.loan.refresh_from_db()
+
+        self.assertEqual(second.scheduled_date, second_date)
+        self.assertEqual(third.scheduled_date, third_date)
+        self.assertEqual(first.scheduled_date, third_date + timedelta(days=14))
+        self.assertEqual(self.loan.balance, original_balance + Decimal("35.00"))
+        self.assertEqual(self.loan.total_amount, original_total + Decimal("35.00"))
+
+        fee = self.loan.payments.get(notes__icontains="Deferral fee")
+        self.assertEqual(fee.amount, Decimal("35.00"))
+        self.assertEqual(fee.scheduled_date, timezone.localdate())
+        self.assertEqual(fee.status, "scheduled")
+        self.assertEqual(fee.type, "scheduled")
+        self.assertEqual(response.data["deferral_fee"]["id"], str(fee.id))
+
+    def test_defer_scheduled_payment_marks_fee_paid_via_interac(self):
+        payment = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+        )
+        later = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate() + timedelta(days=14),
+            status="scheduled",
+        )
+        original_balance = self.loan.balance
+
+        response = self.client.post(
+            f"/api/payments/{payment.id}/defer/",
+            {"fee_collection": "interac_paid"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        payment.refresh_from_db()
+        later.refresh_from_db()
+        self.loan.refresh_from_db()
+
+        self.assertEqual(payment.scheduled_date, later.scheduled_date + timedelta(days=14))
+        fee = self.loan.payments.get(notes__icontains="Deferral fee")
+        self.assertEqual(fee.amount, Decimal("35.00"))
+        self.assertEqual(fee.status, "completed")
+        self.assertEqual(fee.type, "etransfer")
+        self.assertEqual(fee.scheduled_date, timezone.localdate())
+        # Fee charged then immediately paid — balance unchanged.
+        self.assertEqual(self.loan.balance, original_balance)
+
+    def test_defer_scheduled_payment_requires_fee_collection(self):
+        payment = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+        )
+
+        response = self.client.post(f"/api/payments/{payment.id}/defer/", {}, format="json")
+
+        self.assertEqual(response.status_code, 400)
 
     def test_defer_scheduled_payment_rejects_completed(self):
         payment = Payment.objects.create(
@@ -671,10 +735,35 @@ class ZumRailsWorkflowTests(APITestCase):
             processed_at=timezone.now(),
         )
 
-        response = self.client.post(f"/api/payments/{payment.id}/defer/", {}, format="json")
+        response = self.client.post(
+            f"/api/payments/{payment.id}/defer/",
+            {"fee_collection": "schedule"},
+            format="json",
+        )
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("deferred", response.data["error"])
+
+    def test_stop_and_reactivate_loan(self):
+        self.loan.status = "active"
+        self.loan.is_active = True
+        self.loan.save(update_fields=["status", "is_active", "updated_at"])
+
+        stop = self.client.post(f"/api/loans/{self.loan.id}/mark_defaulted/", {}, format="json")
+        self.assertEqual(stop.status_code, 200, stop.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "defaulted")
+        self.assertFalse(self.loan.is_active)
+
+        reactivate = self.client.post(
+            f"/api/loans/{self.loan.id}/reactivate/",
+            {"notes": "Customer resumed payments"},
+            format="json",
+        )
+        self.assertEqual(reactivate.status_code, 200, reactivate.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "active")
+        self.assertTrue(self.loan.is_active)
 
     def test_duplicate_funding_is_blocked(self):
         FundedPayment.objects.create(

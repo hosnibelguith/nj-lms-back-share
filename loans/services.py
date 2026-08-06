@@ -1111,9 +1111,11 @@ class LoanService:
         )
         return payment
 
+    DEFERRAL_FEE_AMOUNT = Decimal('35.00')
+
     @staticmethod
     def _schedule_frequency_days(loan: Loan) -> int:
-        """Cadence used when deferring an installment (formula, else inferred gap, else 14)."""
+        """Cadence used when placing a deferred installment at schedule end."""
         formula = getattr(loan, 'formula', None)
         if formula and getattr(formula, 'default_frequency_days', None):
             days = int(formula.default_frequency_days)
@@ -1133,16 +1135,27 @@ class LoanService:
 
     @staticmethod
     @transaction.atomic
-    def defer_scheduled_payment(payment: Payment, *, user=None) -> Payment:
-        """Defer one open installment by one schedule period.
+    def defer_scheduled_payment(
+        payment: Payment,
+        *,
+        fee_collection: str,
+        user=None,
+    ) -> tuple:
+        """Defer one open installment to the end of the schedule and charge $35.
 
-        Shifts this payment and every later open installment by the same number of
-        days so cadence is preserved and dates do not collide.
+        fee_collection:
+          - ``schedule``: create a scheduled $35 fee on the original payment date
+          - ``interac_paid``: create the $35 fee on that date and mark it paid (Interac)
         """
+        if fee_collection not in ('schedule', 'interac_paid'):
+            raise ValueError(
+                'Choose how to collect the $35 deferral fee: schedule or interac_paid.'
+            )
+
         payment = Payment.objects.select_for_update().select_related(
             'loan', 'loan__customer', 'loan__formula'
         ).get(pk=payment.pk)
-        loan = payment.loan
+        loan = Loan.objects.select_for_update().get(pk=payment.loan_id)
 
         if loan.status not in [
             'pending_signature',
@@ -1161,41 +1174,68 @@ class LoanService:
                 'This installment has an active collection and cannot be deferred.'
             )
 
-        frequency_days = LoanService._schedule_frequency_days(loan)
         previous_date = payment.scheduled_date
+        previous_amount = payment.amount
+        frequency_days = LoanService._schedule_frequency_days(loan)
+        fee_amount = LoanService.money(LoanService.DEFERRAL_FEE_AMOUNT)
 
-        open_statuses = ('scheduled', 'pending', 'failed', 'nsf')
-        open_payments = list(
-            Payment.objects.select_for_update()
-            .filter(loan=loan, status__in=open_statuses)
-            .order_by('scheduled_date', 'created_at', 'id')
+        last_other_date = (
+            loan.payments.exclude(pk=payment.pk)
+            .order_by('-scheduled_date', '-created_at')
+            .values_list('scheduled_date', flat=True)
+            .first()
         )
-        try:
-            start_idx = next(i for i, item in enumerate(open_payments) if item.id == payment.id)
-        except StopIteration as exc:
-            raise ValueError('Payment not found among open installments.') from exc
+        end_date = (last_other_date or previous_date) + timedelta(days=frequency_days)
 
-        later_open = open_payments[start_idx:]
-        shifted_ids = []
-        for item in later_open:
-            item.scheduled_date = item.scheduled_date + timedelta(days=frequency_days)
-            update_fields = ['scheduled_date']
-            if item.status in ('failed', 'nsf'):
-                item.status = 'scheduled'
-                item.failure_reason = None
-                item.processed_at = None
-                update_fields.extend(['status', 'failure_reason', 'processed_at'])
-            item.save(update_fields=update_fields)
-            shifted_ids.append(str(item.id))
+        payment.scheduled_date = end_date
+        update_fields = ['scheduled_date']
+        if payment.status in ('failed', 'nsf'):
+            payment.status = 'scheduled'
+            payment.failure_reason = None
+            payment.processed_at = None
+            update_fields.extend(['status', 'failure_reason', 'processed_at'])
+        defer_note = f'Deferred from {previous_date}'
+        payment.notes = (
+            f'{payment.notes}\n{defer_note}'.strip() if payment.notes else defer_note
+        )
+        update_fields.append('notes')
+        payment.save(update_fields=update_fields)
 
-        payment.refresh_from_db()
+        loan.fee = LoanService.money((loan.fee or Decimal('0.00')) + fee_amount)
+        loan.total_amount = LoanService.money(
+            (loan.total_amount or Decimal('0.00')) + fee_amount
+        )
+        loan.balance = LoanService.money((loan.balance or Decimal('0.00')) + fee_amount)
+        loan.save(update_fields=['fee', 'total_amount', 'balance', 'updated_at'])
+
+        fee_payment = Payment.objects.create(
+            loan=loan,
+            amount=fee_amount,
+            type='etransfer' if fee_collection == 'interac_paid' else 'scheduled',
+            status='scheduled',
+            scheduled_date=previous_date,
+            notes='Deferral fee $35',
+            created_by=user,
+        )
+
+        if fee_collection == 'interac_paid':
+            fee_payment.status = 'completed'
+            fee_payment.processed_at = timezone.now()
+            fee_payment.reference = 'INTERAC-DEFERRAL-FEE'
+            fee_payment.save(update_fields=['status', 'processed_at', 'reference'])
+            loan.apply_payment(fee_amount, user=user)
 
         from activity.services import actor_label, log_staff_action
 
         actor = actor_label(user)
+        fee_mode = (
+            'marked paid via Interac'
+            if fee_collection == 'interac_paid'
+            else f'scheduled on {previous_date}'
+        )
         detail = (
-            f'Payment deferred by {actor}: {previous_date} → {payment.scheduled_date} '
-            f'({frequency_days}-day period; {len(shifted_ids)} installment(s) shifted).'
+            f'Payment deferred by {actor}: installment ${previous_amount} moved from '
+            f'{previous_date} to {end_date}; $35 deferral fee {fee_mode}.'
         )
         log_staff_action(
             customer=loan.customer,
@@ -1207,10 +1247,14 @@ class LoanService:
             metadata={
                 'action': 'defer_scheduled_payment',
                 'payment_id': str(payment.id),
+                'deferral_fee_payment_id': str(fee_payment.id),
                 'previous_date': str(previous_date),
-                'new_date': str(payment.scheduled_date),
+                'new_date': str(end_date),
+                'fee_amount': str(fee_amount),
+                'fee_collection': fee_collection,
                 'frequency_days': frequency_days,
-                'shifted_payment_ids': shifted_ids,
             },
         )
-        return payment
+        payment.refresh_from_db()
+        fee_payment.refresh_from_db()
+        return payment, fee_payment

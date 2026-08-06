@@ -606,6 +606,11 @@ class PaymentScheduleItemUpdateSerializer(serializers.Serializer):
         return attrs
 
 
+class PaymentDeferSerializer(serializers.Serializer):
+    """Defer an installment and collect the mandatory $35 deferral fee."""
+    fee_collection = serializers.ChoiceField(choices=['schedule', 'interac_paid'])
+
+
 class LoanFundSerializer(serializers.Serializer):
     method = serializers.ChoiceField(choices=['etransfer', 'eft', 'card_issuance'])
     reference = serializers.CharField(required=False, allow_blank=True, max_length=100)
