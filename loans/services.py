@@ -1110,3 +1110,107 @@ class LoanService:
             },
         )
         return payment
+
+    @staticmethod
+    def _schedule_frequency_days(loan: Loan) -> int:
+        """Cadence used when deferring an installment (formula, else inferred gap, else 14)."""
+        formula = getattr(loan, 'formula', None)
+        if formula and getattr(formula, 'default_frequency_days', None):
+            days = int(formula.default_frequency_days)
+            if days > 0:
+                return days
+
+        dates = list(
+            loan.payments.order_by('scheduled_date', 'created_at', 'id').values_list(
+                'scheduled_date', flat=True
+            )[:3]
+        )
+        if len(dates) >= 2:
+            delta = (dates[1] - dates[0]).days
+            if delta > 0:
+                return delta
+        return 14
+
+    @staticmethod
+    @transaction.atomic
+    def defer_scheduled_payment(payment: Payment, *, user=None) -> Payment:
+        """Defer one open installment by one schedule period.
+
+        Shifts this payment and every later open installment by the same number of
+        days so cadence is preserved and dates do not collide.
+        """
+        payment = Payment.objects.select_for_update().select_related(
+            'loan', 'loan__customer', 'loan__formula'
+        ).get(pk=payment.pk)
+        loan = payment.loan
+
+        if loan.status not in [
+            'pending_signature',
+            'pending',
+            'pending_funding',
+            'active',
+            'defaulted',
+        ]:
+            raise ValueError(f'Cannot defer payments for loan in status: {loan.status}')
+
+        if payment.status not in ('scheduled', 'pending', 'failed', 'nsf'):
+            raise ValueError('Only open schedule installments can be deferred.')
+
+        if payment.collection_attempts.filter(status__in=['processing', 'completed']).exists():
+            raise ValueError(
+                'This installment has an active collection and cannot be deferred.'
+            )
+
+        frequency_days = LoanService._schedule_frequency_days(loan)
+        previous_date = payment.scheduled_date
+
+        open_statuses = ('scheduled', 'pending', 'failed', 'nsf')
+        open_payments = list(
+            Payment.objects.select_for_update()
+            .filter(loan=loan, status__in=open_statuses)
+            .order_by('scheduled_date', 'created_at', 'id')
+        )
+        try:
+            start_idx = next(i for i, item in enumerate(open_payments) if item.id == payment.id)
+        except StopIteration as exc:
+            raise ValueError('Payment not found among open installments.') from exc
+
+        later_open = open_payments[start_idx:]
+        shifted_ids = []
+        for item in later_open:
+            item.scheduled_date = item.scheduled_date + timedelta(days=frequency_days)
+            update_fields = ['scheduled_date']
+            if item.status in ('failed', 'nsf'):
+                item.status = 'scheduled'
+                item.failure_reason = None
+                item.processed_at = None
+                update_fields.extend(['status', 'failure_reason', 'processed_at'])
+            item.save(update_fields=update_fields)
+            shifted_ids.append(str(item.id))
+
+        payment.refresh_from_db()
+
+        from activity.services import actor_label, log_staff_action
+
+        actor = actor_label(user)
+        detail = (
+            f'Payment deferred by {actor}: {previous_date} → {payment.scheduled_date} '
+            f'({frequency_days}-day period; {len(shifted_ids)} installment(s) shifted).'
+        )
+        log_staff_action(
+            customer=loan.customer,
+            loan=loan,
+            user=user,
+            type_value='payment_scheduled',
+            title='Payment Deferred',
+            description=detail,
+            metadata={
+                'action': 'defer_scheduled_payment',
+                'payment_id': str(payment.id),
+                'previous_date': str(previous_date),
+                'new_date': str(payment.scheduled_date),
+                'frequency_days': frequency_days,
+                'shifted_payment_ids': shifted_ids,
+            },
+        )
+        return payment

@@ -630,6 +630,52 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("open schedule", response.data["error"])
 
+    def test_defer_scheduled_payment_shifts_this_and_later_open(self):
+        first = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+        )
+        second = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate() + timedelta(days=14),
+            status="scheduled",
+        )
+        completed = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("50.00"),
+            scheduled_date=timezone.localdate() - timedelta(days=14),
+            status="completed",
+            processed_at=timezone.now(),
+        )
+        completed_date = completed.scheduled_date
+
+        response = self.client.post(f"/api/payments/{first.id}/defer/", {}, format="json")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        first.refresh_from_db()
+        second.refresh_from_db()
+        completed.refresh_from_db()
+        self.assertEqual(first.scheduled_date, timezone.localdate() + timedelta(days=14))
+        self.assertEqual(second.scheduled_date, timezone.localdate() + timedelta(days=28))
+        self.assertEqual(completed.scheduled_date, completed_date)
+
+    def test_defer_scheduled_payment_rejects_completed(self):
+        payment = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate(),
+            status="completed",
+            processed_at=timezone.now(),
+        )
+
+        response = self.client.post(f"/api/payments/{payment.id}/defer/", {}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("deferred", response.data["error"])
+
     def test_duplicate_funding_is_blocked(self):
         FundedPayment.objects.create(
             loan=self.loan,

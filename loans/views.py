@@ -882,6 +882,16 @@ class PaymentViewSet(viewsets.ModelViewSet):
         return Response(PaymentSerializer(payment).data)
 
     @action(detail=True, methods=['post'])
+    def defer(self, request, pk=None):
+        """Defer this open installment by one schedule period (and later open ones)."""
+        payment = self.get_object()
+        try:
+            payment = LoanService.defer_scheduled_payment(payment, user=request.user)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
+        return Response(PaymentSerializer(payment).data)
+
+    @action(detail=True, methods=['post'])
     def complete(self, request, pk=None):
         payment = self.get_object()
         payment.complete(user=request.user)
