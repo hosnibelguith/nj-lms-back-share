@@ -255,6 +255,149 @@ def is_unsubmitted_funding_attempt(funding: FundedPayment) -> bool:
     )
 
 
+def extract_zum_transaction_fields(payload) -> dict:
+    """Pull status/reason from a Zum webhook payload or GET /transaction response."""
+    data = payload if isinstance(payload, dict) else {}
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    source = result or data
+    nested = source.get("Transaction") if isinstance(source.get("Transaction"), dict) else {}
+    if not nested and isinstance(data.get("Transaction"), dict):
+        nested = data["Transaction"]
+
+    status_value = (
+        source.get("TransactionStatus")
+        or source.get("Status")
+        or nested.get("TransactionStatus")
+        or nested.get("Status")
+        or data.get("TransactionStatus")
+        or data.get("Status")
+    )
+    reason = (
+        source.get("FailedTransactionEvent")
+        or nested.get("FailedTransactionEvent")
+        or data.get("FailedTransactionEvent")
+        or source.get("Event")
+        or nested.get("Event")
+        or data.get("Event")
+        or source.get("MemberMessage")
+        or nested.get("MemberMessage")
+        or data.get("MemberMessage")
+    )
+    if isinstance(reason, str):
+        reason = reason.strip() or None
+    if isinstance(status_value, str):
+        status_value = status_value.strip() or None
+    return {
+        "status": status_value,
+        "reason": reason,
+        "transaction_id": (
+            source.get("Id")
+            or source.get("TransactionId")
+            or nested.get("Id")
+            or data.get("Id")
+            or data.get("TransactionId")
+        ),
+    }
+
+
+def is_zum_failed_status(status_value) -> bool:
+    return isinstance(status_value, str) and "Failed" in status_value
+
+
+def apply_funded_payment_zum_status(
+    funding: FundedPayment,
+    *,
+    status_value: str | None,
+    reason: str | None = None,
+) -> FundedPayment:
+    """Apply a Zum transaction status to funding; unlocks retry on failed/returned."""
+    status_value = (status_value or "").strip() or None
+    reason = (reason or "").strip() or None
+    display_reason = reason or status_value or "Failed"
+
+    if status_value == "Completed":
+        funding.zum_status = status_value
+        if funding.status == "processing":
+            funding.mark_completed()
+            if funding.loan.status != "active":
+                funding.loan.mark_funding_completed(
+                    method=funding.method,
+                    reference=funding.processor_transaction_id or "",
+                )
+            log_activity(
+                funding.loan,
+                "loan_funded",
+                "Funding Completed",
+                "ZūmRails confirmed funding completion.",
+                metadata={"funded_payment_id": str(funding.id)},
+            )
+        else:
+            funding.save(update_fields=["zum_status", "updated_at"])
+        return funding
+
+    if status_value == "Returned":
+        was_returned = funding.status == "returned"
+        funding.zum_status = status_value
+        if not was_returned:
+            funding.mark_returned(display_reason)
+            _reopen_loan_after_funding_failure_safe(funding)
+            log_activity(
+                funding.loan,
+                "system",
+                "Funding Returned",
+                display_reason,
+                metadata={"funded_payment_id": str(funding.id)},
+            )
+        else:
+            funding.save(update_fields=["zum_status", "updated_at"])
+        return funding
+
+    if status_value and (is_zum_failed_status(status_value) or status_value == "Rejected"):
+        was_failed = funding.status == "failed"
+        funding.zum_status = status_value
+        if not was_failed:
+            funding.mark_failed(display_reason)
+            _reopen_loan_after_funding_failure_safe(funding)
+            log_activity(
+                funding.loan,
+                "system",
+                "Funding Failed",
+                display_reason,
+                metadata={"funded_payment_id": str(funding.id)},
+            )
+        else:
+            funding.failure_reason = display_reason
+            funding.save(update_fields=["zum_status", "failure_reason", "updated_at"])
+        return funding
+
+    # Still in flight (InProgress / Scheduled / InReview / etc.)
+    update_fields = ["updated_at"]
+    if status_value:
+        funding.zum_status = status_value
+        update_fields.append("zum_status")
+    if reason and reason not in ("Updated", "Created", status_value):
+        funding.failure_reason = reason
+        update_fields.append("failure_reason")
+    funding.save(update_fields=list(dict.fromkeys(update_fields)))
+    return funding
+
+
+def _reopen_loan_after_funding_failure_safe(funding: FundedPayment) -> None:
+    """Local reopen helper (mirrors webhook) so sync can unlock without circular imports."""
+    loan = funding.loan
+    if loan.status == "active":
+        loan.status = "pending_funding"
+        loan.is_active = False
+        loan.funded_at = None
+        loan.save(update_fields=[
+            "status",
+            "is_active",
+            "funded_at",
+            "updated_at",
+        ])
+    release_funding_locks(loan)
+
+
 def active_funding_block_message(loan: Loan) -> str | None:
     """Human-readable funding block including Zūm failure/status when available."""
     attempt = get_active_funding_attempt(loan)
@@ -263,7 +406,10 @@ def active_funding_block_message(loan: Loan) -> str | None:
     if attempt.status == "completed":
         return "Funding already exists for this loan."
 
-    zum_reason = (attempt.failure_reason or attempt.zum_status or "").strip()
+    zum_reason = (attempt.failure_reason or "").strip()
+    zum_status = (attempt.zum_status or "").strip()
+    tx_id = (attempt.processor_transaction_id or "").strip()
+
     if is_unsubmitted_funding_attempt(attempt):
         if zum_reason:
             return (
@@ -276,7 +422,11 @@ def active_funding_block_message(loan: Loan) -> str | None:
         )
     if zum_reason:
         return f"Funding already exists for this loan. Zūm reason: {zum_reason}."
-    tx_id = (attempt.processor_transaction_id or "").strip()
+    if zum_status:
+        message = f"Funding already exists for this loan. Zūm status: {zum_status}"
+        if tx_id:
+            message += f" (transaction {tx_id})"
+        return f"{message}."
     if tx_id:
         return (
             f"Funding already exists for this loan. "
@@ -736,6 +886,26 @@ class ZumRailsService:
         return transaction_id
 
     @classmethod
+    def get_transaction(cls, transaction_id: str) -> dict:
+        """GET /api/transaction/{id} — used to refresh status/reason when webhooks lag."""
+        tx_id = (transaction_id or "").strip()
+        if not tx_id:
+            raise ZumRailsConfigurationError("Zūm transaction id is required.")
+        if cls._is_dry_run():
+            return {
+                "Id": tx_id,
+                "TransactionStatus": "InProgress",
+                "FailedTransactionEvent": None,
+            }
+        data = cls._result(cls._request("GET", f"/transaction/{tx_id}"))
+        if not isinstance(data, dict):
+            raise ZumRailsRequestError(
+                "ZūmRails returned an unexpected transaction payload.",
+                outcome_unknown=False,
+            )
+        return data
+
+    @classmethod
     def _batch_destination(cls, destination: str | None = None) -> dict:
         if destination == "funding":
             funding_source_id = str(cls._setting("ZUMRAILS_FUNDING_SOURCE_ID", "")).strip()
@@ -1041,6 +1211,43 @@ class FundingService:
         )
         FundingService._queue_funding_email(loan)
         return funding
+
+    @staticmethod
+    def sync_active_funding_from_zum(loan: Loan) -> FundedPayment | None:
+        """Refresh processing funding from Zum by transaction id (webhook fallback)."""
+        funding = get_active_funding_attempt(loan)
+        if not funding or funding.status != "processing":
+            return funding
+        tx_id = (funding.processor_transaction_id or "").strip()
+        if not tx_id:
+            return funding
+        try:
+            payload = ZumRailsService.get_transaction(tx_id)
+        except ZumRailsError:
+            logger.exception(
+                "Unable to sync funding status from Zūm for loan=%s tx=%s",
+                loan.id,
+                tx_id,
+            )
+            return funding
+
+        fields = extract_zum_transaction_fields(payload)
+        status_value = fields.get("status")
+        reason = fields.get("reason")
+        if not status_value and not reason:
+            return funding
+
+        with transaction.atomic():
+            funding = FundedPayment.objects.select_for_update().select_related("loan").get(
+                pk=funding.pk
+            )
+            if funding.status != "processing":
+                return funding
+            return apply_funded_payment_zum_status(
+                funding,
+                status_value=status_value,
+                reason=reason,
+            )
 
     @staticmethod
     @transaction.atomic

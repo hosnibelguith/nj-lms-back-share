@@ -1017,6 +1017,64 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertFalse(self.loan.is_active)
         self.assertIsNone(self.loan.funded_at)
 
+    def test_funding_failure_webhook_stores_zum_reason_and_allows_retry(self):
+        funding = FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="eft",
+            status="processing",
+            processor_transaction_id="funding-fail-reason-1",
+        )
+
+        response = self.post_webhook({
+            "Type": "Transaction",
+            "Data": {
+                "Id": funding.processor_transaction_id,
+                "TransactionStatus": "Failed",
+                "FailedTransactionEvent": "EftFailedInsufficientFunds",
+            },
+        })
+
+        self.assertEqual(response.status_code, 200)
+        funding.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(funding.status, "failed")
+        self.assertEqual(funding.failure_reason, "EftFailedInsufficientFunds")
+        self.assertEqual(funding.zum_status, "Failed")
+        self.assertEqual(self.loan.status, "pending_funding")
+        readiness = funding_configuration_ready(self.loan)
+        self.assertFalse(readiness["has_active_funding"])
+        self.assertNotIn(
+            "Funding already exists for this loan.",
+            readiness["blockers"],
+        )
+
+    @patch("loans.zumrails.ZumRailsService.get_transaction")
+    def test_funding_options_syncs_failed_zum_status_and_unlocks_retry(self, mock_get_tx):
+        FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="eft",
+            status="processing",
+            processor_transaction_id="662cec6c-f516-45ee-adad-c9fb660cf558",
+        )
+        mock_get_tx.return_value = {
+            "Id": "662cec6c-f516-45ee-adad-c9fb660cf558",
+            "TransactionStatus": "Failed",
+            "FailedTransactionEvent": "EftFailedAccountClosed",
+        }
+
+        response = self.client.get(f"/api/loans/{self.loan.id}/funding/options/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data["has_active_funding"])
+        self.assertEqual(
+            self.loan.funded_payments.get().failure_reason,
+            "EftFailedAccountClosed",
+        )
+        self.assertEqual(self.loan.funded_payments.get().status, "failed")
+        mock_get_tx.assert_called_once_with("662cec6c-f516-45ee-adad-c9fb660cf558")
+
     def test_documented_failure_event_outside_legacy_list_is_processed(self):
         self.loan.status = "active"
         self.loan.save(update_fields=["status", "updated_at"])

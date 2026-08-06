@@ -539,6 +539,14 @@ class LoanViewSet(viewsets.ModelViewSet):
         loan = self.get_object()
         from loans.zumrails import is_arrive_funded_loan
 
+        # Refresh Zum status/reason for in-flight funding so the UI shows the
+        # webhook/API reason and unlocks Fund Customer after terminal failure.
+        try:
+            FundingService.sync_active_funding_from_zum(loan)
+            loan.refresh_from_db()
+        except Exception:
+            pass
+
         recommended_method = FundingMethodRecommendation.for_date()
         if is_arrive_funded_loan(loan):
             recommended_method = 'card_issuance'

@@ -13,6 +13,9 @@ from .zumrails import (
     TERMINAL_FAILURE_STATUSES,
     add_business_days,
     apply_collection_failure,
+    apply_funded_payment_zum_status,
+    extract_zum_transaction_fields,
+    is_zum_failed_status,
     log_activity,
     payload_hash,
     release_funding_locks,
@@ -21,6 +24,9 @@ from .zumrails import (
 
 
 def _transaction_id(event_data):
+    fields = extract_zum_transaction_fields(event_data)
+    if fields.get("transaction_id"):
+        return fields["transaction_id"]
     transaction_data = event_data.get("Transaction")
     if not isinstance(transaction_data, dict):
         transaction_data = {}
@@ -32,11 +38,12 @@ def _transaction_id(event_data):
 
 
 def _failure_reason(event_data, fallback="Failed"):
-    return event_data.get("FailedTransactionEvent") or event_data.get("Event") or event_data.get("Status") or fallback
+    fields = extract_zum_transaction_fields(event_data)
+    return fields.get("reason") or fields.get("status") or fallback
 
 
 def _is_failed_status(status_value):
-    return isinstance(status_value, str) and "Failed" in status_value
+    return is_zum_failed_status(status_value)
 
 
 def _is_returned_or_rejected(status_value):
@@ -203,24 +210,14 @@ class ZumRailsWebhookView(APIView):
             history = funding.event_history if isinstance(funding.event_history, list) else []
             history.append(history_item)
             funding.event_history = history
+            funding.save(update_fields=["event_history", "updated_at"])
             if _is_failure_event(event_name):
-                was_terminal = funding.status in ("failed", "returned")
-                funding.zum_status = event_name
-                if not was_terminal:
-                    funding.mark_failed(event_name)
-                    _reopen_loan_after_funding_failure(funding)
-                funding.event_history = history
-                funding.save(update_fields=["event_history", "updated_at"])
-                if not was_terminal:
-                    log_activity(
-                        funding.loan,
-                        "system",
-                        "Funding Failed",
-                        event_name,
-                        metadata={"funded_payment_id": str(funding.id)},
-                    )
-            else:
-                funding.save(update_fields=["event_history", "updated_at"])
+                reason = _failure_reason(event_data, event_name or "Failed")
+                apply_funded_payment_zum_status(
+                    funding,
+                    status_value="Failed",
+                    reason=reason,
+                )
 
     def _process_transaction(self, processor_transaction_id, status_value, event_data):
         if not processor_transaction_id:
@@ -288,55 +285,11 @@ class ZumRailsWebhookView(APIView):
                         "updated_at",
                     ])
         if funding:
-            funding.zum_status = status_value
-            if status_value == "Completed":
-                was_completed = funding.status == "completed"
-                if funding.status == "processing":
-                    funding.mark_completed()
-                    if funding.loan.status != "active":
-                        funding.loan.mark_funding_completed(
-                            method=funding.method,
-                            reference=funding.processor_transaction_id or "",
-                        )
-                    log_activity(
-                        funding.loan,
-                        "loan_funded",
-                        "Funding Completed",
-                        "ZūmRails confirmed funding completion.",
-                        metadata={"funded_payment_id": str(funding.id)},
-                    )
-                return
-
-            if status_value == "Returned":
-                reason = _failure_reason(event_data, status_value)
-                was_returned = funding.status == "returned"
-                funding.zum_status = status_value
-                if not was_returned:
-                    funding.mark_returned(reason)
-                    _reopen_loan_after_funding_failure(funding)
-                    log_activity(
-                        funding.loan,
-                        "system",
-                        "Funding Returned",
-                        reason,
-                        metadata={"funded_payment_id": str(funding.id)},
-                    )
-                return
-
-            if _is_failed_status(status_value) or status_value == "Rejected":
-                reason = _failure_reason(event_data, status_value)
-                was_failed = funding.status == "failed"
-                funding.zum_status = status_value
-                if not was_failed:
-                    funding.mark_failed(reason)
-                    _reopen_loan_after_funding_failure(funding)
-                    log_activity(
-                        funding.loan,
-                        "system",
-                        "Funding Failed",
-                        reason,
-                        metadata={"funded_payment_id": str(funding.id)},
-                    )
-                return
-
-            funding.save(update_fields=["zum_status", "updated_at"])
+            fields = extract_zum_transaction_fields(event_data)
+            resolved_status = status_value or fields.get("status")
+            reason = _failure_reason(event_data, resolved_status or "Failed")
+            apply_funded_payment_zum_status(
+                funding,
+                status_value=resolved_status,
+                reason=reason if resolved_status != "Completed" else None,
+            )
