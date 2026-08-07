@@ -12,6 +12,7 @@ from accounts.views import LoginView, LogoutView, CurrentUserView, RefreshTokenV
 from banking.views import (
     BankConnectionViewSet, BankAccountViewSet, BankTransactionViewSet,
     FinancialAnalysisReportViewSet, FlinksWebhookView, ConnectBankView,
+    ResetPendingBankConnectionView,
     CustomerPortalBankingStatusView, CustomerPortalBankAccountsView
 )
 from banking.webhooks import MohawkBankingAnalysisWebhookView
@@ -60,6 +61,11 @@ urlpatterns = [
 
     # Banking endpoints
     path('api/banking/connect/', ConnectBankView.as_view(), name='bank-connect'),
+    path(
+        'api/banking/reset-pending/',
+        ResetPendingBankConnectionView.as_view(),
+        name='bank-reset-pending',
+    ),
     path('api/portal/me/banking/', CustomerPortalBankingStatusView.as_view(), name='customer-portal-banking-status'),
     path('api/portal/me/bank-accounts/', CustomerPortalBankAccountsView.as_view(), name='customer-portal-bank-accounts'),
     # API routes

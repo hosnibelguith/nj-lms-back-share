@@ -84,6 +84,40 @@ class BankingConnectTests(TestCase):
         mocked_a.assert_called_once_with(str(connection_a.id))
         mocked_b.assert_called_once_with(str(connection_b.id))
 
+    def test_reset_pending_connection_allows_reconnect(self):
+        connection = BankConnection.objects.create(
+            customer=self.customer_a,
+            login_id=self.login_id,
+            provider='flinks',
+            is_active=True,
+            sync_status='pending',
+        )
+        self.client.force_authenticate(user=self.user_a)
+        response = self.client.post('/api/banking/reset-pending/', {}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        connection.refresh_from_db()
+        self.assertFalse(connection.is_active)
+        self.assertEqual(connection.sync_status, 'failed')
+
+        status = self.client.get('/api/portal/me/banking/')
+        self.assertEqual(status.status_code, 200)
+        self.assertFalse(status.data['has_connection'])
+        self.assertFalse(status.data['banking_verified'])
+
+    def test_reset_pending_rejected_when_already_verified(self):
+        self.customer_a.banking_verified = True
+        self.customer_a.save(update_fields=['banking_verified', 'updated_at'])
+        BankConnection.objects.create(
+            customer=self.customer_a,
+            login_id=self.login_id,
+            provider='flinks',
+            is_active=True,
+            sync_status='synced',
+        )
+        self.client.force_authenticate(user=self.user_a)
+        response = self.client.post('/api/banking/reset-pending/', {}, format='json')
+        self.assertEqual(response.status_code, 400, response.data)
+
     def test_sync_task_uses_connection_id_not_shared_login_id(self):
         connection_a = BankConnection.objects.create(
             customer=self.customer_a,

@@ -158,6 +158,41 @@ class ConnectBankView(CustomerPortalBaseView):
         }, status=status.HTTP_200_OK)
 
 
+class ResetPendingBankConnectionView(CustomerPortalBaseView):
+    """Abandon a stuck unverified Flinks connection so the customer can reconnect.
+
+    Used when sync never completes and the portal would otherwise stay on the
+    "Securely syncing" screen with no path back to the Connect widget.
+    """
+
+    def post(self, request):
+        customer = self.get_customer(request)
+        if customer.banking_verified:
+            return Response(
+                {"error": "Banking is already verified."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        updated = BankConnection.objects.filter(
+            customer=customer,
+            is_active=True,
+        ).exclude(sync_status='failed').update(
+            is_active=False,
+            sync_status='failed',
+            sync_error='Customer restarted bank connection.',
+        )
+        logger.info(
+            'Pending bank connection reset customer_id=%s deactivated=%s',
+            customer.id,
+            updated,
+        )
+        return Response({
+            "message": "Bank connection reset. You can connect again.",
+            "status": "RESET",
+            "deactivated": updated,
+        })
+
+
 class CustomerPortalBankingStatusView(CustomerPortalBaseView):
     def get(self, request):
         customer = self.get_customer(request)
