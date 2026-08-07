@@ -1570,7 +1570,7 @@ class FundingService:
             loan,
             "system",
             "Card Issuance Funding",
-            f"Loan marked funded via Card Issuance by {actor_label(user)} (no LendStack EFT/EMT).",
+            f"Loan marked funded via Card Issuance by {actor_label(user)} (no MohawkLoans EFT/EMT).",
             created_by=getattr(user, "id", "system"),
             metadata={"funded_payment_id": str(funding.id), "method": "card_issuance", "loan_id": str(loan.id)},
         )

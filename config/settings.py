@@ -422,7 +422,7 @@ FRONTEND_URL = os.environ.get(
     "http://localhost:3000" if DEBUG else "https://app.mohawkloans.com",
 )
 
-# Lender-facing brand used in customer communications and the customer/IBV iframe.
+# Lender-facing brand used in UI copy, customer communications, and the IBV iframe.
 LENDER_BRAND_NAME = os.environ.get("LENDER_BRAND_NAME", "MohawkLoans")
 
 

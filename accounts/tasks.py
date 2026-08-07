@@ -21,15 +21,16 @@ def send_welcome_email(customer_id: str):
 
         customer = Customer.objects.get(id=customer_id)
         frontend_url = settings.FRONTEND_URL.rstrip('/')
+        brand = getattr(settings, 'LENDER_BRAND_NAME', None) or 'MohawkLoans'
 
         send_mail(
-            subject='Welcome to Mohawk Loans',
+            subject=f'Welcome to {brand}',
             message=(
                 f'Hello {customer.first_name},\n\n'
-                f'Thank you for applying with Mohawk Loans.\n\n'
+                f'Thank you for applying with {brand}.\n\n'
                 f'Your next step is to complete banking verification:\n'
                 f'{frontend_url}/customer/banking\n\n'
-                f'Thank you,\nMohawk Loans'
+                f'Thank you,\n{brand}'
             ),
             from_email=settings.DEFAULT_FROM_EMAIL,
             recipient_list=[customer.email],
