@@ -11,12 +11,7 @@ from .serializers import (
     ActivityHistorySerializer, ActivityHistoryCreateSerializer,
     CommentSerializer, CommentCreateSerializer
 )
-
-FUNDING_ALERT_TITLES = (
-    'Funding Failed',
-    'Funding Returned',
-    'Funding Cancelled',
-)
+from .services import FUNDING_ALERT_TITLES
 
 
 class ActivityHistoryViewSet(viewsets.ModelViewSet):
@@ -84,14 +79,20 @@ class ActivityHistoryViewSet(viewsets.ModelViewSet):
         except (TypeError, ValueError):
             days = 14
 
-        qs = (
+        # Over-fetch then drop resolved rows in Python so SQLite/Postgres both
+        # treat missing metadata.is_resolved as unresolved (SQL NULL ≠ True).
+        candidates = list(
             ActivityHistory.objects.filter(
                 title__in=FUNDING_ALERT_TITLES,
                 created_at__gte=timezone.now() - timedelta(days=days),
             )
             .select_related('customer', 'loan')
-            .order_by('-created_at')[:limit]
+            .order_by('-created_at')[: max(limit * 4, 40)]
         )
+        qs = [
+            row for row in candidates
+            if not (row.metadata or {}).get('is_resolved')
+        ][:limit]
         return Response(ActivityHistorySerializer(qs, many=True).data)
     
     @action(detail=False, methods=['get'])

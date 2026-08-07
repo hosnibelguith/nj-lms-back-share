@@ -92,7 +92,7 @@ class BankAccount(models.Model):
 
     @property
     def is_payment_blocked(self) -> bool:
-        """True when this account's institution may not move money via Zūm Rails."""
+        """True for agent-review institutions (621/623/703); funding may still proceed."""
         from .constants import is_payment_blocked_institution
 
         return is_payment_blocked_institution(self.institution_number)

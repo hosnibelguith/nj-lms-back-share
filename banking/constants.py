@@ -4,15 +4,18 @@
 # and the customer is asked to reconnect).
 UNSUPPORTED_IBV_INSTITUTIONS = frozenset({'621', '623'})
 
-# Institutions that must never be used as a Zūm Rails funding (AccountsPayable)
-# or collections (AccountsReceivable) account, regardless of how the account
-# entered the system (Flinks sync, manual void cheque, or Mohawk webhook).
-PAYMENT_BLOCKED_INSTITUTIONS = frozenset({'621', '623', '703'})
+# Institutions that need extra agent review before funding/collections.
+# Agents may still proceed after verifying PAD / payment history (not a hard block).
+PAYMENT_RISK_INSTITUTIONS = frozenset({'621', '623', '703'})
+# Backward-compatible alias used across the codebase / serializers.
+PAYMENT_BLOCKED_INSTITUTIONS = PAYMENT_RISK_INSTITUTIONS
 
-PAYMENT_BLOCKED_INSTITUTION_MESSAGE = (
-    'Institution {institution} cannot be used for funding or collections. '
-    'Select a different bank account.'
+PAYMENT_RISK_WARNING_MESSAGE = (
+    'Problematic bank (institution {institution}) — please verify that the client '
+    'has PAD payments or sufficient payment history in the account before proceeding.'
 )
+# Backward-compatible alias for older imports / tests.
+PAYMENT_BLOCKED_INSTITUTION_MESSAGE = PAYMENT_RISK_WARNING_MESSAGE
 
 
 def normalize_institution_number(raw_value):
@@ -22,10 +25,15 @@ def normalize_institution_number(raw_value):
 
 
 def is_payment_blocked_institution(raw_value) -> bool:
-    return normalize_institution_number(raw_value) in PAYMENT_BLOCKED_INSTITUTIONS
+    """True when the institution is in the agent-review risk set (621/623/703)."""
+    return normalize_institution_number(raw_value) in PAYMENT_RISK_INSTITUTIONS
 
 
 def payment_blocked_message(raw_value) -> str:
-    return PAYMENT_BLOCKED_INSTITUTION_MESSAGE.format(
+    return payment_risk_warning_message(raw_value)
+
+
+def payment_risk_warning_message(raw_value) -> str:
+    return PAYMENT_RISK_WARNING_MESSAGE.format(
         institution=normalize_institution_number(raw_value) or 'unknown'
     )

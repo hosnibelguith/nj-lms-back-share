@@ -987,6 +987,93 @@ class ZumRailsWorkflowTests(APITestCase):
             title="Funding Failed",
         ).latest("created_at")
         self.assertTrue(alert.metadata.get("staff_alert"))
+        self.assertFalse(alert.metadata.get("is_resolved"))
+
+    def test_funding_failure_alert_resolves_when_new_funding_initiated(self):
+        from activity.models import ActivityHistory
+
+        failed = FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="eft",
+            status="failed",
+            processor_transaction_id="funding-fail-resolve-1",
+            zum_status="Failed",
+            failure_reason="EftFailedInsufficientFunds",
+        )
+        alert = ActivityHistory.objects.create(
+            customer=self.customer,
+            loan=self.loan,
+            type="system",
+            title="Funding Failed",
+            description=failed.failure_reason,
+            created_by="system",
+            metadata={
+                "staff_alert": True,
+                "alert_kind": "funding_failure",
+                "failure_reason": failed.failure_reason,
+                "funded_payment_id": str(failed.id),
+                "is_resolved": False,
+            },
+        )
+
+        alerts = self.client.get("/api/activities/funding-alerts/")
+        self.assertEqual(alerts.status_code, 200)
+        self.assertTrue(any(row["id"] == str(alert.id) for row in alerts.data))
+
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/funding/initiate/",
+            {"method": "eft", "schedule_confirmed": True, "override_confirmed": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+
+        alert.refresh_from_db()
+        self.assertTrue(alert.metadata.get("is_resolved"))
+        self.assertEqual(alert.metadata.get("resolved_reason"), "new_funding_initiated")
+
+        alerts = self.client.get("/api/activities/funding-alerts/")
+        self.assertEqual(alerts.status_code, 200)
+        self.assertFalse(any(row["id"] == str(alert.id) for row in alerts.data))
+
+    def test_funding_failure_alert_resolves_when_funding_completes(self):
+        from activity.models import ActivityHistory
+
+        funding = FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="etransfer",
+            status="processing",
+            processor_transaction_id="funding-complete-resolve-1",
+        )
+        alert = ActivityHistory.objects.create(
+            customer=self.customer,
+            loan=self.loan,
+            type="system",
+            title="Funding Failed",
+            description="Prior attempt failed",
+            created_by="system",
+            metadata={
+                "staff_alert": True,
+                "alert_kind": "funding_failure",
+                "is_resolved": False,
+            },
+        )
+
+        response = self.post_webhook({
+            "Type": "Transaction",
+            "Data": {
+                "Id": funding.processor_transaction_id,
+                "TransactionStatus": "Completed",
+            },
+        })
+        self.assertEqual(response.status_code, 200)
+
+        alert.refresh_from_db()
+        self.assertTrue(alert.metadata.get("is_resolved"))
+        self.assertEqual(alert.metadata.get("resolved_reason"), "funding_completed")
+        alerts = self.client.get("/api/activities/funding-alerts/")
+        self.assertFalse(any(row["id"] == str(alert.id) for row in alerts.data))
 
     def test_funding_completed_transaction_event_activates_loan(self):
         funding = FundedPayment.objects.create(
@@ -1622,8 +1709,8 @@ class ZumRailsClientTests(APITestCase):
         self.assertEqual(payload["InteracNotificationChannel"], "email")
         # Non-AutoDeposit emails require Q&A — must not omit security question.
         self.assertTrue(payload["InteracHasSecurityQuestionAndAnswer"])
-        self.assertEqual(payload["InteracSecurityQuestion"], "What is your last name?")
-        self.assertEqual(payload["InteracSecurityAnswer"], "Doe")
+        self.assertEqual(payload["InteracSecurityQuestion"], "Mohawk")
+        self.assertEqual(payload["InteracSecurityAnswer"], "Loans")
 
     @patch("loans.zumrails.requests.request")
     @patch("loans.zumrails.requests.post")
@@ -1756,9 +1843,9 @@ class ZumRailsClientTests(APITestCase):
 
 @override_settings(ZUMRAILS_DRY_RUN=True)
 class BlockedInstitutionFundingTests(APITestCase):
-    """Institutions 621 / 623 / 703 must never fund or collect through Zūm Rails."""
+    """Institutions 621 / 623 / 703 warn agents but may still fund/collect."""
 
-    BLOCKED_INSTITUTIONS = ("621", "623", "703")
+    RISK_INSTITUTIONS = ("621", "623", "703")
 
     def setUp(self):
         self.staff = User.objects.create_user(
@@ -1808,49 +1895,64 @@ class BlockedInstitutionFundingTests(APITestCase):
         )
         self.client.force_authenticate(self.staff)
 
-    def blocked_account(self, institution):
+    def risk_account(self, institution):
         return BankAccount.objects.create(
             connection=self.connection,
             customer=self.customer,
             external_id=f"acct-{institution}",
-            name=f"Blocked {institution}",
+            name=f"Risk {institution}",
             type="checking",
             transit_number="54321",
             institution_number=institution,
             account_number="9876543210",
         )
 
-    def test_model_flags_blocked_institutions(self):
-        for institution in self.BLOCKED_INSTITUTIONS:
+    def test_model_flags_risk_institutions(self):
+        for institution in self.RISK_INSTITUTIONS:
             with self.subTest(institution=institution):
-                self.assertTrue(self.blocked_account(institution).is_payment_blocked)
+                self.assertTrue(self.risk_account(institution).is_payment_blocked)
         self.assertFalse(self.allowed_account.is_payment_blocked)
 
-    def test_configuration_endpoint_rejects_blocked_funding_account(self):
-        for institution in self.BLOCKED_INSTITUTIONS:
+    def test_configuration_endpoint_accepts_risk_funding_account_with_warning(self):
+        for institution in self.RISK_INSTITUTIONS:
             with self.subTest(institution=institution):
-                account = self.blocked_account(institution)
+                account = self.risk_account(institution)
                 response = self.client.patch(
                     f"/api/loans/{self.loan.id}/funding/configuration/",
                     {"eft_bank_account_id": str(account.id)},
                     format="json",
                 )
-                self.assertEqual(response.status_code, 400, response.data)
-                self.assertIn(institution, response.data["error"])
+                self.assertEqual(response.status_code, 200, response.data)
                 self.loan.refresh_from_db()
-                self.assertEqual(self.loan.bank_account_id, self.allowed_account.id)
+                self.assertEqual(self.loan.bank_account_id, account.id)
+                warnings = funding_configuration_ready(self.loan)["warnings"]
+                self.assertTrue(
+                    any(institution in warning for warning in warnings),
+                    warnings,
+                )
                 account.delete()
+                self.loan.bank_account = self.allowed_account
+                self.loan.save(update_fields=["bank_account"])
 
-    def test_configuration_endpoint_rejects_blocked_collections_account(self):
-        account = self.blocked_account("703")
+    def test_configuration_endpoint_accepts_risk_collections_account(self):
+        account = self.risk_account("703")
         response = self.client.patch(
             f"/api/loans/{self.loan.id}/funding/configuration/",
             {"collections_account_id": str(account.id)},
             format="json",
         )
-        self.assertEqual(response.status_code, 400, response.data)
+        self.assertEqual(response.status_code, 200, response.data)
         self.loan.refresh_from_db()
-        self.assertEqual(self.loan.collections_account_id, self.allowed_account.id)
+        self.assertEqual(self.loan.collections_account_id, account.id)
+        readiness = funding_configuration_ready(self.loan)
+        self.assertFalse(
+            any("703" in blocker for blocker in readiness["blockers"]),
+            readiness["blockers"],
+        )
+        self.assertTrue(
+            any("703" in warning for warning in readiness["warnings"]),
+            readiness["warnings"],
+        )
 
     def test_configuration_endpoint_still_accepts_allowed_account(self):
         response = self.client.patch(
@@ -1865,57 +1967,76 @@ class BlockedInstitutionFundingTests(APITestCase):
         )
         self.assertEqual(response.status_code, 200, response.data)
 
-    def test_funding_readiness_reports_blocked_account_as_blocker(self):
-        blocked = self.blocked_account("621")
-        self.loan.collections_account = blocked
+    def test_funding_readiness_reports_risk_account_as_warning_not_blocker(self):
+        risk = self.risk_account("621")
+        self.loan.collections_account = risk
         self.loan.save(update_fields=["collections_account"])
 
-        blockers = funding_configuration_ready(self.loan)["blockers"]
+        readiness = funding_configuration_ready(self.loan)
+        self.assertFalse(
+            any("621" in blocker for blocker in readiness["blockers"]),
+            readiness["blockers"],
+        )
         self.assertTrue(
-            any("621" in blocker for blocker in blockers),
-            blockers,
+            any("621" in warning for warning in readiness["warnings"]),
+            readiness["warnings"],
         )
 
-    def test_funding_initiate_rejects_blocked_collections_account(self):
-        blocked = self.blocked_account("623")
-        with self.assertRaises(ValueError) as ctx:
-            FundingService.initiate(
-                loan=self.loan,
-                method="eft",
-                schedule_confirmed=True,
-                user=self.staff,
-                collections_account=blocked,
-            )
-        self.assertIn("623", str(ctx.exception))
-        self.assertFalse(FundedPayment.objects.filter(loan=self.loan).exists())
+    def test_funding_initiate_allows_risk_collections_account(self):
+        risk = self.risk_account("623")
+        self.loan.collections_account = risk
+        self.loan.bank_account = risk
+        self.loan.funding_destination = {
+            "eft": {
+                "bank_account_id": str(risk.id),
+                "account": {
+                    "id": str(risk.id),
+                    "institution_number": "623",
+                    "transit_number": "54321",
+                    "account_number": "9876543210",
+                },
+            }
+        }
+        self.loan.save(
+            update_fields=["collections_account", "bank_account", "funding_destination"]
+        )
+        funded = FundingService.initiate(
+            loan=self.loan,
+            method="eft",
+            schedule_confirmed=True,
+            user=self.staff,
+            collections_account=risk,
+        )
+        self.assertIsNotNone(funded)
+        self.assertTrue(FundedPayment.objects.filter(loan=self.loan).exists())
 
-    def test_collections_account_change_rejects_blocked_account(self):
+    def test_collections_account_change_allows_risk_account(self):
         failed_payment = CollectionPayment.objects.create(
             loan=self.loan,
             amount=Decimal("100.00"),
             status="failed",
             failure_reason="EftFailedInsufficientFunds",
         )
-        blocked = self.blocked_account("703")
+        risk = self.risk_account("703")
 
-        with self.assertRaises(ValueError) as ctx:
-            CollectionService.change_account(
-                self.loan,
-                new_account=blocked,
-                failed_payment=failed_payment,
-                user=self.staff,
-            )
-        self.assertIn("703", str(ctx.exception))
+        CollectionService.change_account(
+            self.loan,
+            new_account=risk,
+            failed_payment=failed_payment,
+            user=self.staff,
+        )
         self.loan.refresh_from_db()
-        self.assertEqual(self.loan.collections_account_id, self.allowed_account.id)
+        self.assertEqual(self.loan.collections_account_id, risk.id)
 
-    def test_zumrails_user_payload_is_the_final_backstop(self):
-        """Even if a blocked account slips through, coordinates never reach Zūm."""
-        for institution in self.BLOCKED_INSTITUTIONS:
+    def test_zumrails_user_payload_allows_risk_institutions(self):
+        for institution in self.RISK_INSTITUTIONS:
             with self.subTest(institution=institution):
-                account = self.blocked_account(institution)
-                with self.assertRaises(ZumRailsConfigurationError):
-                    ZumRailsService.user_payload(self.customer, account=account)
+                account = self.risk_account(institution)
+                payload = ZumRailsService.user_payload(self.customer, account=account)
+                self.assertEqual(
+                    payload["BankAccountInformation"]["InstitutionNumber"],
+                    institution,
+                )
                 account.delete()
 
     def test_zumrails_user_payload_allows_supported_institution(self):

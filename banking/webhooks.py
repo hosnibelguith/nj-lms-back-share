@@ -196,8 +196,8 @@ def process_banking_analysis_payload(payload: dict):
         bool(connection),
     )
 
-    primary_blocked = is_payment_blocked_institution(primary.get('institution_number'))
-    eft_incomplete = not _coords_complete(primary) or primary_blocked
+    primary_risk = is_payment_blocked_institution(primary.get('institution_number'))
+    eft_incomplete = not _coords_complete(primary)
     exception_note = ''
     primary_account = None
 
@@ -205,16 +205,17 @@ def process_banking_analysis_payload(payload: dict):
         exception_note = 'Missing login_id'
     elif connection is None:
         exception_note = 'No bank connection found for login_id'
-    elif primary_blocked:
-        exception_note = (
-            'Primary bank account institution '
-            f"{normalize_institution_number(primary.get('institution_number'))} "
-            'is not allowed for funding or collections'
-        )
     elif eft_incomplete:
         exception_note = 'Primary bank account coordinates incomplete'
     else:
         primary_account = _apply_primary_eft_account(connection, primary)
+        if primary_risk:
+            # Agent-review institutions (621/623/703) may still be used after verification.
+            exception_note = (
+                'Problematic bank (institution '
+                f"{normalize_institution_number(primary.get('institution_number'))}) — "
+                'verify PAD / payment history before funding or collections.'
+            )
 
     processing_status = 'exception' if exception_note and (
         not login_id or connection is None

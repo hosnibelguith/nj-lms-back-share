@@ -16,7 +16,7 @@ from django.core.cache import cache
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from banking.constants import payment_blocked_message
+from banking.constants import payment_risk_warning_message
 from banking.models import BankAccount
 
 from .models import (
@@ -138,16 +138,19 @@ def add_business_days(start_dt, days: int):
 
 
 def assert_payment_account_allowed(account: BankAccount | None, *, role: str) -> None:
-    """Reject blocked institutions before any Zūm Rails funding/collections use.
+    """No-op: 621/623/703 are agent-review warnings, not hard blocks.
 
-    ZumRailsConfigurationError subclasses ValueError, so existing callers that
-    handle ValueError keep their behaviour.
+    Call sites remain so older code paths stay stable. Warnings are surfaced via
+    ``funding_configuration_ready()["warnings"]`` and the staff UI.
     """
+    return None
+
+
+def payment_account_risk_warning(account: BankAccount | None, *, role: str) -> str | None:
+    """Return a non-blocking warning when the account is a problematic institution."""
     if account is None or not account.is_payment_blocked:
-        return
-    raise ZumRailsConfigurationError(
-        f"{role}: {payment_blocked_message(account.institution_number)}"
-    )
+        return None
+    return f"{role}: {payment_risk_warning_message(account.institution_number)}"
 
 
 def account_snapshot(account: BankAccount | None) -> dict:
@@ -415,6 +418,9 @@ def apply_funded_payment_zum_status(
                 "ZūmRails confirmed funding completion.",
                 metadata={"funded_payment_id": str(funding.id)},
             )
+        from activity.services import resolve_funding_failure_alerts
+
+        resolve_funding_failure_alerts(funding.loan, reason="funding_completed")
         return funding
 
     if status_value == "Returned":
@@ -433,6 +439,7 @@ def apply_funded_payment_zum_status(
                     "staff_alert": True,
                     "alert_kind": "funding_failure",
                     "failure_reason": display_reason,
+                    "is_resolved": False,
                 },
             )
         else:
@@ -463,6 +470,7 @@ def apply_funded_payment_zum_status(
                     "staff_alert": True,
                     "alert_kind": "funding_failure",
                     "failure_reason": display_reason,
+                    "is_resolved": False,
                 },
             )
         else:
@@ -485,6 +493,7 @@ def apply_funded_payment_zum_status(
                     "staff_alert": True,
                     "alert_kind": "funding_failure",
                     "failure_reason": display_reason,
+                    "is_resolved": False,
                 },
             )
         else:
@@ -588,6 +597,7 @@ def funding_configuration_ready(loan: Loan) -> dict:
     eft_configured = bool(eft.get("account") or loan.bank_account)
     collections_configured = bool(collections_account)
     blockers = []
+    warnings = []
     arrive_loan = is_arrive_funded_loan(loan)
     active_funding = get_active_funding_attempt(loan)
     if loan.status != "pending_funding":
@@ -609,10 +619,12 @@ def funding_configuration_ready(loan: Loan) -> dict:
         # collections (repayment) bank account when multiple chequing accounts exist.
         blockers.append("Collections account required.")
 
-    if collections_account and collections_account.is_payment_blocked:
-        blockers.append(
-            f"Collections account: {payment_blocked_message(collections_account.institution_number)}"
-        )
+    # Problematic banks (621/623/703): warn only — agents may still proceed.
+    warning = payment_account_risk_warning(
+        collections_account, role="Collections account"
+    )
+    if warning:
+        warnings.append(warning)
     if not arrive_loan:
         eft_account = loan.bank_account
         eft_account_id = eft.get("bank_account_id") or (eft.get("account") or {}).get("id")
@@ -621,10 +633,9 @@ def funding_configuration_ready(loan: Loan) -> dict:
                 BankAccount.objects.filter(id=eft_account_id, customer_id=loan.customer_id).first()
                 or eft_account
             )
-        if eft_account and eft_account.is_payment_blocked:
-            blockers.append(
-                f"Funding account: {payment_blocked_message(eft_account.institution_number)}"
-            )
+        warning = payment_account_risk_warning(eft_account, role="Funding account")
+        if warning:
+            warnings.append(warning)
 
     active_reason = None
     if active_funding:
@@ -648,6 +659,7 @@ def funding_configuration_ready(loan: Loan) -> dict:
             ["card_issuance"] if arrive_loan else ["eft", "etransfer"]
         ),
         "blockers": blockers,
+        "warnings": warnings,
     }
 
 
@@ -927,34 +939,21 @@ class ZumRailsService:
         """Build Interac Q&A fields for AccountsPayable.
 
         Zum rejects non-AutoDeposit emails when InteracHasSecurityQuestionAndAnswer
-        is false ("Security Question Needed For Provided Email"). Always send a
-        valid question/answer (configurable via GlobalSetting / env).
+        is false ("Security Question Needed For Provided Email"). Always send one
+        shared company question/answer (API Integrations / env; defaults Mohawk/Loans).
         """
+        # user_payload kept for call-site compatibility; Q&A is company-wide.
         question = str(
-            cls._setting(
-                "ZUMRAILS_INTERAC_SECURITY_QUESTION",
-                "What is your last name?",
-            )
-        ).strip()
-        answer = str(cls._setting("ZUMRAILS_INTERAC_SECURITY_ANSWER", "")).strip()
-
-        if not answer and isinstance(user_payload, dict):
-            # Prefer configured company answer; fall back to recipient last name.
-            raw_last = str(user_payload.get("LastName") or "")
-            answer = re.sub(
-                r"[^a-zA-Z0-9àâäèéêëîïôœùûüÿçÀÂÄÈÉÊËÎÏÔŒÙÛÜŸÇ]",
-                "",
-                raw_last,
-            )[:25]
+            cls._setting("ZUMRAILS_INTERAC_SECURITY_QUESTION", "Mohawk")
+        ).strip() or "Mohawk"
+        answer = str(
+            cls._setting("ZUMRAILS_INTERAC_SECURITY_ANSWER", "Loans")
+        ).strip() or "Loans"
 
         if not _INTERAC_QUESTION_PATTERN.fullmatch(question):
-            question = "What is your last name?"
-        if not _INTERAC_ANSWER_PATTERN.fullmatch(answer or ""):
-            raise ZumRailsConfigurationError(
-                "Interac security answer is not configured. Set "
-                "ZUMRAILS_INTERAC_SECURITY_ANSWER (3-25 letters/digits, no spaces) "
-                "in API Integrations, or ensure the customer last name is valid."
-            )
+            question = "Mohawk"
+        if not _INTERAC_ANSWER_PATTERN.fullmatch(answer):
+            answer = "Loans"
 
         return {
             "InteracNotificationChannel": "email",
@@ -1350,6 +1349,7 @@ class FundingService:
                         "alert_kind": "funding_failure",
                         "failure_reason": str(exc),
                         "method": method,
+                        "is_resolved": False,
                     },
                 )
             raise
@@ -1364,9 +1364,12 @@ class FundingService:
             "updated_at",
         ])
 
-        recommended_method = FundingMethodRecommendation.for_date()
-        from activity.services import actor_label
+        # New attempt accepted by Zūm — clear prior failure alerts from the bell.
+        from activity.services import actor_label, resolve_funding_failure_alerts
 
+        resolve_funding_failure_alerts(loan, reason="new_funding_initiated")
+
+        recommended_method = FundingMethodRecommendation.for_date()
         actor = actor_label(user)
         log_activity(
             loan,
@@ -1560,8 +1563,9 @@ class FundingService:
             reference=funding.reference,
             user=user,
         )
-        from activity.services import actor_label
+        from activity.services import actor_label, resolve_funding_failure_alerts
 
+        resolve_funding_failure_alerts(loan, reason="funding_completed")
         log_activity(
             loan,
             "system",

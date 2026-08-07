@@ -534,7 +534,7 @@ class ManualBankAccountStaffTests(TestCase):
         self.assertEqual(account_payload['account_number'], '1111111')
         self.assertFalse(account_payload['is_payment_blocked'])
 
-    def test_void_cheque_entry_rejects_blocked_institutions(self):
+    def test_void_cheque_entry_allows_risk_institutions_with_flag(self):
         for institution in ('621', '623', '703'):
             with self.subTest(institution=institution):
                 update = self.client.patch(
@@ -546,7 +546,8 @@ class ManualBankAccountStaffTests(TestCase):
                     },
                     format='json',
                 )
-                self.assertEqual(update.status_code, 400, update.data)
+                self.assertEqual(update.status_code, 200, update.data)
+                self.assertTrue(update.data.get('is_payment_blocked'))
 
                 create = self.client.post(
                     '/api/bank-accounts/manual/',
@@ -558,10 +559,11 @@ class ManualBankAccountStaffTests(TestCase):
                     },
                     format='json',
                 )
-                self.assertEqual(create.status_code, 400, create.data)
+                self.assertEqual(create.status_code, 201, create.data)
+                self.assertTrue(create.data.get('is_payment_blocked'))
 
         self.account.refresh_from_db()
-        self.assertEqual(self.account.institution_number, '001')
+        self.assertEqual(self.account.institution_number, '703')
 
 
 @override_settings(
@@ -570,7 +572,7 @@ class ManualBankAccountStaffTests(TestCase):
     MOHAWK_BANKING_ANALYSIS_API_KEY='test-mohawk-key',
 )
 class BlockedInstitutionBankingTests(TestCase):
-    """703 is accepted for IBV but may never become a funding/collections account."""
+    """703 is accepted for IBV; agents may fund/collect after verifying PAD history."""
 
     def setUp(self):
         self.client = APIClient()
@@ -599,14 +601,14 @@ class BlockedInstitutionBankingTests(TestCase):
             sync_status='synced',
         )
 
-    def test_flinks_sync_never_marks_blocked_account_primary(self):
+    def test_flinks_sync_prefers_non_risk_primary_but_flags_risk_account(self):
         tasks._persist_accounts(
             self.connection,
             self.customer,
             [
                 {
                     'Id': 'acct-703',
-                    'Title': 'Blocked 703',
+                    'Title': 'Risk 703',
                     'Type': 'Chequing',
                     'Currency': 'CAD',
                     'InstitutionNumber': '703',
@@ -627,13 +629,34 @@ class BlockedInstitutionBankingTests(TestCase):
             ],
         )
 
-        blocked = BankAccount.objects.get(connection=self.connection, external_id='acct-703')
+        risk = BankAccount.objects.get(connection=self.connection, external_id='acct-703')
         allowed = BankAccount.objects.get(connection=self.connection, external_id='acct-001')
-        self.assertFalse(blocked.is_primary)
-        self.assertTrue(blocked.is_payment_blocked)
+        self.assertFalse(risk.is_primary)
+        self.assertTrue(risk.is_payment_blocked)
         self.assertTrue(allowed.is_primary)
 
-    def test_mohawk_webhook_flags_blocked_primary_instead_of_using_it(self):
+    def test_flinks_sync_allows_risk_only_account_as_primary(self):
+        tasks._persist_accounts(
+            self.connection,
+            self.customer,
+            [
+                {
+                    'Id': 'acct-703-only',
+                    'Title': 'Only 703',
+                    'Type': 'Chequing',
+                    'Currency': 'CAD',
+                    'InstitutionNumber': '703',
+                    'TransitNumber': '11111',
+                    'AccountNumber': '1111111',
+                    'Transactions': [],
+                },
+            ],
+        )
+        risk = BankAccount.objects.get(connection=self.connection, external_id='acct-703-only')
+        self.assertTrue(risk.is_primary)
+        self.assertTrue(risk.is_payment_blocked)
+
+    def test_mohawk_webhook_applies_risk_primary_with_warning_note(self):
         response = self.client.post(
             '/api/integrations/mohawk/banking-analysis/',
             {
@@ -656,16 +679,16 @@ class BlockedInstitutionBankingTests(TestCase):
         from banking.models import BankingAnalysisEvent
 
         event = BankingAnalysisEvent.objects.get(event_id='blocked-primary-1')
-        self.assertTrue(event.eft_setup_incomplete)
+        self.assertFalse(event.eft_setup_incomplete)
         self.assertIn('703', event.exception_note)
-        self.assertIsNone(event.primary_account)
-        self.assertFalse(
+        self.assertIsNotNone(event.primary_account)
+        self.assertTrue(
             BankAccount.objects.filter(
                 connection=self.connection,
                 use_for_eft_funding=True,
             ).exists()
         )
-        self.assertFalse(
+        self.assertTrue(
             BankAccount.objects.filter(
                 connection=self.connection,
                 use_for_eft_collections=True,

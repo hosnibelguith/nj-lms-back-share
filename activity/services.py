@@ -1,7 +1,44 @@
 """Staff-facing activity / audit trail helpers."""
 from __future__ import annotations
 
+from django.utils import timezone
+
 from activity.models import ActivityHistory
+
+# Staff bell / funding-alerts feed.
+FUNDING_ALERT_TITLES = (
+    "Funding Failed",
+    "Funding Returned",
+    "Funding Cancelled",
+)
+
+
+def resolve_funding_failure_alerts(loan, *, reason: str = "resolved") -> int:
+    """Mark unresolved funding failure alerts for a loan so they leave the bell.
+
+    Called when a new funding attempt is successfully initiated or funding completes.
+    Uses metadata.is_resolved (no schema migration).
+    """
+    if loan is None or getattr(loan, "id", None) is None:
+        return 0
+
+    qs = ActivityHistory.objects.filter(
+        loan_id=loan.id,
+        title__in=FUNDING_ALERT_TITLES,
+    )
+    updated = 0
+    now_iso = timezone.now().isoformat()
+    for activity in qs.iterator():
+        meta = dict(activity.metadata or {})
+        if meta.get("is_resolved") is True:
+            continue
+        meta["is_resolved"] = True
+        meta["resolved_at"] = now_iso
+        meta["resolved_reason"] = reason
+        activity.metadata = meta
+        activity.save(update_fields=["metadata"])
+        updated += 1
+    return updated
 
 
 def actor_label(user) -> str:

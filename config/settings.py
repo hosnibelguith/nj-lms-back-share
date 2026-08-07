@@ -370,12 +370,16 @@ ZUMRAILS_FUNDING_SOURCE_ID = os.environ.get("ZUMRAILS_FUNDING_SOURCE_ID", "")
 ZUMRAILS_WEBHOOK_SECRET = os.environ.get("ZUMRAILS_WEBHOOK_SECRET", "")
 ZUMRAILS_DRY_RUN = os.environ.get("ZUMRAILS_DRY_RUN", "True" if DEBUG else "False").lower() == "true"
 # Interac AP: required when recipient email is not enrolled for AutoDeposit.
+# One shared company Q&A for all customers (override via env / API Integrations).
 ZUMRAILS_INTERAC_SECURITY_QUESTION = os.environ.get(
     "ZUMRAILS_INTERAC_SECURITY_QUESTION",
-    "What is your last name?",
+    "Mohawk",
 )
-# Optional company-wide answer (3-25 letters/digits, no spaces). Falls back to customer last name.
-ZUMRAILS_INTERAC_SECURITY_ANSWER = os.environ.get("ZUMRAILS_INTERAC_SECURITY_ANSWER", "")
+# 3-25 letters/digits, no spaces (Zum constraint).
+ZUMRAILS_INTERAC_SECURITY_ANSWER = os.environ.get(
+    "ZUMRAILS_INTERAC_SECURITY_ANSWER",
+    "Loans",
+)
 
 
 # -------------------------------------------------------------------

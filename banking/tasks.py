@@ -208,6 +208,7 @@ def _delete_unsupported_banking_connection(connection, customer, reason, institu
 
 def _persist_accounts(connection, customer, accounts_data):
     primary_assigned = False
+    risk_primary_candidate = None
     account_count = 0
     transaction_count = 0
 
@@ -232,14 +233,16 @@ def _persist_accounts(connection, customer, accounts_data):
             },
         )
 
-        if (
-            not primary_assigned
-            and normalized_type in {'checking', 'savings'}
-            and not is_payment_blocked_institution(acc.get('InstitutionNumber'))
-        ):
-            account_obj.is_primary = True
-            account_obj.save(update_fields=['is_primary', 'updated_at'])
-            primary_assigned = True
+        if not primary_assigned and normalized_type in {'checking', 'savings'}:
+            # Prefer non-risk banks for primary; allow 621/623/703 when that is all
+            # the customer has (agent warning before funding/collections).
+            if is_payment_blocked_institution(acc.get('InstitutionNumber')):
+                if risk_primary_candidate is None:
+                    risk_primary_candidate = account_obj
+            else:
+                account_obj.is_primary = True
+                account_obj.save(update_fields=['is_primary', 'updated_at'])
+                primary_assigned = True
 
         transactions = acc.get('Transactions') or []
         transaction_count += len(transactions)
@@ -256,6 +259,12 @@ def _persist_accounts(connection, customer, accounts_data):
                     'balance': tx.get('Balance'),
                 },
             )
+
+    if not primary_assigned and risk_primary_candidate is not None:
+        risk_primary_candidate.is_primary = True
+        risk_primary_candidate.save(update_fields=['is_primary', 'updated_at'])
+        primary_assigned = True
+
     logger.info(
         'Flinks accounts persisted customer_id=%s connection_id=%s accounts=%s transactions=%s primary_assigned=%s',
         customer.id,

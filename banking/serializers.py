@@ -1,5 +1,4 @@
 from rest_framework import serializers
-from .constants import is_payment_blocked_institution, payment_blocked_message
 from .models import BankConnection, BankAccount, BankTransaction, FinancialAnalysisReport
 
 
@@ -59,8 +58,7 @@ class BankAccountManualCoordinatesSerializer(serializers.Serializer):
         digits = _digits_only(value)
         if len(digits) != 3:
             raise serializers.ValidationError('Institution number must be 3 digits.')
-        if is_payment_blocked_institution(digits):
-            raise serializers.ValidationError(payment_blocked_message(digits))
+        # 621/623/703 are allowed with an agent warning in the funding UI — not rejected here.
         return digits
 
     def validate_transit_number(self, value):
