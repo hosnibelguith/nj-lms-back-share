@@ -220,48 +220,38 @@ class BankingConnectTests(TestCase):
 
         return connection, result
 
-    def test_institution_621_is_rejected_and_connection_is_deleted(self):
+    def test_institution_621_is_saved_like_any_other_bank(self):
         connection, result = self._sync_payload_with_institution('621')
 
         self.customer_a.refresh_from_db()
-        self.assertFalse(result)
-        self.assertFalse(BankConnection.objects.filter(id=connection.id).exists())
-        self.assertEqual(BankAccount.objects.filter(customer=self.customer_a).count(), 0)
-        self.assertFalse(self.customer_a.banking_verified)
-        self.assertEqual(self.customer_a.onboarding_stage, 'banking_verification')
-        activity = ActivityHistory.objects.get(
-            customer=self.customer_a,
-            metadata__reason_code=tasks.UNSUPPORTED_IBV_REASON_CODE,
+        self.assertTrue(result)
+        self.assertTrue(BankConnection.objects.filter(id=connection.id).exists())
+        account = BankAccount.objects.get(customer=self.customer_a, institution_number='621')
+        self.assertTrue(account.is_payment_blocked)
+        self.assertTrue(self.customer_a.banking_verified)
+        self.assertFalse(
+            ActivityHistory.objects.filter(
+                customer=self.customer_a,
+                metadata__reason_code=tasks.UNSUPPORTED_IBV_REASON_CODE,
+            ).exists()
         )
-        self.assertEqual(activity.title, 'Banking Verification Reset')
-        self.assertEqual(activity.metadata['reason_code'], tasks.UNSUPPORTED_IBV_REASON_CODE)
-        self.assertEqual(activity.metadata['unsupported_institutions'], ['621'])
-        self.assertEqual(len(mail.outbox), 1)
-        self.assertIn('Please refill IBV', mail.outbox[0].body)
-        self.assertIn('will not count as completed', mail.outbox[0].body)
 
         self.client.force_authenticate(user=self.user_a)
         response = self.client.get('/api/portal/me/banking/')
         self.assertEqual(response.status_code, 200, response.data)
-        self.assertTrue(response.data['requires_ibv_refill'])
-        self.assertEqual(response.data['failure_reason_code'], tasks.UNSUPPORTED_IBV_REASON_CODE)
+        self.assertFalse(response.data['requires_ibv_refill'])
 
-    def test_institution_623_is_rejected_and_connection_is_deleted(self):
+    def test_institution_623_is_saved_like_any_other_bank(self):
         connection, result = self._sync_payload_with_institution('623')
 
         self.customer_a.refresh_from_db()
-        self.assertFalse(result)
-        self.assertFalse(BankConnection.objects.filter(id=connection.id).exists())
-        self.assertEqual(BankAccount.objects.filter(customer=self.customer_a).count(), 0)
-        self.assertFalse(self.customer_a.banking_verified)
-        self.assertEqual(self.customer_a.onboarding_stage, 'banking_verification')
-        activity = ActivityHistory.objects.get(
-            customer=self.customer_a,
-            metadata__reason_code=tasks.UNSUPPORTED_IBV_REASON_CODE,
-        )
-        self.assertEqual(activity.metadata['unsupported_institutions'], ['623'])
+        self.assertTrue(result)
+        self.assertTrue(BankConnection.objects.filter(id=connection.id).exists())
+        account = BankAccount.objects.get(customer=self.customer_a, institution_number='623')
+        self.assertTrue(account.is_payment_blocked)
+        self.assertTrue(self.customer_a.banking_verified)
 
-    def test_purge_command_removes_existing_unsupported_connection(self):
+    def test_purge_command_is_noop_when_no_auto_reject_institutions(self):
         self.customer_a.banking_verified = True
         self.customer_a.onboarding_stage = 'contract'
         self.customer_a.save(update_fields=['banking_verified', 'onboarding_stage', 'updated_at'])
@@ -276,7 +266,7 @@ class BankingConnectTests(TestCase):
             connection=connection,
             customer=self.customer_a,
             external_id='acct-stale-621',
-            name='Unsupported Chequing',
+            name='Risk Chequing',
             type='checking',
             institution_number='621',
             transit_number='12345',
@@ -287,21 +277,10 @@ class BankingConnectTests(TestCase):
         call_command('purge_unsupported_ibv_connections', stdout=output)
 
         self.customer_a.refresh_from_db()
-        self.assertFalse(BankConnection.objects.filter(id=connection.id).exists())
-        self.assertEqual(BankAccount.objects.filter(customer=self.customer_a).count(), 0)
-        self.assertFalse(self.customer_a.banking_verified)
-        self.assertEqual(self.customer_a.onboarding_stage, 'banking_verification')
-        activity = ActivityHistory.objects.get(
-            customer=self.customer_a,
-            metadata__reason_code=tasks.UNSUPPORTED_IBV_REASON_CODE,
-        )
-        self.assertEqual(activity.title, 'Banking Verification Reset')
-        self.assertEqual(activity.metadata['source'], 'unsupported_ibv_cleanup')
-        self.assertEqual(activity.metadata['reason_code'], tasks.UNSUPPORTED_IBV_REASON_CODE)
-        self.assertEqual(activity.metadata['unsupported_institutions'], ['621'])
-        self.assertEqual(len(mail.outbox), 1)
-        self.assertIn('Please refill IBV', mail.outbox[0].body)
-        self.assertIn('Deleted 1 unsupported IBV connection(s)', output.getvalue())
+        self.assertTrue(BankConnection.objects.filter(id=connection.id).exists())
+        self.assertEqual(BankAccount.objects.filter(customer=self.customer_a).count(), 1)
+        self.assertTrue(self.customer_a.banking_verified)
+        self.assertIn('0 unsupported IBV connection', output.getvalue())
 
 
 @override_settings(

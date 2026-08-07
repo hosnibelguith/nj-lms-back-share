@@ -1,8 +1,8 @@
 """Institution-number rules shared by IBV ingestion and Zūm Rails money movement."""
 
-# Institutions that make an entire IBV connection unusable (connection is deleted
-# and the customer is asked to reconnect).
-UNSUPPORTED_IBV_INSTITUTIONS = frozenset({'621', '623'})
+# Legacy: previously auto-deleted Flinks connections for 621/623. Empty so IBV
+# saves those banks like any other; agents decline with "Unsupported bank" if needed.
+UNSUPPORTED_IBV_INSTITUTIONS = frozenset()
 
 # Institutions that need extra agent review before funding/collections.
 # Agents may still proceed after verifying PAD / payment history (not a hard block).

@@ -28,7 +28,7 @@ New customers are created with `status=pending`.
 ### Banking business rules
 
 - Success requires at least one account and total transaction count > 0 across **all** accounts.
-- Institution numbers `621` and `623` are rejected.
+- Institution numbers `621`, `623`, and `703` are saved normally; agents may decline with “Unsupported bank” and see a funding warning.
 - On failure: `sync_status=failed`, activity logged, retry email sent (`Action Required: Please reconnect your bank account`).
 - Flinks holder `Email` / `PhoneNumber` saved to `User.flinks_email` / `User.flinks_phone`.
 

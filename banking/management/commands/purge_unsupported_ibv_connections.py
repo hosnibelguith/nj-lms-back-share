@@ -13,7 +13,10 @@ from banking.tasks import (
 
 
 class Command(BaseCommand):
-    help = "Delete IBV connections containing unsupported institution numbers 621 or 623."
+    help = (
+        "Legacy cleanup for auto-rejected IBV institutions. "
+        "No-op while UNSUPPORTED_IBV_INSTITUTIONS is empty (621/623 are saved normally)."
+    )
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -24,6 +27,14 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         dry_run = options["dry_run"]
+        if not UNSUPPORTED_IBV_INSTITUTIONS:
+            self.stdout.write(
+                "No auto-rejected IBV institutions configured "
+                "(UNSUPPORTED_IBV_INSTITUTIONS is empty). "
+                "Deleted 0 unsupported IBV connection(s)."
+            )
+            return
+
         connection_institutions = {}
 
         for account in BankAccount.objects.select_related("connection"):

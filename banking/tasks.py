@@ -516,19 +516,8 @@ def fetch_flinks_accounts_only(self, connection_id):
     if total_transactions == 0:
         return _mark_banking_failed(connection, customer, ZERO_TRANSACTIONS_MESSAGE)
 
-    unsupported_institutions = _unsupported_institutions(accounts_data)
-    if unsupported_institutions:
-        reason = (
-            f"{UNSUPPORTED_INSTITUTION_MESSAGE} "
-            f"Unsupported institution number(s): {', '.join(sorted(unsupported_institutions))}."
-        )
-        return _delete_unsupported_banking_connection(
-            connection,
-            customer,
-            reason,
-            unsupported_institutions,
-        )
-
+    # 621/623/703 are persisted like any other bank. Agents may decline with
+    # "Unsupported bank"; funding UI shows a non-blocking risk warning.
     flinks_email, flinks_phone, flinks_name = _extract_holder_identity(accounts_data)
     _persist_accounts(connection, customer, accounts_data)
     return _mark_banking_success(connection, customer, flinks_email, flinks_phone, flinks_name)

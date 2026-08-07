@@ -443,7 +443,7 @@ class ZumRailsWorkflowTests(APITestCase):
 
         self.assertIn(response.status_code, [400, 403])
         if response.status_code == 400:
-        self.assertIn("schedule_confirmed", response.data)
+            self.assertIn("schedule_confirmed", response.data)
 
     def test_adjust_schedule_reprices_daily_interest_from_selected_terms(self):
         formula = LoanFormula.objects.create(

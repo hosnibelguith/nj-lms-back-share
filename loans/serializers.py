@@ -571,6 +571,7 @@ class LoanDeclineSerializer(serializers.Serializer):
         'new bank account',
         'new job',
         'Unacceptable bank',
+        'Unsupported bank',
     )
 
     reason = serializers.ChoiceField(choices=[(r, r) for r in ALLOWED_REASONS])
