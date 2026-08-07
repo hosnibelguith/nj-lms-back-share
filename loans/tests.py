@@ -932,6 +932,86 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(self.loan.status, "active")
         self.assertIsNotNone(self.loan.funded_at)
 
+    def test_funding_completed_heals_loan_stuck_pending_funding(self):
+        """Succeeded AP already marked completed locally must still activate the loan."""
+        FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="etransfer",
+            status="completed",
+            processor_transaction_id="funding-heal-1",
+            zum_status="Completed",
+            completed_at=timezone.now(),
+        )
+        self.assertEqual(self.loan.status, "pending_funding")
+
+        response = self.client.get(f"/api/loans/{self.loan.id}/funding/options/")
+        self.assertEqual(response.status_code, 200)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "active")
+        self.assertTrue(self.loan.is_active)
+
+    def test_interac_security_question_failure_notifies_and_unlocks(self):
+        from activity.models import ActivityHistory
+
+        funding = FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="etransfer",
+            status="processing",
+            processor_transaction_id="interac-sq-1",
+            zum_status="InProgress",
+        )
+        message = (
+            "Interac Failed Security Question Needed For Provided Email. "
+            "The provided e-mail is not authorized to receive transfers without security question."
+        )
+
+        response = self.post_webhook({
+            "Type": "Transaction",
+            "Data": {
+                "Id": funding.processor_transaction_id,
+                "TransactionStatus": "InProgress",
+                "MemberMessage": message,
+            },
+        })
+
+        self.assertEqual(response.status_code, 200)
+        funding.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(funding.status, "failed")
+        self.assertIn("Security Question", funding.failure_reason)
+        self.assertEqual(self.loan.status, "pending_funding")
+        alert = ActivityHistory.objects.filter(
+            loan=self.loan,
+            title="Funding Failed",
+        ).latest("created_at")
+        self.assertTrue(alert.metadata.get("staff_alert"))
+
+    def test_funding_completed_transaction_event_activates_loan(self):
+        funding = FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="etransfer",
+            status="processing",
+            processor_transaction_id="funding-event-complete-1",
+        )
+
+        response = self.post_webhook({
+            "Type": "TransactionEvent",
+            "Data": {
+                "Id": funding.processor_transaction_id,
+                "Event": "Completed",
+                "TransactionStatus": "Completed",
+            },
+        })
+
+        self.assertEqual(response.status_code, 200)
+        funding.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(funding.status, "completed")
+        self.assertEqual(self.loan.status, "active")
+
     def test_official_root_webhook_shape_is_idempotent(self):
         funding = FundedPayment.objects.create(
             loan=self.loan,
@@ -1540,7 +1620,10 @@ class ZumRailsClientTests(APITestCase):
         self.assertEqual(mock_post.call_count, 1)
         payload = mock_request.call_args.kwargs["json"]
         self.assertEqual(payload["InteracNotificationChannel"], "email")
-        self.assertFalse(payload["InteracHasSecurityQuestionAndAnswer"])
+        # Non-AutoDeposit emails require Q&A — must not omit security question.
+        self.assertTrue(payload["InteracHasSecurityQuestionAndAnswer"])
+        self.assertEqual(payload["InteracSecurityQuestion"], "What is your last name?")
+        self.assertEqual(payload["InteracSecurityAnswer"], "Doe")
 
     @patch("loans.zumrails.requests.request")
     @patch("loans.zumrails.requests.post")

@@ -780,6 +780,8 @@ class ApiIntegrationsSerializer(serializers.Serializer):
     zum_wallet_id = serializers.CharField(required=False, allow_blank=True)
     zum_funding_source_id = serializers.CharField(required=False, allow_blank=True)
     zum_webhook_secret = serializers.CharField(required=False, allow_blank=True)
+    zum_interac_security_question = serializers.CharField(required=False, allow_blank=True)
+    zum_interac_security_answer = serializers.CharField(required=False, allow_blank=True)
     webhook_url = serializers.CharField(required=False, allow_blank=True)
     arrive_api_key = serializers.CharField(required=False, allow_blank=True)
     arrive_webhook_url = serializers.CharField(required=False, allow_blank=True)
@@ -802,6 +804,8 @@ class ApiIntegrationsSerializer(serializers.Serializer):
             'zum_wallet_id': 'ZUMRAILS_WALLET_ID',
             'zum_funding_source_id': 'ZUMRAILS_FUNDING_SOURCE_ID',
             'zum_webhook_secret': 'ZUMRAILS_WEBHOOK_SECRET',
+            'zum_interac_security_question': 'ZUMRAILS_INTERAC_SECURITY_QUESTION',
+            'zum_interac_security_answer': 'ZUMRAILS_INTERAC_SECURITY_ANSWER',
             'webhook_url': 'WEBHOOK_URL',
             'arrive_api_key': 'ARRIVE_API_KEY',
             'arrive_webhook_url': 'ARRIVE_WEBHOOK_URL',

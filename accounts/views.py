@@ -53,6 +53,8 @@ class ApiIntegrationsView(APIView):
             'ZUMRAILS_WALLET_ID': 'zum_wallet_id',
             'ZUMRAILS_FUNDING_SOURCE_ID': 'zum_funding_source_id',
             'ZUMRAILS_WEBHOOK_SECRET': 'zum_webhook_secret',
+            'ZUMRAILS_INTERAC_SECURITY_QUESTION': 'zum_interac_security_question',
+            'ZUMRAILS_INTERAC_SECURITY_ANSWER': 'zum_interac_security_answer',
             'WEBHOOK_URL': 'webhook_url',
             'ARRIVE_API_KEY': 'arrive_api_key',
             'ARRIVE_WEBHOOK_URL': 'arrive_webhook_url',

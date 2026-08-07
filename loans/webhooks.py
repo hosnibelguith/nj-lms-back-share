@@ -1,4 +1,5 @@
 import json
+import re
 import uuid
 
 from django.db import transaction
@@ -17,7 +18,9 @@ from .zumrails import (
     extract_zum_transaction_fields,
     is_zum_failed_status,
     log_activity,
+    normalize_zum_status,
     payload_hash,
+    reason_implies_interac_security_failure,
     release_funding_locks,
     verify_zumrails_signature,
 )
@@ -51,12 +54,14 @@ def _is_returned_or_rejected(status_value):
 
 
 def _is_failure_event(event_name):
+    if not isinstance(event_name, str) or not event_name.strip():
+        return False
+    compact = re.sub(r"[\s_\-]+", "", event_name)
     return (
         event_name in ALL_FAILURE_EVENTS
-        or (
-            isinstance(event_name, str)
-            and event_name.startswith(("EftFailed", "InteracFailed"))
-        )
+        or event_name.startswith(("EftFailed", "InteracFailed"))
+        or compact.startswith(("EftFailed", "InteracFailed"))
+        or reason_implies_interac_security_failure(event_name)
     )
 
 
@@ -211,12 +216,26 @@ class ZumRailsWebhookView(APIView):
             history.append(history_item)
             funding.event_history = history
             funding.save(update_fields=["event_history", "updated_at"])
-            if _is_failure_event(event_name):
-                reason = _failure_reason(event_data, event_name or "Failed")
+            fields = extract_zum_transaction_fields(event_data)
+            reason = _failure_reason(event_data, event_name or "Failed")
+            if _is_failure_event(event_name) or reason_implies_interac_security_failure(reason):
                 apply_funded_payment_zum_status(
                     funding,
                     status_value="Failed",
                     reason=reason,
+                )
+                return
+            # Zum sometimes reports completion only as a TransactionEvent.
+            event_status = normalize_zum_status(
+                fields.get("status") or event_name
+            )
+            if event_status == "Completed" or (
+                isinstance(event_name, str) and event_name.strip().lower() == "completed"
+            ):
+                apply_funded_payment_zum_status(
+                    funding,
+                    status_value="Completed",
+                    reason=None,
                 )
 
     def _process_transaction(self, processor_transaction_id, status_value, event_data):

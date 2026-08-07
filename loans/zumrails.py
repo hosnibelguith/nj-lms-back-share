@@ -61,7 +61,18 @@ INTERAC_FAILURE_EVENTS = {
     "InteracFailedInvalidAccountNumber",
     "InteracFailedRequestBlockedByUser",
     "InteracFailedBulkCancellationRequest",
+    # Non-AutoDeposit recipient — Q&A required (see InteracHasSecurityQuestionAndAnswer).
+    "InteracFailedSecurityQuestionNeededForProvidedEmail",
 }
+
+# Zum InteracSecurityAnswer: 3–25 chars, letters/digits/accents only (no spaces).
+_INTERAC_ANSWER_PATTERN = re.compile(
+    r"^[a-zA-Z0-9àâäèéêëîïôœùûüÿçÀÂÄÈÉÊËÎÏÔŒÙÛÜŸÇ]{3,25}$"
+)
+# Zum InteracSecurityQuestion: 5–40 chars, limited punctuation.
+_INTERAC_QUESTION_PATTERN = re.compile(
+    r"^[^\s]([a-zA-Z0-9àâäèéêëîïôœùûüÿçÀÂÄÈÉÊËÎÏÔŒÙÛÜŸÇ \-.\?!,#]+)[^\s]$"
+)
 
 ALL_FAILURE_EVENTS = EFT_FAILURE_EVENTS | INTERAC_FAILURE_EVENTS
 TERMINAL_FAILURE_STATUSES = {"Returned", "Rejected"}
@@ -341,6 +352,16 @@ def is_terminal_zum_funding_status(status_value) -> bool:
     )
 
 
+def reason_implies_interac_security_failure(reason: str | None) -> bool:
+    """True for Zum MemberMessage / event text that requires Interac Q&A."""
+    text = (reason or "").strip().lower()
+    if not text:
+        return False
+    return "security question" in text and (
+        "interac" in text or "needed" in text or "not authorized" in text
+    )
+
+
 def apply_funded_payment_zum_status(
     funding: FundedPayment,
     *,
@@ -352,15 +373,41 @@ def apply_funded_payment_zum_status(
     reason = (reason or "").strip() or None
     display_reason = reason or status_value or "Failed"
 
+    # Human-readable Interac Q&A failures sometimes arrive while status is still InProgress.
+    if (
+        reason_implies_interac_security_failure(reason)
+        and status_value not in ("Completed", "Returned", "Cancelled")
+        and not is_zum_failed_status(status_value or "")
+    ):
+        status_value = "Failed"
+
     if status_value == "Completed":
         funding.zum_status = status_value
-        if funding.status == "processing":
-            funding.mark_completed()
-            if funding.loan.status != "active":
-                funding.loan.mark_funding_completed(
-                    method=funding.method,
-                    reference=funding.processor_transaction_id or "",
-                )
+        was_incomplete = funding.status != "completed"
+        loan_was_inactive = funding.loan.status != "active"
+
+        if funding.status != "completed":
+            # Heal processing/failed/cancelled rows when Zum confirms completion.
+            funding.failure_reason = None
+            funding.status = "completed"
+            if not funding.completed_at:
+                funding.completed_at = timezone.now()
+            funding.save(update_fields=[
+                "status",
+                "zum_status",
+                "failure_reason",
+                "completed_at",
+                "updated_at",
+            ])
+        else:
+            funding.save(update_fields=["zum_status", "updated_at"])
+
+        if funding.loan.status != "active":
+            funding.loan.mark_funding_completed(
+                method=funding.method,
+                reference=funding.processor_transaction_id or "",
+            )
+        if was_incomplete or loan_was_inactive:
             log_activity(
                 funding.loan,
                 "loan_funded",
@@ -368,8 +415,6 @@ def apply_funded_payment_zum_status(
                 "ZūmRails confirmed funding completion.",
                 metadata={"funded_payment_id": str(funding.id)},
             )
-        else:
-            funding.save(update_fields=["zum_status", "updated_at"])
         return funding
 
     if status_value == "Returned":
@@ -877,6 +922,47 @@ class ZumRailsService:
             raise ZumRailsConfigurationError("ZūmRails memo is invalid.")
         return memo
 
+    @classmethod
+    def interac_security_payload(cls, *, user_payload: dict | None = None) -> dict:
+        """Build Interac Q&A fields for AccountsPayable.
+
+        Zum rejects non-AutoDeposit emails when InteracHasSecurityQuestionAndAnswer
+        is false ("Security Question Needed For Provided Email"). Always send a
+        valid question/answer (configurable via GlobalSetting / env).
+        """
+        question = str(
+            cls._setting(
+                "ZUMRAILS_INTERAC_SECURITY_QUESTION",
+                "What is your last name?",
+            )
+        ).strip()
+        answer = str(cls._setting("ZUMRAILS_INTERAC_SECURITY_ANSWER", "")).strip()
+
+        if not answer and isinstance(user_payload, dict):
+            # Prefer configured company answer; fall back to recipient last name.
+            raw_last = str(user_payload.get("LastName") or "")
+            answer = re.sub(
+                r"[^a-zA-Z0-9àâäèéêëîïôœùûüÿçÀÂÄÈÉÊËÎÏÔŒÙÛÜŸÇ]",
+                "",
+                raw_last,
+            )[:25]
+
+        if not _INTERAC_QUESTION_PATTERN.fullmatch(question):
+            question = "What is your last name?"
+        if not _INTERAC_ANSWER_PATTERN.fullmatch(answer or ""):
+            raise ZumRailsConfigurationError(
+                "Interac security answer is not configured. Set "
+                "ZUMRAILS_INTERAC_SECURITY_ANSWER (3-25 letters/digits, no spaces) "
+                "in API Integrations, or ensure the customer last name is valid."
+            )
+
+        return {
+            "InteracNotificationChannel": "email",
+            "InteracHasSecurityQuestionAndAnswer": True,
+            "InteracSecurityQuestion": question[:40],
+            "InteracSecurityAnswer": answer[:25],
+        }
+
     @staticmethod
     def user_payload(customer, *, account: BankAccount | None = None, email=None) -> dict:
         phone = re.sub(r"\D", "", customer.phone or "")[-10:]
@@ -938,10 +1024,7 @@ class ZumRailsService:
         if comment:
             payload["Comment"] = comment
         if method == "Interac":
-            payload.update({
-                "InteracNotificationChannel": "email",
-                "InteracHasSecurityQuestionAndAnswer": False,
-            })
+            payload.update(cls.interac_security_payload(user_payload=user_payload))
 
         response_data = cls._result(
             cls._request(
@@ -1249,11 +1332,26 @@ class FundingService:
             # reached Zūm, so close the attempt and unlock the destination for retry.
             if isinstance(exc, ZumRailsRequestError) and exc.outcome_unknown:
                 funding.failure_reason = str(exc)
+                funding.save(update_fields=["failure_reason", "updated_at"])
             else:
                 funding.status = "failed"
                 funding.failure_reason = str(exc)
                 release_funding_locks(loan)
-            funding.save(update_fields=["status", "failure_reason", "updated_at"])
+                funding.save(update_fields=["status", "failure_reason", "updated_at"])
+                log_activity(
+                    loan,
+                    "system",
+                    "Funding Failed",
+                    str(exc),
+                    created_by=getattr(user, "id", "system"),
+                    metadata={
+                        "funded_payment_id": str(funding.id),
+                        "staff_alert": True,
+                        "alert_kind": "funding_failure",
+                        "failure_reason": str(exc),
+                        "method": method,
+                    },
+                )
             raise
 
         funding.processor_transaction_id = processor_id
@@ -1292,6 +1390,24 @@ class FundingService:
     @staticmethod
     def sync_active_funding_from_zum(loan: Loan) -> FundedPayment | None:
         """Refresh processing funding from Zum by transaction id (webhook fallback)."""
+        # Heal completed AP that never flipped the loan to active.
+        if loan.status == "pending_funding":
+            completed = (
+                FundedPayment.objects.filter(loan=loan, status="completed")
+                .order_by("-created_at")
+                .first()
+            )
+            if completed:
+                with transaction.atomic():
+                    locked = FundedPayment.objects.select_for_update().select_related(
+                        "loan"
+                    ).get(pk=completed.pk)
+                    return apply_funded_payment_zum_status(
+                        locked,
+                        status_value="Completed",
+                        reason=None,
+                    )
+
         funding = get_active_funding_attempt(loan)
         if not funding or funding.status != "processing":
             return funding
@@ -1299,12 +1415,17 @@ class FundingService:
         # Heal rows that already stored a terminal Zum status but stayed processing
         # (e.g. Cancelled was saved only on zum_status before unlock logic existed).
         local_zum_status = normalize_zum_status(funding.zum_status)
-        if local_zum_status and is_terminal_zum_funding_status(local_zum_status):
+        if local_zum_status and (
+            is_terminal_zum_funding_status(local_zum_status)
+            or local_zum_status == "Completed"
+        ):
             with transaction.atomic():
                 funding = FundedPayment.objects.select_for_update().select_related(
                     "loan"
                 ).get(pk=funding.pk)
-                if funding.status == "processing":
+                if funding.status == "processing" or (
+                    local_zum_status == "Completed" and funding.loan.status != "active"
+                ):
                     return apply_funded_payment_zum_status(
                         funding,
                         status_value=local_zum_status,
@@ -1335,7 +1456,7 @@ class FundingService:
             funding = FundedPayment.objects.select_for_update().select_related("loan").get(
                 pk=funding.pk
             )
-            if funding.status != "processing":
+            if funding.status != "processing" and normalize_zum_status(status_value) != "Completed":
                 return funding
             return apply_funded_payment_zum_status(
                 funding,
