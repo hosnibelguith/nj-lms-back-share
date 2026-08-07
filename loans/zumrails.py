@@ -1736,6 +1736,62 @@ class FundingConfigurationService:
         return f"{email}" + (f" ({source})" if source else "")
 
     @staticmethod
+    def default_customer_payment_account(customer) -> BankAccount | None:
+        """Primary / EFT-flagged payable account — same preference the staff UI shows."""
+        qs = BankAccount.objects.filter(customer=customer)
+        return (
+            qs.filter(use_for_eft_funding=True).order_by("-is_primary", "name").first()
+            or qs.filter(is_primary=True).order_by("name").first()
+            or qs.filter(type__in=["checking", "chequing", "savings"])
+            .order_by("-is_primary", "name")
+            .first()
+            or qs.order_by("-is_primary", "name").first()
+        )
+
+    @staticmethod
+    def ensure_defaults(loan: Loan, *, user=None) -> Loan:
+        """Persist the customer's default bank when the loan has no destinations yet.
+
+        The staff UI pre-fills the primary account locally. Without saving those
+        choices onto the loan, readiness still reports "Funding destination /
+        Collections account required" and Fund Customer stays disabled.
+        """
+        if loan.status not in FundingConfigurationService.CONFIGURABLE_STATUSES:
+            return loan
+        try:
+            assert_funding_configuration_editable(loan)
+        except ValueError:
+            return loan
+
+        arrive = is_arrive_funded_loan(loan)
+        configured = loan.funding_destination if isinstance(loan.funding_destination, dict) else {}
+        emt = configured.get("emt") if isinstance(configured.get("emt"), dict) else {}
+        eft = configured.get("eft") if isinstance(configured.get("eft"), dict) else {}
+        emt_configured = bool(emt.get("email"))
+        eft_configured = bool(
+            eft.get("account") or eft.get("bank_account_id") or loan.bank_account_id
+        )
+        collections_configured = bool(loan.collections_account_id or loan.bank_account_id)
+
+        needs_funding = not arrive and not emt_configured and not eft_configured
+        needs_collections = not collections_configured
+        if not needs_funding and not needs_collections:
+            return loan
+
+        account = FundingConfigurationService.default_customer_payment_account(loan.customer)
+        if not account:
+            return loan
+
+        kwargs = {}
+        if needs_funding:
+            kwargs["eft_bank_account_id"] = account.id
+            kwargs["collections_account_id"] = account.id
+        elif needs_collections:
+            kwargs["collections_account_id"] = account.id
+
+        return FundingConfigurationService.configure(loan, user=user, **kwargs)
+
+    @staticmethod
     @transaction.atomic
     def configure(
         loan: Loan,

@@ -214,7 +214,8 @@ def process_banking_analysis_payload(payload: dict):
             exception_note = (
                 'Problematic bank (institution '
                 f"{normalize_institution_number(primary.get('institution_number'))}) — "
-                'verify PAD / payment history before funding or collections.'
+                'verify other lenders were able to collect from this account '
+                'before funding or collections.'
             )
 
     processing_status = 'exception' if exception_note and (

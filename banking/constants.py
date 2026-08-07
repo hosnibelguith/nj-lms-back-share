@@ -5,14 +5,14 @@
 UNSUPPORTED_IBV_INSTITUTIONS = frozenset()
 
 # Institutions that need extra agent review before funding/collections.
-# Agents may still proceed after verifying PAD / payment history (not a hard block).
+# Agents may still proceed after verifying other lenders collected (PAD) from the account.
 PAYMENT_RISK_INSTITUTIONS = frozenset({'621', '623', '703'})
 # Backward-compatible alias used across the codebase / serializers.
 PAYMENT_BLOCKED_INSTITUTIONS = PAYMENT_RISK_INSTITUTIONS
 
 PAYMENT_RISK_WARNING_MESSAGE = (
-    'Problematic bank (institution {institution}) — please verify that the client '
-    'has PAD payments or sufficient payment history in the account before proceeding.'
+    'Problematic bank (institution {institution}) — verify other lenders were able '
+    'to collect from this account before proceeding.'
 )
 # Backward-compatible alias for older imports / tests.
 PAYMENT_BLOCKED_INSTITUTION_MESSAGE = PAYMENT_RISK_WARNING_MESSAGE

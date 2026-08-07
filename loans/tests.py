@@ -201,6 +201,26 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertTrue(response.data["collections_account_configured"])
         self.assertEqual(response.data["blockers"], [])
 
+    def test_funding_options_heals_missing_destinations_from_primary_account(self):
+        """UI may show the primary bank while the loan still has no saved destinations."""
+        self.loan.bank_account = None
+        self.loan.collections_account = None
+        self.loan.funding_destination = {}
+        self.loan.save(
+            update_fields=["bank_account", "collections_account", "funding_destination", "updated_at"]
+        )
+
+        response = self.client.get(f"/api/loans/{self.loan.id}/funding/options/")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.bank_account_id, self.account.id)
+        self.assertEqual(self.loan.collections_account_id, self.account.id)
+        self.assertTrue(response.data["eft_configured"])
+        self.assertTrue(response.data["collections_account_configured"])
+        self.assertNotIn("Funding destination required.", response.data["blockers"])
+        self.assertNotIn("Collections account required.", response.data["blockers"])
+
     def test_configure_accounts_allowed_before_approve(self):
         pending_loan = Loan.objects.create(
             customer=self.customer,
@@ -1980,6 +2000,37 @@ class BlockedInstitutionFundingTests(APITestCase):
         self.assertTrue(
             any("621" in warning for warning in readiness["warnings"]),
             readiness["warnings"],
+        )
+        self.assertTrue(
+            any("other lenders were able to collect" in warning for warning in readiness["warnings"]),
+            readiness["warnings"],
+        )
+
+    def test_funding_options_heals_risk_primary_without_destination_blockers(self):
+        """703-only customers must get a warning, not destination required blockers."""
+        self.allowed_account.is_primary = False
+        self.allowed_account.save(update_fields=["is_primary"])
+        risk = self.risk_account("703")
+        risk.is_primary = True
+        risk.use_for_eft_funding = True
+        risk.save(update_fields=["is_primary", "use_for_eft_funding", "updated_at"])
+        self.loan.bank_account = None
+        self.loan.collections_account = None
+        self.loan.funding_destination = {}
+        self.loan.save(
+            update_fields=["bank_account", "collections_account", "funding_destination", "updated_at"]
+        )
+
+        response = self.client.get(f"/api/loans/{self.loan.id}/funding/options/")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.bank_account_id, risk.id)
+        self.assertNotIn("Funding destination required.", response.data["blockers"])
+        self.assertNotIn("Collections account required.", response.data["blockers"])
+        self.assertTrue(
+            any("703" in warning for warning in response.data.get("warnings", [])),
+            response.data.get("warnings"),
         )
 
     def test_funding_initiate_allows_risk_collections_account(self):

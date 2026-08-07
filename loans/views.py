@@ -584,7 +584,7 @@ class LoanViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'], url_path='funding/options')
     def funding_options(self, request, pk=None):
         loan = self.get_object()
-        from loans.zumrails import is_arrive_funded_loan
+        from loans.zumrails import FundingConfigurationService, is_arrive_funded_loan
 
         # Refresh Zum status/reason for in-flight funding so the UI shows the
         # webhook/API reason and unlocks Fund Customer after terminal failure.
@@ -592,6 +592,13 @@ class LoanViewSet(viewsets.ModelViewSet):
             FundingService.sync_active_funding_from_zum(loan)
             loan.refresh_from_db()
         except Exception:
+            pass
+
+        # Align loan destinations with the primary bank the staff UI already shows
+        # so Fund Customer is not stuck on "destination/collections required".
+        try:
+            loan = FundingConfigurationService.ensure_defaults(loan, user=request.user)
+        except ValueError:
             pass
 
         recommended_method = FundingMethodRecommendation.for_date()
