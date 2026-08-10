@@ -3233,6 +3233,14 @@ class FundingFailureRecoveryTests(APITestCase):
         self.assertEqual(self.loan.bank_account_id, self.replacement_account.id)
 
 
+class PaymentPendingDisplayTests(APITestCase):
+    """Payment.status=pending is in-flight collection → display Processing."""
+
+    def test_payment_pending_status_display_is_processing(self):
+        self.assertEqual(dict(Payment.STATUS_CHOICES)["pending"], "Processing")
+        self.assertEqual(dict(Payment.STATUS_CHOICES)["scheduled"], "Scheduled")
+
+
 @override_settings(ZUMRAILS_DRY_RUN=True)
 class ScheduleFrequencyAndDeferralInterestTests(APITestCase):
     """Frequency badge field + daily interest on deferral."""

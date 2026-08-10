@@ -480,7 +480,7 @@ class Payment(models.Model):
     # Payment Status
     STATUS_CHOICES = [
         ('scheduled', 'Scheduled'),    # Future payment
-        ('pending', 'Pending'),        # Processing
+        ('pending', 'Processing'),     # Collection in flight (UI: Processing)
         ('completed', 'Completed'),    # Successfully collected
         ('failed', 'Failed'),          # Failed to collect
         ('nsf', 'NSF'),                # Non-sufficient funds
