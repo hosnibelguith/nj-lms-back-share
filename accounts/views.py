@@ -361,7 +361,11 @@ class CustomerViewSet(viewsets.ModelViewSet):
     def loans(self, request, pk=None):
         customer = self.get_object()
         from loans.serializers import CustomerLoanDetailSerializer
-        loans = customer.loans.prefetch_related('payments').order_by('-created_at')
+        loans = (
+            customer.loans.select_related('formula')
+            .prefetch_related('payments')
+            .order_by('-created_at')
+        )
         serializer = CustomerLoanDetailSerializer(loans, many=True)
         return Response(serializer.data)
 
@@ -611,7 +615,11 @@ class CustomerPortalMyLoansView(CustomerPortalBaseView):
 
         from loans.serializers import CustomerLoanDetailSerializer
 
-        loans = customer.loans.prefetch_related('payments').order_by('-created_at')
+        loans = (
+            customer.loans.select_related('formula')
+            .prefetch_related('payments')
+            .order_by('-created_at')
+        )
         serializer = CustomerLoanDetailSerializer(loans, many=True)
 
         return Response(serializer.data)

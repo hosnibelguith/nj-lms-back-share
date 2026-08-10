@@ -3241,6 +3241,83 @@ class PaymentPendingDisplayTests(APITestCase):
         self.assertEqual(dict(Payment.STATUS_CHOICES)["scheduled"], "Scheduled")
 
 
+class CustomerLoanFrequencyFieldTests(APITestCase):
+    """GET customer loans always includes frequency for the schedule badge."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            email="freq-api@example.com",
+            password="password123",
+            full_name="Freq API Agent",
+            user_type="staff",
+            is_staff=True,
+            permission_level=4,
+        )
+        self.portal_user = User.objects.create_user(
+            email="freq-api-customer@example.com",
+            password="password123",
+            full_name="Freq API Customer",
+            user_type="customer",
+        )
+        self.customer = Customer.objects.create(
+            portal_user=self.portal_user,
+            first_name="Freq",
+            last_name="API",
+            email="freq-api-customer@example.com",
+            phone="4165553333",
+            phone_normalized="4165553333",
+            province="ON",
+            status="active",
+            onboarding_stage="portal_active",
+            banking_verified=True,
+            contract_completed=True,
+            requested_loan_amount=Decimal("500.00"),
+        )
+        self.loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("100.00"),
+            total_amount=Decimal("600.00"),
+            balance=Decimal("600.00"),
+            status="active",
+            is_active=True,
+        )
+        self.client.force_authenticate(user=self.staff)
+
+    def test_customer_loans_includes_frequency_from_schedule_gaps(self):
+        start = timezone.localdate()
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("200.00"),
+            scheduled_date=start,
+            status="scheduled",
+        )
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("200.00"),
+            scheduled_date=start + timedelta(days=14),
+            status="scheduled",
+        )
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("200.00"),
+            scheduled_date=start + timedelta(days=28),
+            status="scheduled",
+        )
+
+        response = self.client.get(f"/api/customers/{self.customer.id}/loans/")
+        self.assertEqual(response.status_code, 200, response.data)
+        row = next(item for item in response.data if item["id"] == str(self.loan.id))
+        self.assertIn("frequency", row)
+        self.assertEqual(row["frequency"], "bi-weekly")
+
+    def test_customer_loans_frequency_defaults_without_payments(self):
+        response = self.client.get(f"/api/customers/{self.customer.id}/loans/")
+        self.assertEqual(response.status_code, 200, response.data)
+        row = next(item for item in response.data if item["id"] == str(self.loan.id))
+        self.assertEqual(row["frequency"], "bi-weekly")
+
+
 @override_settings(ZUMRAILS_DRY_RUN=True)
 class ScheduleFrequencyAndDeferralInterestTests(APITestCase):
     """Frequency badge field + daily interest on deferral."""
