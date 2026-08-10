@@ -16,7 +16,8 @@ class CommunicationHistorySerializer(serializers.ModelSerializer):
         fields = [
             'id', 'customer', 'customer_name', 'type', 'direction',
             'subject', 'sender', 'recipient', 'status', 'incoming_status',
-            'is_answered', 'is_unknown_sender', 'opened_at', 'opened_by', 'error_message',
+            'is_answered', 'is_unknown_sender', 'opened_at', 'answered_at',
+            'opened_by', 'error_message',
             'timestamp', 'body'
         ]
 
@@ -53,7 +54,8 @@ class CommunicationSerializer(serializers.ModelSerializer):
             'subject', 'from_address', 'to_address', 'from_phone', 'to_phone',
             'content', 'html_content', 'status', 'status_display',
             'external_id', 'error_message', 'incoming_status', 'is_answered', 'is_unknown_sender',
-            'sent_at', 'delivered_at', 'read_at', 'opened_at', 'opened_by', 'created_at',
+            'sent_at', 'delivered_at', 'read_at', 'opened_at', 'answered_at',
+            'opened_by', 'created_at',
             'template_name', 'created_by'
         ]
         read_only_fields = ['id', 'created_at']

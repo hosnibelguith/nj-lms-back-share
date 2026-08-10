@@ -108,42 +108,57 @@ class CommunicationViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='email-summary')
     def email_summary(self, request):
-        """Return database-backed email counts for dashboard headers."""
-        queryset = self.get_queryset().filter(type='email')
-        inbound_unanswered = queryset.filter(
-            direction='inbound',
-            is_answered=False,
-            incoming_status__in=['new', 'unanswered'],
+        """Return database-backed email counts for dashboard headers.
+
+        Unanswered counts collapse same-customer / same-day inbound duplicates
+        so three follow-ups on one day count as one inbox item.
+        """
+        from communications.services.inbox_grouping import (
+            collapsed_unanswered_email_counts,
         )
+
+        queryset = self.get_queryset().filter(type='email')
+        collapsed = collapsed_unanswered_email_counts(queryset)
 
         return Response({
             'total_count': queryset.count(),
-            'unanswered_count': inbound_unanswered.count(),
-            'new_count': inbound_unanswered.filter(incoming_status='new').count(),
-            'opened_unanswered_count': inbound_unanswered.filter(
-                incoming_status='unanswered'
-            ).count(),
+            'unanswered_count': collapsed['unanswered_count'],
+            'new_count': collapsed['new_count'],
+            'opened_unanswered_count': collapsed['opened_unanswered_count'],
         })
 
     @action(detail=False, methods=['get'], url_path='new-incoming')
     def new_incoming(self, request):
-        """Return new inbound emails for the dashboard notification bar."""
+        """Return new inbound emails for the dashboard notification bar.
+
+        Collapses same-customer / same-day duplicates (newest representative).
+        """
+        from communications.services.inbox_grouping import group_key_for_inbound
+
         queryset = self.get_queryset().filter(
             direction='inbound',
             type='email',
             incoming_status='new',
             is_answered=False,
-        )
-        limit = request.query_params.get('limit')
+        ).order_by('-created_at')
 
+        seen = set()
+        collapsed = []
+        for row in queryset.iterator(chunk_size=200):
+            key = group_key_for_inbound(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            collapsed.append(row)
+
+        limit = request.query_params.get('limit')
         if limit:
             try:
-                limit = min(int(limit), 200)
-                queryset = queryset[:limit]
+                collapsed = collapsed[: min(int(limit), 200)]
             except ValueError:
                 pass
 
-        return Response(CommunicationHistorySerializer(queryset, many=True).data)
+        return Response(CommunicationHistorySerializer(collapsed, many=True).data)
 
     @action(detail=True, methods=['post'], url_path='mark-opened')
     def mark_opened(self, request, pk=None):
@@ -223,14 +238,20 @@ class CommunicationViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_502_BAD_GATEWAY
                 )
 
-            update_fields = ['is_answered', 'incoming_status']
-            communication.is_answered = True
-            communication.incoming_status = 'read'
-            if not communication.opened_at:
-                communication.opened_at = timezone.now()
-                communication.opened_by = getattr(request.user, 'email', '') or None
-                update_fields.extend(['opened_at', 'opened_by'])
-            communication.save(update_fields=update_fields)
+            from communications.services.inbox_grouping import (
+                mark_same_day_inbound_answered,
+            )
+
+            answered_at = timezone.now()
+            opened_by = getattr(request.user, 'email', '') or None
+            # Reply answers this email and any same-day follow-ups from the
+            # same customer/contact so duplicate unanswered rows clear together.
+            mark_same_day_inbound_answered(
+                communication,
+                opened_by=opened_by,
+                answered_at=answered_at,
+            )
+            communication.refresh_from_db()
 
             return Response({
                 'success': True,

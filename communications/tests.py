@@ -1,7 +1,10 @@
+from datetime import timedelta
+from decimal import Decimal
 from unittest.mock import Mock, patch
 
 from django.test import TestCase, override_settings
-from rest_framework.test import APIClient
+from django.utils import timezone
+from rest_framework.test import APIClient, APITestCase
 from twilio.base.exceptions import TwilioRestException
 from twilio.request_validator import RequestValidator
 
@@ -9,6 +12,10 @@ from accounts.models import Customer, User
 from accounts.tasks import send_sms_otp_task
 from activity.models import ActivityHistory
 from communications.models import Communication
+from communications.services.inbox_grouping import (
+    collapsed_unanswered_email_counts,
+    mark_same_day_inbound_answered,
+)
 from communications.tasks import send_sms
 from communications.twilio_sms import (
     TwilioConfigurationError,
@@ -527,3 +534,139 @@ class CommunicationTemplateApiTests(TestCase):
         )
         self.assertEqual(response.status_code, 201, response.data)
         self.assertIsNone(response.data['hot_key'])
+
+
+class EmailInboxGroupingTests(APITestCase):
+    """Same-day same-customer inbound emails collapse in counts and answer together."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            email="inbox-agent@example.com",
+            password="password123",
+            full_name="Inbox Agent",
+            user_type="staff",
+            is_staff=True,
+            permission_level=4,
+        )
+        self.portal_user = User.objects.create_user(
+            email="joseph@example.com",
+            password="password123",
+            full_name="Joseph Saad",
+            user_type="customer",
+        )
+        self.customer = Customer.objects.create(
+            portal_user=self.portal_user,
+            first_name="Joseph",
+            last_name="Saad",
+            email="joseph@example.com",
+            phone="4165557777",
+            phone_normalized="4165557777",
+            province="ON",
+            status="active",
+            onboarding_stage="portal_active",
+            banking_verified=True,
+            requested_loan_amount=Decimal("500.00"),
+        )
+        self.client.force_authenticate(user=self.staff)
+        self.now = timezone.now()
+
+    def _inbound(self, *, minutes_ago: int, status: str = "new", content: str = "Hi"):
+        email = Communication.objects.create(
+            customer=self.customer,
+            type="email",
+            direction="inbound",
+            subject="Re: Your loan request has been approved",
+            from_address="joseph@example.com",
+            to_address="support@example.com",
+            content=content,
+            status="delivered",
+            incoming_status=status,
+            is_answered=False,
+        )
+        Communication.objects.filter(pk=email.pk).update(
+            created_at=self.now - timedelta(minutes=minutes_ago)
+        )
+        email.refresh_from_db()
+        return email
+
+    def test_collapsed_counts_same_day_duplicates_as_one(self):
+        self._inbound(minutes_ago=120, content="Hi there")
+        self._inbound(minutes_ago=60, content="Hi again")
+        self._inbound(minutes_ago=5, content="Hi, I noticed")
+
+        other = Customer.objects.create(
+            first_name="Other",
+            last_name="Person",
+            email="other@example.com",
+            phone="4165558888",
+            phone_normalized="4165558888",
+            province="ON",
+            status="active",
+            requested_loan_amount=Decimal("300.00"),
+        )
+        Communication.objects.create(
+            customer=other,
+            type="email",
+            direction="inbound",
+            subject="Help",
+            from_address="other@example.com",
+            to_address="support@example.com",
+            content="Different customer",
+            status="delivered",
+            incoming_status="new",
+            is_answered=False,
+        )
+
+        counts = collapsed_unanswered_email_counts(Communication.objects.all())
+        self.assertEqual(counts["new_count"], 2)
+        self.assertEqual(counts["opened_unanswered_count"], 0)
+        self.assertEqual(counts["unanswered_count"], 2)
+
+        summary = self.client.get("/api/communications/email-summary/")
+        self.assertEqual(summary.status_code, 200, summary.data)
+        self.assertEqual(summary.data["new_count"], 2)
+        self.assertEqual(summary.data["unanswered_count"], 2)
+
+    def test_reply_marks_same_day_siblings_answered(self):
+        first = self._inbound(minutes_ago=120, content="Hi there")
+        second = self._inbound(minutes_ago=60, content="Hi again")
+        third = self._inbound(minutes_ago=5, content="Hi, I noticed")
+
+        with patch("communications.views.send_email_task") as send_task:
+            def _mark_sent(comm_id):
+                Communication.objects.filter(pk=comm_id).update(status="sent")
+
+            send_task.side_effect = _mark_sent
+            response = self.client.post(
+                f"/api/communications/{third.id}/reply/",
+                {"body": "Thanks — we will fund shortly."},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertTrue(response.data["success"])
+
+        for email in (first, second, third):
+            email.refresh_from_db()
+            self.assertTrue(email.is_answered)
+            self.assertEqual(email.incoming_status, "read")
+            self.assertIsNotNone(email.answered_at)
+
+        counts = collapsed_unanswered_email_counts(Communication.objects.all())
+        self.assertEqual(counts["unanswered_count"], 0)
+
+    def test_different_day_emails_stay_separate(self):
+        today = self._inbound(minutes_ago=10, content="Today")
+        yesterday = self._inbound(minutes_ago=10, content="Yesterday")
+        Communication.objects.filter(pk=yesterday.pk).update(
+            created_at=self.now - timedelta(days=1)
+        )
+        yesterday.refresh_from_db()
+
+        mark_same_day_inbound_answered(today, opened_by="agent@example.com")
+        today.refresh_from_db()
+        yesterday.refresh_from_db()
+
+        self.assertTrue(today.is_answered)
+        self.assertFalse(yesterday.is_answered)
+        self.assertEqual(yesterday.incoming_status, "new")
