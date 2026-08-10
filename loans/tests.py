@@ -777,6 +777,8 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertIn("open schedule", response.data["error"])
 
     def test_defer_scheduled_payment_moves_to_end_and_schedules_fee(self):
+        from loans.services import LoanService
+
         first = Payment.objects.create(
             loan=self.loan,
             amount=Decimal("100.00"),
@@ -799,6 +801,9 @@ class ZumRailsWorkflowTests(APITestCase):
         original_total = self.loan.total_amount
         second_date = second.scheduled_date
         third_date = third.scheduled_date
+        # No formula: flat daily interest from fee / planned schedule span.
+        expected_interest = LoanService._deferral_extra_interest(self.loan, 14)
+        self.assertEqual(expected_interest, Decimal("50.00"))
 
         response = self.client.post(f"/api/payments/{first.id}/defer/", {}, format="json")
 
@@ -811,8 +816,10 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(second.scheduled_date, second_date)
         self.assertEqual(third.scheduled_date, third_date)
         self.assertEqual(first.scheduled_date, third_date + timedelta(days=14))
-        self.assertEqual(self.loan.balance, original_balance + Decimal("35.00"))
-        self.assertEqual(self.loan.total_amount, original_total + Decimal("35.00"))
+        self.assertEqual(first.amount, Decimal("100.00") + expected_interest)
+        delta = Decimal("35.00") + expected_interest
+        self.assertEqual(self.loan.balance, original_balance + delta)
+        self.assertEqual(self.loan.total_amount, original_total + delta)
 
         fee = self.loan.payments.get(notes__icontains="Deferral fee")
         self.assertEqual(fee.amount, Decimal("35.00"))
@@ -3224,3 +3231,156 @@ class FundingFailureRecoveryTests(APITestCase):
         self.loan.refresh_from_db()
         self.assertIsNone(self.loan.funding_destination_locked_at)
         self.assertEqual(self.loan.bank_account_id, self.replacement_account.id)
+
+
+@override_settings(ZUMRAILS_DRY_RUN=True)
+class ScheduleFrequencyAndDeferralInterestTests(APITestCase):
+    """Frequency badge field + daily interest on deferral."""
+
+    def setUp(self):
+        from loans.services import LoanService
+
+        self.LoanService = LoanService
+        self.staff = User.objects.create_user(
+            email="freq-defer@example.com",
+            password="password123",
+            full_name="Freq Agent",
+            user_type="staff",
+            is_staff=True,
+            permission_level=4,
+        )
+        self.portal_user = User.objects.create_user(
+            email="freq-customer@example.com",
+            password="password123",
+            full_name="Freq Customer",
+            user_type="customer",
+        )
+        self.customer = Customer.objects.create(
+            portal_user=self.portal_user,
+            first_name="Freq",
+            last_name="Customer",
+            email="freq-customer@example.com",
+            phone="4165552222",
+            phone_normalized="4165552222",
+            province="ON",
+            status="active",
+            onboarding_stage="portal_active",
+            banking_verified=True,
+            contract_completed=True,
+            requested_loan_amount=Decimal("500.00"),
+        )
+        self.formula = LoanFormula.objects.create(
+            name="Freq Defer 500",
+            principal_amount=Decimal("500.00"),
+            brokerage_percent=Decimal("70.00"),
+            repayment_percent=Decimal("35.00"),
+            default_number_of_payments=6,
+            default_frequency_days=14,
+            is_active=True,
+        )
+        self.loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("383.09"),
+            total_amount=Decimal("883.09"),
+            balance=Decimal("883.09"),
+            status="active",
+            formula=self.formula,
+            is_active=True,
+            funded_at=timezone.now(),
+        )
+        self.client.force_authenticate(user=self.staff)
+
+    def test_customer_loans_api_exposes_schedule_frequency(self):
+        start = timezone.localdate()
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("147.18"),
+            scheduled_date=start,
+            status="scheduled",
+        )
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("147.18"),
+            scheduled_date=start + timedelta(days=7),
+            status="scheduled",
+        )
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("147.18"),
+            scheduled_date=start + timedelta(days=14),
+            status="scheduled",
+        )
+
+        response = self.client.get(f"/api/customers/{self.customer.id}/loans/")
+        self.assertEqual(response.status_code, 200, response.data)
+        loan_row = next(row for row in response.data if row["id"] == str(self.loan.id))
+        # Schedule gaps are weekly even though formula default is bi-weekly.
+        self.assertEqual(loan_row["frequency"], "weekly")
+        self.assertEqual(self.LoanService.schedule_frequency_key(self.loan), "weekly")
+
+    def test_frequency_falls_back_to_formula_without_schedule(self):
+        self.assertEqual(self.LoanService.schedule_frequency_key(self.loan), "bi-weekly")
+
+        self.formula.default_frequency_days = 30
+        self.formula.save(update_fields=["default_frequency_days"])
+        self.assertEqual(self.LoanService.schedule_frequency_key(self.loan), "monthly")
+
+    def test_defer_applies_formula_daily_interest_to_installment(self):
+        start = timezone.localdate()
+        first = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("147.18"),
+            scheduled_date=start,
+            status="scheduled",
+        )
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("147.18"),
+            scheduled_date=start + timedelta(days=14),
+            status="scheduled",
+        )
+        last = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("147.18"),
+            scheduled_date=start + timedelta(days=28),
+            status="scheduled",
+        )
+
+        # 883.09 * 0.35 / 365 * 14
+        expected_interest = self.LoanService.money(
+            Decimal("883.09")
+            * (Decimal("35.00") / Decimal("100") / Decimal("365"))
+            * Decimal("14")
+        )
+        self.assertEqual(
+            self.LoanService._deferral_extra_interest(self.loan, 14),
+            expected_interest,
+        )
+        self.assertGreater(expected_interest, Decimal("0.00"))
+
+        original_balance = self.loan.balance
+        original_total = self.loan.total_amount
+        response = self.client.post(f"/api/payments/{first.id}/defer/", {}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+
+        first.refresh_from_db()
+        self.loan.refresh_from_db()
+        last.refresh_from_db()
+
+        self.assertEqual(first.scheduled_date, last.scheduled_date + timedelta(days=14))
+        self.assertEqual(first.amount, Decimal("147.18") + expected_interest)
+        delta = Decimal("35.00") + expected_interest
+        self.assertEqual(self.loan.balance, original_balance + delta)
+        self.assertEqual(self.loan.total_amount, original_total + delta)
+        self.assertEqual(self.loan.fee, Decimal("383.09") + delta)
+
+        fee = self.loan.payments.get(notes__icontains="Deferral fee")
+        self.assertEqual(fee.amount, Decimal("35.00"))
+        self.assertEqual(fee.scheduled_date, start)
+        # Interest lands on the deferred installment; fee stays a separate $35 row.
+        self.assertIn("daily interest", (first.notes or "").lower())
+        self.assertEqual(
+            first.amount + fee.amount,
+            Decimal("147.18") + expected_interest + Decimal("35.00"),
+        )

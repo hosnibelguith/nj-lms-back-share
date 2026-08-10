@@ -1018,6 +1018,22 @@ class LoanService:
         return days
 
     @staticmethod
+    def _frequency_key_from_days(days: int) -> str:
+        """Map a day cadence to the staff Adjust Schedule frequency choice."""
+        if days <= 9:
+            return 'weekly'
+        if days <= 20:
+            return 'bi-weekly'
+        return 'monthly'
+
+    @staticmethod
+    def schedule_frequency_key(loan: Loan) -> str:
+        """Selected/active payment cadence for UI (weekly / bi-weekly / monthly)."""
+        return LoanService._frequency_key_from_days(
+            LoanService._schedule_frequency_days(loan)
+        )
+
+    @staticmethod
     def _protected_in_flight_payments(loan: Loan):
         """Pending collections and any installment with a processing attempt."""
         return (
@@ -1560,31 +1576,99 @@ class LoanService:
 
     @staticmethod
     def _schedule_frequency_days(loan: Loan) -> int:
-        """Cadence used when placing a deferred installment at schedule end."""
+        """Cadence for deferral placement and frequency badge (selected schedule).
+
+        Prefer gaps between real installments (reflects Adjust Schedule choice),
+        then formula default, then bi-weekly.
+        """
+        dates = []
+        for payment in loan.payments.order_by('scheduled_date', 'created_at', 'id'):
+            if LoanService.is_deferral_fee_payment(payment):
+                continue
+            if payment.scheduled_date is None:
+                continue
+            if not dates or payment.scheduled_date != dates[-1]:
+                dates.append(payment.scheduled_date)
+        if len(dates) >= 2:
+            for index in range(len(dates) - 1):
+                delta = (dates[index + 1] - dates[index]).days
+                if delta > 0:
+                    return delta
+
         formula = getattr(loan, 'formula', None)
         if formula and getattr(formula, 'default_frequency_days', None):
             days = int(formula.default_frequency_days)
             if days > 0:
                 return days
-
-        dates = list(
-            loan.payments.order_by('scheduled_date', 'created_at', 'id').values_list(
-                'scheduled_date', flat=True
-            )[:3]
-        )
-        if len(dates) >= 2:
-            delta = (dates[1] - dates[0]).days
-            if delta > 0:
-                return delta
         return 14
+
+    @staticmethod
+    def _deferral_extra_interest(loan: Loan, frequency_days: int) -> Decimal:
+        """Interest for extending the schedule by one payment period.
+
+        Uses the same annualized daily rate as Adjust Schedule
+        (``repayment_percent / 100 / 365``) on the current outstanding balance.
+        Falls back to flat daily interest from the fee breakdown when no rate.
+        """
+        if frequency_days <= 0:
+            return Decimal('0.00')
+
+        money = LoanService.money
+        formula = getattr(loan, 'formula', None)
+        outstanding = money(loan.balance or Decimal('0.00'))
+
+        if formula is not None:
+            annual_rate = formula.annual_interest_rate or Decimal('0.00')
+            if annual_rate > 0 and outstanding > 0:
+                daily_rate = annual_rate / Decimal('100') / Decimal('365')
+                return money(outstanding * daily_rate * Decimal(frequency_days))
+
+        principal = loan.principal or Decimal('0.00')
+        brokerage = Decimal('0.00')
+        if formula is not None and principal:
+            brokerage = money(principal * formula.brokerage_percent / Decimal('100'))
+
+        deferral_fee_total = Decimal('0.00')
+        for payment in loan.payments.all():
+            if LoanService.is_deferral_fee_payment(payment):
+                deferral_fee_total += money(payment.amount or Decimal('0.00'))
+
+        planned_interest = money(
+            max(
+                (loan.fee or Decimal('0.00')) - brokerage - deferral_fee_total,
+                Decimal('0.00'),
+            )
+        )
+        if formula is not None:
+            planned_days = (
+                int(formula.default_number_of_payments)
+                * int(formula.default_frequency_days)
+            )
+        else:
+            schedule_dates = list(
+                loan.payments.order_by('scheduled_date').values_list(
+                    'scheduled_date', flat=True
+                )
+            )
+            if len(schedule_dates) >= 2:
+                planned_days = max((schedule_dates[-1] - schedule_dates[0]).days, 0)
+            else:
+                planned_days = 0
+
+        if planned_days <= 0 or planned_interest <= 0:
+            return Decimal('0.00')
+        daily_interest = planned_interest / Decimal(planned_days)
+        return money(daily_interest * Decimal(frequency_days))
 
     @staticmethod
     @transaction.atomic
     def defer_scheduled_payment(payment: Payment, *, user=None) -> tuple:
-        """Defer one open installment to schedule end and add a $35 fee payment.
+        """Defer one open installment to schedule end; add $35 fee + period interest.
 
         The fee is always created as a normal scheduled Payment on the original
-        date; staff can mark that fee paid later (Interac / manual).
+        date; staff can mark that fee paid later (Interac / manual). Daily
+        interest for the extra period is added to the deferred installment and
+        loan totals so the open schedule stays aligned with ``total_amount``.
         """
         # Avoid select_related on nullable FKs under FOR UPDATE (Postgres rejects outer joins).
         payment = Payment.objects.select_for_update().select_related('loan').get(
@@ -1616,6 +1700,8 @@ class LoanService:
         previous_amount = LoanService.money(payment.amount or Decimal('0.00'))
         frequency_days = LoanService._schedule_frequency_days(loan)
         fee_amount = LoanService.money(LoanService.DEFERRAL_FEE_AMOUNT)
+        extra_interest = LoanService._deferral_extra_interest(loan, frequency_days)
+        total_delta = LoanService.money(fee_amount + extra_interest)
 
         last_other_date = (
             loan.payments.exclude(pk=payment.pk)
@@ -1627,12 +1713,17 @@ class LoanService:
 
         payment.scheduled_date = end_date
         update_fields = ['scheduled_date']
+        if extra_interest > 0:
+            payment.amount = LoanService.money(previous_amount + extra_interest)
+            update_fields.append('amount')
         if payment.status in ('failed', 'nsf'):
             payment.status = 'scheduled'
             payment.failure_reason = None
             payment.processed_at = None
             update_fields.extend(['status', 'failure_reason', 'processed_at'])
         defer_note = f'Deferred from {previous_date}'
+        if extra_interest > 0:
+            defer_note = f'{defer_note}; daily interest ${extra_interest}'
         existing_notes = (payment.notes or '').strip()
         payment.notes = (
             f'{existing_notes}\n{defer_note}'.strip() if existing_notes else defer_note
@@ -1640,11 +1731,11 @@ class LoanService:
         update_fields.append('notes')
         payment.save(update_fields=update_fields)
 
-        loan.fee = LoanService.money((loan.fee or Decimal('0.00')) + fee_amount)
+        loan.fee = LoanService.money((loan.fee or Decimal('0.00')) + total_delta)
         loan.total_amount = LoanService.money(
-            (loan.total_amount or Decimal('0.00')) + fee_amount
+            (loan.total_amount or Decimal('0.00')) + total_delta
         )
-        loan.balance = LoanService.money((loan.balance or Decimal('0.00')) + fee_amount)
+        loan.balance = LoanService.money((loan.balance or Decimal('0.00')) + total_delta)
         loan.save(update_fields=['fee', 'total_amount', 'balance', 'updated_at'])
 
         fee_payment = Payment.objects.create(
@@ -1660,11 +1751,18 @@ class LoanService:
         from activity.services import actor_label, log_staff_action
 
         actor = actor_label(user)
-        detail = (
-            f'Payment deferred by {actor}: installment ${previous_amount} moved from '
-            f'{previous_date} to {end_date}; $35 deferral fee scheduled as payment on '
-            f'{previous_date}.'
-        )
+        if extra_interest > 0:
+            detail = (
+                f'Payment deferred by {actor}: installment ${previous_amount} moved from '
+                f'{previous_date} to {end_date}; daily interest ${extra_interest} applied '
+                f'to installment; $35 deferral fee scheduled as payment on {previous_date}.'
+            )
+        else:
+            detail = (
+                f'Payment deferred by {actor}: installment ${previous_amount} moved from '
+                f'{previous_date} to {end_date}; $35 deferral fee scheduled as payment on '
+                f'{previous_date}.'
+            )
         # Load customer only for audit (never fail the defer if audit/customer join breaks).
         try:
             customer = Customer.objects.get(pk=loan.customer_id)
@@ -1685,7 +1783,9 @@ class LoanService:
                     'previous_date': str(previous_date),
                     'new_date': str(end_date),
                     'fee_amount': str(fee_amount),
+                    'extra_interest': str(extra_interest),
                     'frequency_days': frequency_days,
+                    'frequency': LoanService._frequency_key_from_days(frequency_days),
                 },
             )
         payment.refresh_from_db()

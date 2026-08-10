@@ -64,3 +64,40 @@ Frontend expects: `NEXT_PUBLIC_API_URL=http://localhost:8000/api` (default in fr
    heroku run python manage.py ensure_admin -a nj-lms-back
    ```
    Staff login: `POST /api/auth/login/` (frontend `/login`). Django admin: `/admin/`.
+
+## Ops: heal payment schedule (keep Pending)
+
+`heal_schedule_keeping_pending` rebuilds broken **Scheduled** / failed / nsf installments while leaving in-flight **Pending** (and processing collection) payments untouched. Default is **dry-run** (simulate only); pass `--apply` to write.
+
+| Flag | What it does |
+|------|----------------|
+| `--loan-id` | Loan UUID to heal (required) |
+| `--payment-amount` | Target installment amount for new scheduled rows |
+| `--number-of-payments` | Alternate mode: number of new scheduled installments |
+| `--frequency` | `weekly`, `bi-weekly`, or `monthly` (default `bi-weekly`) |
+| `--start-date` | First new scheduled date `YYYY-MM-DD` (default: after last Pending) |
+| `--reprice` | Recompute `loan.total_amount` with Adjust Schedule interest math, then schedule the remainder |
+| `--apply` | Persist changes (without this flag: simulate only) |
+| `--notes` | Optional note on the activity log when applying |
+
+**Local**
+
+```bash
+# Simulate — prints KEEP / DELETE / CREATE; no DB writes
+python manage.py heal_schedule_keeping_pending \
+  --loan-id <uuid> --payment-amount 147.18 --frequency bi-weekly --start-date 2026-08-20
+
+# Apply after reviewing the plan
+python manage.py heal_schedule_keeping_pending \
+  --loan-id <uuid> --payment-amount 147.18 --frequency bi-weekly --start-date 2026-08-20 --apply
+```
+
+**Heroku** — quote the whole Django command so Heroku CLI does not treat Django flags as its own:
+
+```bash
+# Simulate
+heroku run "python manage.py heal_schedule_keeping_pending --loan-id 54fe7b2b-e32f-4883-b902-e2506c308875 --payment-amount 147.18 --frequency bi-weekly --start-date 2026-08-20" -a nj-lms-back
+
+# Apply
+heroku run "python manage.py heal_schedule_keeping_pending --loan-id 54fe7b2b-e32f-4883-b902-e2506c308875 --payment-amount 147.18 --frequency bi-weekly --start-date 2026-08-20 --apply --notes 'Ops heal keep Pending'" -a nj-lms-back
+```

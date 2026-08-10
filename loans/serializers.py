@@ -313,6 +313,7 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
     collectedAmount = serializers.SerializerMethodField(method_name='get_collected_amount')
     funded_at = serializers.SerializerMethodField()
     fundedAt = serializers.SerializerMethodField(method_name='get_funded_at')
+    frequency = serializers.SerializerMethodField()
     paymentSchedule = CustomerLoanPaymentSerializer(source='payments', many=True, read_only=True)
     type_display = serializers.CharField(source='get_type_display', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
@@ -338,6 +339,7 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
             'collectedAmount',
             'funded_at',
             'fundedAt',
+            'frequency',
             'contract_signed',
             'contract_signed_at',
             'contract_sent_at',
@@ -351,6 +353,11 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
 
     def get_funded_at(self, obj):
         return obj.funded_at.isoformat() if obj.funded_at else None
+
+    def get_frequency(self, obj):
+        from loans.services import LoanService
+
+        return LoanService.schedule_frequency_key(obj)
 
 
 class LoanSerializer(serializers.ModelSerializer):
