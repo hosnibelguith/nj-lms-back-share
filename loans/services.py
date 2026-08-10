@@ -1004,7 +1004,362 @@ class LoanService:
         )
 
         return payments
-    
+
+    @staticmethod
+    def _frequency_days(frequency: str) -> int:
+        frequency_days_by_key = {
+            'weekly': 7,
+            'bi-weekly': 14,
+            'monthly': 30,
+        }
+        days = frequency_days_by_key.get(frequency)
+        if not days:
+            raise ValueError('Invalid payment frequency.')
+        return days
+
+    @staticmethod
+    def _protected_in_flight_payments(loan: Loan):
+        """Pending collections and any installment with a processing attempt."""
+        return (
+            loan.payments.filter(
+                models.Q(status='pending')
+                | models.Q(collection_attempts__status='processing')
+            )
+            .distinct()
+            .order_by('scheduled_date', 'created_at', 'id')
+        )
+
+    @staticmethod
+    def plan_heal_upcoming_schedule_keeping_pending(
+        loan: Loan,
+        *,
+        calculation_mode: str = 'payment_amount',
+        payment_amount: Decimal = None,
+        number_of_payments: int = None,
+        frequency: str = 'bi-weekly',
+        start_date=None,
+        reprice: bool = False,
+    ) -> dict:
+        """Simulate rebuilding Scheduled/failed/nsf rows while keeping Pending.
+
+        Does not write. Remaining to schedule =
+        loan.total_amount (or repriced total) − completed − protected in-flight.
+        Interest for the keep-total path is already baked into total_amount;
+        ``reprice=True`` uses the same daily-interest math as Adjust Schedule.
+        """
+        if loan.status not in [
+            'pending_signature',
+            'pending',
+            'pending_funding',
+            'active',
+            'defaulted',
+        ]:
+            raise ValueError(f'Cannot heal schedule in status: {loan.status}')
+
+        calculation_mode = calculation_mode or 'payment_amount'
+        if calculation_mode not in ['payment_amount', 'number_of_payments']:
+            raise ValueError('Invalid schedule calculation mode.')
+
+        money = LoanService.money
+        frequency_days = LoanService._frequency_days(frequency)
+        principal = money(loan.principal or Decimal('0.00'))
+        if principal <= 0:
+            raise ValueError('Loan principal must be greater than zero.')
+
+        protected = list(LoanService._protected_in_flight_payments(loan))
+        protected_ids = {p.id for p in protected}
+        completed = list(
+            loan.payments.filter(status='completed').order_by(
+                'scheduled_date', 'created_at', 'id'
+            )
+        )
+        replaceable = list(
+            loan.payments.filter(status__in=['scheduled', 'failed', 'nsf'])
+            .exclude(id__in=protected_ids)
+            .order_by('scheduled_date', 'created_at', 'id')
+        )
+
+        completed_sum = sum(
+            (money(p.amount or Decimal('0.00')) for p in completed),
+            Decimal('0.00'),
+        )
+        protected_sum = sum(
+            (money(p.amount or Decimal('0.00')) for p in protected),
+            Decimal('0.00'),
+        )
+        reserved = money(completed_sum + protected_sum)
+
+        formula = LoanService.get_formula_for_amount(principal) or loan.formula
+        if start_date is None:
+            if protected:
+                start_date = protected[-1].scheduled_date + timedelta(days=frequency_days)
+            else:
+                start_date = timezone.localdate()
+            if start_date < timezone.localdate():
+                start_date = timezone.localdate()
+
+        max_payments = 260
+        total_amount = money(loan.total_amount or Decimal('0.00'))
+        annual_rate = Decimal('0.00')
+        priced_principal = principal
+
+        if reprice:
+            if formula:
+                amounts = LoanService.calculate_from_formula(formula, principal)
+                priced_principal = amounts['total_amount']
+                annual_rate = formula.annual_interest_rate
+            else:
+                priced_principal = principal
+                annual_rate = Decimal('0.00')
+
+        if calculation_mode == 'number_of_payments':
+            if number_of_payments is None:
+                raise ValueError('Number of payments is required.')
+            num_payments = int(number_of_payments)
+            if num_payments < 1 or num_payments > max_payments:
+                raise ValueError(
+                    f'Number of payments must be between 1 and {max_payments}.'
+                )
+            if reprice:
+                total_amount = LoanService.calculate_schedule_total(
+                    principal_balance=priced_principal,
+                    annual_rate_percent=annual_rate,
+                    start_date=start_date,
+                    num_payments=num_payments,
+                    frequency_days=frequency_days,
+                )
+            schedule_total = max(money(total_amount - reserved), Decimal('0.00'))
+            installment = money(schedule_total / Decimal(num_payments)) if schedule_total else Decimal('0.00')
+        else:
+            if payment_amount is None:
+                # Prefer a typical open scheduled amount, else formula default split.
+                sample = next(
+                    (
+                        p.amount
+                        for p in replaceable
+                        if p.status == 'scheduled'
+                        and money(p.amount or 0) > Decimal('1.00')
+                    ),
+                    None,
+                )
+                if sample is not None:
+                    payment_amount = money(sample)
+                elif formula and int(formula.default_number_of_payments or 0) > 0:
+                    payment_amount = money(
+                        max(money(total_amount - reserved), Decimal('0.00'))
+                        / Decimal(int(formula.default_number_of_payments))
+                    )
+                else:
+                    raise ValueError('Payment amount is required.')
+            payment_amount = money(payment_amount)
+            if payment_amount <= 0:
+                raise ValueError('Payment amount must be greater than zero.')
+
+            if reprice:
+                num_payments = None
+                for candidate_count in range(1, max_payments + 1):
+                    candidate_total = LoanService.calculate_schedule_total(
+                        principal_balance=priced_principal,
+                        annual_rate_percent=annual_rate,
+                        start_date=start_date,
+                        num_payments=candidate_count,
+                        frequency_days=frequency_days,
+                    )
+                    candidate_schedule = max(
+                        money(candidate_total - reserved),
+                        Decimal('0.00'),
+                    )
+                    if payment_amount * Decimal(candidate_count) >= candidate_schedule:
+                        num_payments = candidate_count
+                        total_amount = candidate_total
+                        schedule_total = candidate_schedule
+                        break
+                if num_payments is None:
+                    raise ValueError(
+                        'Payment amount is too low for this remaining schedule.'
+                    )
+                installment = payment_amount
+            else:
+                schedule_total = max(money(total_amount - reserved), Decimal('0.00'))
+                if schedule_total <= 0:
+                    num_payments = 0
+                    installment = Decimal('0.00')
+                else:
+                    num_payments = int(
+                        (schedule_total / payment_amount).to_integral_value(
+                            rounding=ROUND_HALF_UP
+                        )
+                    )
+                    if num_payments < 1:
+                        num_payments = 1
+                    if payment_amount * Decimal(num_payments) < schedule_total:
+                        num_payments += 1
+                    num_payments = min(num_payments, max_payments)
+                    installment = payment_amount
+
+        if schedule_total < 0:
+            schedule_total = Decimal('0.00')
+
+        proposed = []
+        remaining = schedule_total
+        current_date = start_date
+        for index in range(num_payments):
+            if remaining <= 0:
+                break
+            is_last = index == num_payments - 1
+            amount = remaining if is_last else min(installment, remaining)
+            amount = money(amount)
+            if amount <= 0:
+                break
+            proposed.append(
+                {
+                    'scheduled_date': current_date,
+                    'amount': amount,
+                    'status': 'scheduled',
+                }
+            )
+            remaining = money(remaining - amount)
+            current_date = current_date + timedelta(days=frequency_days)
+
+        def _row(payment):
+            return {
+                'id': str(payment.id),
+                'scheduled_date': payment.scheduled_date,
+                'amount': money(payment.amount or Decimal('0.00')),
+                'status': payment.status,
+            }
+
+        open_after = money(protected_sum + sum((p['amount'] for p in proposed), Decimal('0.00')))
+        return {
+            'loan_id': str(loan.id),
+            'loan_status': loan.status,
+            'reprice': reprice,
+            'frequency': frequency,
+            'frequency_days': frequency_days,
+            'calculation_mode': calculation_mode,
+            'start_date': start_date,
+            'payment_amount': money(installment),
+            'num_payments': len(proposed),
+            'total_amount_before': money(loan.total_amount or Decimal('0.00')),
+            'total_amount_after': money(total_amount),
+            'balance_before': money(loan.balance or Decimal('0.00')),
+            'balance_after': money(total_amount - completed_sum),
+            'completed_sum': completed_sum,
+            'protected_sum': protected_sum,
+            'schedule_total': schedule_total,
+            'open_sum_after': open_after,
+            'protected': [_row(p) for p in protected],
+            'will_delete': [_row(p) for p in replaceable],
+            'proposed': proposed,
+            'completed': [_row(p) for p in completed],
+        }
+
+    @staticmethod
+    @transaction.atomic
+    def heal_upcoming_schedule_keeping_pending(
+        loan: Loan,
+        *,
+        calculation_mode: str = 'payment_amount',
+        payment_amount: Decimal = None,
+        number_of_payments: int = None,
+        frequency: str = 'bi-weekly',
+        start_date=None,
+        reprice: bool = False,
+        dry_run: bool = True,
+        user=None,
+        notes: str = '',
+    ) -> dict:
+        """Rebuild upcoming schedule rows; never modify Pending / in-flight payments.
+
+        dry_run=True (default) only returns the simulation plan.
+        """
+        plan = LoanService.plan_heal_upcoming_schedule_keeping_pending(
+            loan,
+            calculation_mode=calculation_mode,
+            payment_amount=payment_amount,
+            number_of_payments=number_of_payments,
+            frequency=frequency,
+            start_date=start_date,
+            reprice=reprice,
+        )
+        plan['dry_run'] = dry_run
+        if dry_run:
+            return plan
+
+        loan = Loan.objects.select_for_update().get(pk=loan.pk)
+        # Recompute under lock so apply matches current DB.
+        plan = LoanService.plan_heal_upcoming_schedule_keeping_pending(
+            loan,
+            calculation_mode=calculation_mode,
+            payment_amount=payment_amount,
+            number_of_payments=number_of_payments,
+            frequency=frequency,
+            start_date=start_date,
+            reprice=reprice,
+        )
+        plan['dry_run'] = False
+
+        protected_ids = [p['id'] for p in plan['protected']]
+        delete_qs = loan.payments.filter(status__in=['scheduled', 'failed', 'nsf'])
+        if protected_ids:
+            delete_qs = delete_qs.exclude(id__in=protected_ids)
+        delete_qs.delete()
+
+        if reprice:
+            principal = LoanService.money(loan.principal or Decimal('0.00'))
+            loan.formula = LoanService.get_formula_for_amount(principal) or loan.formula
+            loan.total_amount = plan['total_amount_after']
+            loan.fee = LoanService.money(plan['total_amount_after'] - principal)
+            loan.balance = plan['balance_after']
+            loan.save(
+                update_fields=['formula', 'fee', 'total_amount', 'balance', 'updated_at']
+            )
+        else:
+            # Keep priced totals; only refresh balance to total − completed.
+            loan.balance = plan['balance_after']
+            loan.save(update_fields=['balance', 'updated_at'])
+
+        created = []
+        for row in plan['proposed']:
+            created.append(
+                Payment.objects.create(
+                    loan=loan,
+                    amount=row['amount'],
+                    scheduled_date=row['scheduled_date'],
+                    type='scheduled',
+                    status='scheduled',
+                )
+            )
+
+        from activity.services import actor_label, log_staff_action
+
+        actor = actor_label(user)
+        detail = (
+            f'Upcoming schedule healed by {actor}: kept {len(plan["protected"])} '
+            f'in-flight payment(s), removed {len(plan["will_delete"])} open row(s), '
+            f'created {len(created)} scheduled payment(s) totaling '
+            f'${plan["schedule_total"]} from {plan["start_date"]}.'
+        )
+        if notes:
+            detail = f'{detail} {notes}'
+        log_staff_action(
+            customer=loan.customer,
+            loan=loan,
+            user=user,
+            type_value='payment_scheduled',
+            title='Upcoming Schedule Healed',
+            description=detail,
+            metadata={
+                'action': 'heal_upcoming_schedule_keeping_pending',
+                'protected_payment_ids': list(protected_ids),
+                'num_created': len(created),
+                'schedule_total': str(plan['schedule_total']),
+                'reprice': reprice,
+            },
+        )
+        plan['created_ids'] = [str(p.id) for p in created]
+        return plan
+
     @staticmethod
     @transaction.atomic
     def generate_payment_schedule(loan: Loan, num_payments: int,

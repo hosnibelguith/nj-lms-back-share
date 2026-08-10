@@ -2545,6 +2545,205 @@ class PaymentScheduleIntegrityTests(APITestCase):
 
 
 @override_settings(ZUMRAILS_DRY_RUN=True)
+class HealScheduleKeepingPendingTests(APITestCase):
+    """Ops heal script: keep Pending, rebuild upcoming, dry-run before apply."""
+
+    def setUp(self):
+        from loans.services import LoanService
+
+        self.LoanService = LoanService
+        self.staff = User.objects.create_user(
+            email="heal-schedule@example.com",
+            password="password123",
+            full_name="Heal Agent",
+            user_type="staff",
+            is_staff=True,
+            permission_level=4,
+        )
+        self.portal_user = User.objects.create_user(
+            email="heal-customer@example.com",
+            password="password123",
+            full_name="Heal Customer",
+            user_type="customer",
+        )
+        self.customer = Customer.objects.create(
+            portal_user=self.portal_user,
+            first_name="Heal",
+            last_name="Customer",
+            email="heal-customer@example.com",
+            phone="4165558888",
+            phone_normalized="4165558888",
+            province="ON",
+            status="active",
+            banking_verified=True,
+            requested_loan_amount=Decimal("500.00"),
+        )
+        self.formula = LoanFormula.objects.create(
+            name="Heal Schedule 500",
+            principal_amount=Decimal("500.00"),
+            brokerage_percent=Decimal("70.00"),
+            repayment_percent=Decimal("35.00"),
+            default_number_of_payments=6,
+            default_frequency_days=14,
+            is_active=True,
+        )
+        self.loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("383.09"),
+            total_amount=Decimal("883.09"),
+            balance=Decimal("883.09"),
+            status="active",
+            contract_signed_at=timezone.now(),
+            funded_at=timezone.now(),
+            formula=self.formula,
+            is_active=True,
+        )
+
+    def _add(self, amount, *, days=0, status="scheduled"):
+        return Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal(str(amount)),
+            scheduled_date=timezone.localdate() + timedelta(days=days),
+            status=status,
+            processed_at=timezone.now() if status == "completed" else None,
+        )
+
+    def test_dry_run_simulates_without_writing(self):
+        pending = self._add("295.00", status="pending")
+        stub = self._add("0.01")
+        later = self._add("147.18", days=14)
+
+        plan = self.LoanService.heal_upcoming_schedule_keeping_pending(
+            self.loan,
+            payment_amount=Decimal("147.18"),
+            frequency="bi-weekly",
+            dry_run=True,
+        )
+
+        self.assertTrue(plan["dry_run"])
+        self.assertEqual(len(plan["protected"]), 1)
+        self.assertEqual(plan["protected"][0]["id"], str(pending.id))
+        self.assertEqual(plan["protected_sum"], Decimal("295.00"))
+        self.assertEqual(plan["schedule_total"], Decimal("588.09"))
+        self.assertGreaterEqual(len(plan["proposed"]), 1)
+        self.assertEqual(
+            sum((row["amount"] for row in plan["proposed"]), Decimal("0.00")),
+            Decimal("588.09"),
+        )
+        # Nothing written.
+        self.assertTrue(Payment.objects.filter(pk=stub.pk).exists())
+        self.assertTrue(Payment.objects.filter(pk=later.pk).exists())
+        self.assertEqual(Payment.objects.filter(pk=pending.pk).count(), 1)
+
+    def test_apply_keeps_pending_deletes_stub_and_rebuilds_remainder(self):
+        pending = self._add("295.00", status="pending")
+        stub = self._add("0.01")
+        self._add("147.18", days=14)
+        self._add("147.18", days=28)
+        self._add("147.18", days=42)
+        self._add("147.18", days=56)
+        self._add("147.19", days=70)
+
+        plan = self.LoanService.heal_upcoming_schedule_keeping_pending(
+            self.loan,
+            payment_amount=Decimal("147.18"),
+            frequency="bi-weekly",
+            dry_run=False,
+            user=self.staff,
+        )
+
+        self.assertFalse(plan["dry_run"])
+        pending.refresh_from_db()
+        self.assertEqual(pending.amount, Decimal("295.00"))
+        self.assertEqual(pending.status, "pending")
+        self.assertFalse(Payment.objects.filter(pk=stub.pk).exists())
+
+        scheduled = list(
+            self.loan.payments.filter(status="scheduled").order_by(
+                "scheduled_date", "created_at", "id"
+            )
+        )
+        self.assertGreaterEqual(len(scheduled), 1)
+        scheduled_sum = sum((p.amount for p in scheduled), Decimal("0.00"))
+        self.assertEqual(scheduled_sum, Decimal("588.09"))
+        self.assertEqual(pending.amount + scheduled_sum, self.loan.total_amount)
+
+        from loans.serializers import CustomerLoanPaymentSerializer
+
+        rows = list(self.loan.payments.exclude(status="cancelled"))
+        balances = [
+            Decimal(str(row["balance_after"]))
+            for row in CustomerLoanPaymentSerializer(rows, many=True).data
+        ]
+        self.assertEqual(balances[-1], Decimal("0.00"))
+        self.assertEqual(balances.count(Decimal("0.00")), 1)
+        self.assertTrue(all(b > 0 for b in balances[:-1]), balances)
+
+    def test_apply_preserves_completed_and_processing_collection_payment(self):
+        completed = self._add("100.00", days=-14, status="completed")
+        self.loan.balance = Decimal("783.09")
+        self.loan.save(update_fields=["balance", "updated_at"])
+        in_flight = self._add("200.00", status="scheduled")
+        CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=in_flight,
+            amount=in_flight.amount,
+            status="processing",
+        )
+        stub = self._add("50.00", days=14)
+
+        plan = self.LoanService.heal_upcoming_schedule_keeping_pending(
+            self.loan,
+            payment_amount=Decimal("150.00"),
+            frequency="bi-weekly",
+            dry_run=False,
+        )
+
+        self.assertTrue(Payment.objects.filter(pk=completed.pk, status="completed").exists())
+        in_flight.refresh_from_db()
+        self.assertEqual(in_flight.amount, Decimal("200.00"))
+        self.assertFalse(Payment.objects.filter(pk=stub.pk).exists())
+        self.assertEqual(plan["protected_sum"], Decimal("200.00"))
+        self.assertEqual(plan["schedule_total"], Decimal("583.09"))
+
+    def test_management_command_dry_run_then_apply(self):
+        from io import StringIO
+        from django.core.management import call_command
+
+        pending = self._add("295.00", status="pending")
+        stub = self._add("0.01")
+        self._add("588.08", days=14)
+
+        out = StringIO()
+        call_command(
+            "heal_schedule_keeping_pending",
+            f"--loan-id={self.loan.id}",
+            "--payment-amount=147.18",
+            "--frequency=bi-weekly",
+            stdout=out,
+        )
+        text = out.getvalue()
+        self.assertIn("DRY-RUN", text)
+        self.assertIn("588.09", text)
+        self.assertTrue(Payment.objects.filter(pk=stub.pk).exists())
+
+        out_apply = StringIO()
+        call_command(
+            "heal_schedule_keeping_pending",
+            f"--loan-id={self.loan.id}",
+            "--payment-amount=147.18",
+            "--frequency=bi-weekly",
+            "--apply",
+            stdout=out_apply,
+        )
+        self.assertIn("APPLIED", out_apply.getvalue())
+        pending.refresh_from_db()
+        self.assertEqual(pending.status, "pending")
+        self.assertFalse(Payment.objects.filter(pk=stub.pk).exists())
+
+
+@override_settings(ZUMRAILS_DRY_RUN=True)
 class BlockedInstitutionFundingTests(APITestCase):
     """Institutions 621 / 623 / 703 warn agents but may still fund/collect."""
 
