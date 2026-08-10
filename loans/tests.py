@@ -3469,3 +3469,142 @@ class ScheduleFrequencyAndDeferralInterestTests(APITestCase):
             first.amount + fee.amount,
             Decimal("147.18") + expected_interest + Decimal("35.00"),
         )
+
+
+@override_settings(ZUMRAILS_DRY_RUN=True)
+class IncompleteBankCoordinatesFundingTests(APITestCase):
+    """Block funding when institution / transit / account number is incomplete."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            email="coords-agent@example.com",
+            password="password123",
+            full_name="Coords Agent",
+            user_type="staff",
+            is_staff=True,
+            permission_level=4,
+        )
+        self.customer = Customer.objects.create(
+            first_name="Joseph",
+            last_name="Saad",
+            email="jsrdconsultants@gmail.com",
+            phone="4165559999",
+            phone_normalized="4165559999",
+            province="ON",
+            status="pending",
+            banking_verified=True,
+            requested_loan_amount=Decimal("500.00"),
+        )
+        self.connection = BankConnection.objects.create(
+            customer=self.customer,
+            login_id="login-coords",
+            sync_status="synced",
+        )
+        self.incomplete = BankAccount.objects.create(
+            connection=self.connection,
+            customer=self.customer,
+            external_id="acct-incomplete",
+            name="Tangerine Chequing Account",
+            type="checking",
+            transit_number="",
+            institution_number="",
+            account_number="4021897116",
+            is_primary=True,
+        )
+        self.complete = BankAccount.objects.create(
+            connection=self.connection,
+            customer=self.customer,
+            external_id="acct-complete",
+            name="RBC Chequing",
+            type="checking",
+            transit_number="12345",
+            institution_number="003",
+            account_number="1234567890",
+            is_primary=False,
+        )
+        self.loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("100.00"),
+            total_amount=Decimal("600.00"),
+            balance=Decimal("600.00"),
+            status="pending_funding",
+            contract_signed_at=timezone.now(),
+            bank_account=self.incomplete,
+            collections_account=self.incomplete,
+            funding_destination={
+                "emt": {"email": self.customer.email, "source": "application"},
+                "eft": {
+                    "bank_account_id": str(self.incomplete.id),
+                    "account": {
+                        "id": str(self.incomplete.id),
+                        "institution_number": "",
+                        "transit_number": "",
+                        "account_number": "4021897116",
+                    },
+                },
+            },
+            is_active=True,
+        )
+        self.client.force_authenticate(self.staff)
+
+    def test_funding_options_blocks_incomplete_coordinates(self):
+        response = self.client.get(f"/api/loans/{self.loan.id}/funding/options/")
+        self.assertEqual(response.status_code, 200, response.data)
+        blockers = " ".join(response.data.get("blockers") or [])
+        self.assertIn("institution number", blockers)
+        self.assertIn("transit number", blockers)
+        self.assertIn("Collections account", blockers)
+        self.assertIn("Funding account", blockers)
+
+    def test_funding_initiate_eft_rejects_incomplete_coordinates(self):
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/funding/initiate/",
+            {
+                "method": "eft",
+                "schedule_confirmed": True,
+                "destination": {"bank_account_id": str(self.incomplete.id)},
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("institution number", response.data.get("error", "").lower())
+
+    def test_funding_initiate_etransfer_rejects_incomplete_collections(self):
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/funding/initiate/",
+            {
+                "method": "etransfer",
+                "schedule_confirmed": True,
+                "destination": {"email": self.customer.email},
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("collections account", response.data.get("error", "").lower())
+        self.assertIn("institution number", response.data.get("error", "").lower())
+
+    def test_complete_coordinates_clear_blockers(self):
+        self.loan.bank_account = self.complete
+        self.loan.collections_account = self.complete
+        self.loan.funding_destination = {
+            "emt": {"email": self.customer.email, "source": "application"},
+            "eft": {
+                "bank_account_id": str(self.complete.id),
+                "account": {
+                    "id": str(self.complete.id),
+                    "institution_number": "003",
+                    "transit_number": "12345",
+                    "account_number": "1234567890",
+                },
+            },
+        }
+        self.loan.save(
+            update_fields=["bank_account", "collections_account", "funding_destination", "updated_at"]
+        )
+
+        readiness = funding_configuration_ready(self.loan)
+        self.assertFalse(
+            any("missing" in blocker.lower() for blocker in readiness["blockers"]),
+            readiness["blockers"],
+        )

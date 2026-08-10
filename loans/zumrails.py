@@ -16,7 +16,11 @@ from django.core.cache import cache
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from banking.constants import payment_risk_warning_message
+from banking.constants import (
+    incomplete_bank_coordinates_message,
+    normalize_bank_coordinate,
+    payment_risk_warning_message,
+)
 from banking.models import BankAccount
 
 from .models import (
@@ -625,12 +629,21 @@ def funding_configuration_ready(loan: Loan) -> dict:
         # collections (repayment) bank account when multiple chequing accounts exist.
         blockers.append("Collections account required.")
 
+    # Full EFT coordinates required before any disbursement / collections setup.
+    if collections_account:
+        incomplete = incomplete_bank_coordinates_message(
+            collections_account, role="Collections account"
+        )
+        if incomplete:
+            blockers.append(incomplete)
+
     # Problematic banks (621/623/703): warn only — agents may still proceed.
     warning = payment_account_risk_warning(
         collections_account, role="Collections account"
     )
     if warning:
         warnings.append(warning)
+    eft_account = None
     if not arrive_loan:
         eft_account = loan.bank_account
         eft_account_id = eft.get("bank_account_id") or (eft.get("account") or {}).get("id")
@@ -639,6 +652,12 @@ def funding_configuration_ready(loan: Loan) -> dict:
                 BankAccount.objects.filter(id=eft_account_id, customer_id=loan.customer_id).first()
                 or eft_account
             )
+        if eft_configured and eft_account:
+            incomplete = incomplete_bank_coordinates_message(
+                eft_account, role="Funding account"
+            )
+            if incomplete:
+                blockers.append(incomplete)
         warning = payment_account_risk_warning(eft_account, role="Funding account")
         if warning:
             warnings.append(warning)
@@ -981,23 +1000,19 @@ class ZumRailsService:
             payload["PhoneNumber"] = phone
         if account:
             assert_payment_account_allowed(account, role="Selected bank account")
-            missing = [
-                label for label, value in (
-                    ("institution number", account.institution_number),
-                    ("transit number", account.transit_number),
-                    ("account number", account.account_number),
-                )
-                if not value
-            ]
-            if missing:
-                raise ZumRailsConfigurationError(
-                    f"Selected EFT account is missing {', '.join(missing)}."
-                )
+            incomplete = incomplete_bank_coordinates_message(
+                account, role="Selected EFT account"
+            )
+            if incomplete:
+                raise ZumRailsConfigurationError(incomplete)
+            institution = normalize_bank_coordinate(account.institution_number)
+            transit = normalize_bank_coordinate(account.transit_number)
+            account_number = normalize_bank_coordinate(account.account_number)
             # Zūm requires zero-padded institution (3) and transit/branch (5).
             payload["BankAccountInformation"] = {
-                "InstitutionNumber": str(account.institution_number).strip().zfill(3),
-                "TransitNumber": str(account.transit_number).strip().zfill(5),
-                "AccountNumber": str(account.account_number).strip(),
+                "InstitutionNumber": str(institution).zfill(3),
+                "TransitNumber": str(transit).zfill(5),
+                "AccountNumber": str(account_number),
             }
         return payload
 
@@ -1250,6 +1265,11 @@ class FundingService:
                 if method in ("eft", "etransfer", "card_issuance") and not collections_account:
                     raise ValueError("Collections account required")
                 assert_payment_account_allowed(collections_account, role="Collections account")
+                incomplete_collections = incomplete_bank_coordinates_message(
+                    collections_account, role="Collections account"
+                )
+                if incomplete_collections:
+                    raise ValueError(incomplete_collections)
 
                 if method == "card_issuance":
                     return FundingService._complete_card_issuance(
@@ -1268,13 +1288,19 @@ class FundingService:
                 if method == "eft":
                     if not destination_snapshot.get("account"):
                         raise ValueError("Funding destination required")
+                    funding_account = BankAccount.objects.filter(
+                        id=destination_snapshot["account"].get("id"),
+                        customer=loan.customer,
+                    ).first()
                     assert_payment_account_allowed(
-                        BankAccount.objects.filter(
-                            id=destination_snapshot["account"].get("id"),
-                            customer=loan.customer,
-                        ).first(),
+                        funding_account,
                         role="Funding account",
                     )
+                    incomplete_funding = incomplete_bank_coordinates_message(
+                        funding_account, role="Funding account"
+                    )
+                    if incomplete_funding:
+                        raise ValueError(incomplete_funding)
 
                 funding = FundedPayment.objects.create(
                     loan=loan,

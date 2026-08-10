@@ -9,7 +9,12 @@ from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .constants import is_payment_blocked_institution, normalize_institution_number
+from .constants import (
+    bank_coordinates_complete,
+    is_payment_blocked_institution,
+    normalize_bank_coordinate,
+    normalize_institution_number,
+)
 from .models import (
     BankAccount,
     BankConnection,
@@ -38,12 +43,7 @@ def _api_key_valid(provided: str | None) -> bool:
 
 
 def _normalize_coord(value):
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text or text.upper() == 'N/A':
-        return None
-    return text
+    return normalize_bank_coordinate(value)
 
 
 def _parse_optional_datetime(value):
@@ -55,17 +55,13 @@ def _parse_optional_datetime(value):
 
 
 def _coords_complete(primary: dict) -> bool:
-    return bool(
-        _normalize_coord(primary.get('institution_number'))
-        and _normalize_coord(primary.get('transit_number'))
-        and _normalize_coord(primary.get('account_number'))
-    )
+    return bank_coordinates_complete(primary)
 
 
 def _find_matching_account(connection: BankConnection, primary: dict):
-    institution = _normalize_coord(primary.get('institution_number'))
-    transit = _normalize_coord(primary.get('transit_number'))
-    account_number = _normalize_coord(primary.get('account_number'))
+    institution = normalize_bank_coordinate(primary.get('institution_number'))
+    transit = normalize_bank_coordinate(primary.get('transit_number'))
+    account_number = normalize_bank_coordinate(primary.get('account_number'))
     if not (institution and transit and account_number):
         return None
 
@@ -81,9 +77,9 @@ def _apply_primary_eft_account(connection: BankConnection, primary: dict):
     Mark primary_bank_account as the operational EFT funding + collections account
     for this bank connection (and unlockable loan FKs for the customer).
     """
-    institution = _normalize_coord(primary.get('institution_number'))
-    transit = _normalize_coord(primary.get('transit_number'))
-    account_number = _normalize_coord(primary.get('account_number'))
+    institution = normalize_bank_coordinate(primary.get('institution_number'))
+    transit = normalize_bank_coordinate(primary.get('transit_number'))
+    account_number = normalize_bank_coordinate(primary.get('account_number'))
 
     account = _find_matching_account(connection, primary)
     if account is None:
