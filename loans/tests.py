@@ -632,6 +632,115 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(payment.scheduled_date, new_date)
         self.assertEqual(payment.amount, Decimal("125.50"))
 
+    def test_update_scheduled_payment_rebalances_later_installments(self):
+        """Ballooning one installment must shrink later scheduled rows (no double $0)."""
+        self.loan.total_amount = Decimal("600.00")
+        self.loan.balance = Decimal("600.00")
+        self.loan.save(update_fields=["total_amount", "balance", "updated_at"])
+        first = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+        )
+        second = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("250.00"),
+            scheduled_date=timezone.localdate() + timedelta(days=14),
+            status="scheduled",
+        )
+        third = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("250.00"),
+            scheduled_date=timezone.localdate() + timedelta(days=28),
+            status="scheduled",
+        )
+
+        response = self.client.patch(
+            f"/api/payments/{first.id}/",
+            {"amount": "300.00"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        first.refresh_from_db()
+        remaining = list(
+            self.loan.payments.filter(status="scheduled")
+            .exclude(pk=first.pk)
+            .order_by("scheduled_date", "created_at", "id")
+        )
+        self.assertEqual(first.amount, Decimal("300.00"))
+        remaining_total = sum((p.amount for p in remaining), Decimal("0.00"))
+        self.assertEqual(first.amount + remaining_total, self.loan.total_amount)
+        self.assertEqual(remaining_total, Decimal("300.00"))
+        self.assertTrue(all(p.amount > 0 for p in remaining))
+        # Original trailing 250+250 cannot both remain unchanged after the balloon.
+        self.assertFalse(
+            Payment.objects.filter(pk=second.pk, amount=Decimal("250.00")).exists()
+            and Payment.objects.filter(pk=third.pk, amount=Decimal("250.00")).exists()
+        )
+
+    def test_adjust_schedule_rejects_pending_collection_installment(self):
+        formula = LoanFormula.objects.create(
+            name="Pending Block Schedule 500",
+            principal_amount=Decimal("500.00"),
+            brokerage_percent=Decimal("70.00"),
+            repayment_percent=Decimal("35.00"),
+            default_number_of_payments=4,
+            default_frequency_days=14,
+            is_active=True,
+        )
+        self.loan.status = "active"
+        self.loan.formula = formula
+        self.loan.save(update_fields=["status", "formula", "updated_at"])
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("150.00"),
+            scheduled_date=timezone.localdate(),
+            status="pending",
+        )
+
+        response = self.client.patch(
+            f"/api/loans/{self.loan.id}/adjust-schedule/",
+            {
+                "payment_amount": "180.00",
+                "frequency": "bi-weekly",
+                "start_date": timezone.localdate().isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("pending", response.data["error"].lower())
+        self.assertEqual(self.loan.payments.filter(status="pending").count(), 1)
+
+    def test_balance_after_matches_table_order_on_same_date(self):
+        from loans.serializers import CustomerLoanPaymentSerializer
+
+        self.loan.total_amount = Decimal("400.00")
+        self.loan.balance = Decimal("400.00")
+        self.loan.save(update_fields=["total_amount", "balance", "updated_at"])
+        older = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("300.00"),
+            scheduled_date=timezone.localdate(),
+            status="pending",
+        )
+        newer = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+        )
+
+        rows = list(self.loan.payments.all())
+        self.assertEqual([p.id for p in rows], [older.id, newer.id])
+
+        data = CustomerLoanPaymentSerializer(rows, many=True).data
+        by_id = {row["id"]: row for row in data}
+        self.assertEqual(Decimal(by_id[str(older.id)]["balance_after"]), Decimal("100.00"))
+        self.assertEqual(Decimal(by_id[str(newer.id)]["balance_after"]), Decimal("0.00"))
+
     def test_update_scheduled_payment_rejects_completed(self):
         payment = Payment.objects.create(
             loan=self.loan,
@@ -1859,6 +1968,434 @@ class ZumRailsClientTests(APITestCase):
             mock_request.call_args_list[0].kwargs["json"]["Bytes"],
             process_payload["Bytes"],
         )
+
+
+@override_settings(ZUMRAILS_DRY_RUN=True)
+class PaymentScheduleIntegrityTests(APITestCase):
+    """Edge cases for schedule adjust / installment edit / Balance After.
+
+    Covers the production failure mode where a Pending collection survived
+    Adjust Schedule, producing same-day duplicates ($295 + $0.01) and multiple
+    trailing Balance After $0 rows.
+    """
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            email="schedule-integrity@example.com",
+            password="password123",
+            full_name="Schedule Agent",
+            user_type="staff",
+            is_staff=True,
+            permission_level=4,
+        )
+        self.portal_user = User.objects.create_user(
+            email="schedule-customer@example.com",
+            password="password123",
+            full_name="Schedule Customer",
+            user_type="customer",
+        )
+        self.customer = Customer.objects.create(
+            portal_user=self.portal_user,
+            first_name="Schedule",
+            last_name="Customer",
+            email="schedule-customer@example.com",
+            phone="4165559999",
+            phone_normalized="4165559999",
+            province="ON",
+            status="active",
+            banking_verified=True,
+            requested_loan_amount=Decimal("500.00"),
+        )
+        self.formula = LoanFormula.objects.create(
+            name="Schedule Integrity 500",
+            principal_amount=Decimal("500.00"),
+            brokerage_percent=Decimal("70.00"),
+            repayment_percent=Decimal("35.00"),
+            default_number_of_payments=6,
+            default_frequency_days=14,
+            is_active=True,
+        )
+        self.loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("383.09"),
+            total_amount=Decimal("883.09"),
+            balance=Decimal("883.09"),
+            status="active",
+            contract_signed_at=timezone.now(),
+            funded_at=timezone.now(),
+            formula=self.formula,
+            is_active=True,
+        )
+        self.client.force_authenticate(self.staff)
+
+    def _add_payment(self, amount, *, days=0, status="scheduled", notes=None):
+        return Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal(str(amount)),
+            scheduled_date=timezone.localdate() + timedelta(days=days),
+            status=status,
+            notes=notes,
+            processed_at=timezone.now() if status == "completed" else None,
+        )
+
+    def _open_sum(self):
+        return sum(
+            (
+                p.amount
+                for p in self.loan.payments.exclude(status__in=["completed", "cancelled"])
+            ),
+            Decimal("0.00"),
+        )
+
+    def _balance_after_map(self):
+        from loans.serializers import CustomerLoanPaymentSerializer
+
+        rows = list(self.loan.payments.exclude(status="cancelled"))
+        data = CustomerLoanPaymentSerializer(rows, many=True).data
+        return {row["id"]: Decimal(str(row["balance_after"])) for row in data}
+
+    def test_stephanie_scenario_adjust_blocked_while_pending_keeps_single_row(self):
+        """Pending $295 must not be layered with a new Adjust Schedule start row."""
+        pending = self._add_payment("295.00", status="pending")
+        self._add_payment("147.18", days=14)
+        self._add_payment("147.18", days=28)
+        before_ids = set(self.loan.payments.values_list("id", flat=True))
+
+        response = self.client.patch(
+            f"/api/loans/{self.loan.id}/adjust-schedule/",
+            {
+                "payment_amount": "147.18",
+                "frequency": "bi-weekly",
+                "start_date": timezone.localdate().isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("pending", response.data["error"].lower())
+        pending.refresh_from_db()
+        self.assertEqual(pending.status, "pending")
+        self.assertEqual(pending.amount, Decimal("295.00"))
+        self.assertEqual(set(self.loan.payments.values_list("id", flat=True)), before_ids)
+        # No same-day scheduled twin created beside the pending row.
+        same_day = self.loan.payments.filter(scheduled_date=pending.scheduled_date)
+        self.assertEqual(same_day.count(), 1)
+
+    def test_adjust_blocked_when_collection_attempt_processing_even_if_still_scheduled(self):
+        payment = self._add_payment("147.18")
+        CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=payment,
+            amount=payment.amount,
+            status="processing",
+        )
+
+        response = self.client.patch(
+            f"/api/loans/{self.loan.id}/adjust-schedule/",
+            {
+                "payment_amount": "180.00",
+                "frequency": "weekly",
+                "start_date": (timezone.localdate() + timedelta(days=7)).isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertTrue(Payment.objects.filter(pk=payment.pk).exists())
+
+    def test_adjust_clears_failed_and_nsf_then_rebuilds_without_duplicates(self):
+        completed = self._add_payment("100.00", days=-14, status="completed")
+        failed = self._add_payment("147.18", status="failed")
+        nsf = self._add_payment("147.18", days=14, status="nsf")
+        scheduled = self._add_payment("147.18", days=28)
+
+        response = self.client.patch(
+            f"/api/loans/{self.loan.id}/adjust-schedule/",
+            {
+                "payment_amount": "180.00",
+                "frequency": "bi-weekly",
+                "start_date": (timezone.localdate() + timedelta(days=7)).isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.loan.refresh_from_db()
+        self.assertTrue(Payment.objects.filter(pk=completed.pk, status="completed").exists())
+        self.assertFalse(Payment.objects.filter(pk=failed.pk).exists())
+        self.assertFalse(Payment.objects.filter(pk=nsf.pk).exists())
+        self.assertFalse(Payment.objects.filter(pk=scheduled.pk).exists())
+        rebuilt = list(
+            self.loan.payments.filter(status="scheduled").order_by("scheduled_date", "created_at")
+        )
+        self.assertGreaterEqual(len(rebuilt), 1)
+        dates = [p.scheduled_date for p in rebuilt]
+        self.assertEqual(len(dates), len(set(dates)), "rebuilt schedule must not duplicate dates")
+        rebuilt_total = sum((p.amount for p in rebuilt), Decimal("0.00"))
+        self.assertEqual(rebuilt_total, self.loan.balance)
+        self.assertEqual(
+            rebuilt_total + completed.amount,
+            self.loan.total_amount,
+        )
+
+    def test_adjust_succeeds_after_pending_clears_to_failed(self):
+        pending = self._add_payment("295.00", status="pending")
+        self._add_payment("147.18", days=14)
+
+        blocked = self.client.patch(
+            f"/api/loans/{self.loan.id}/adjust-schedule/",
+            {
+                "payment_amount": "180.00",
+                "frequency": "bi-weekly",
+                "start_date": timezone.localdate().isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(blocked.status_code, 400)
+
+        pending.status = "failed"
+        pending.failure_reason = "NSF"
+        pending.save(update_fields=["status", "failure_reason"])
+
+        ok = self.client.patch(
+            f"/api/loans/{self.loan.id}/adjust-schedule/",
+            {
+                "payment_amount": "180.00",
+                "frequency": "bi-weekly",
+                "start_date": (timezone.localdate() + timedelta(days=1)).isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(ok.status_code, 200, ok.data)
+        self.assertFalse(Payment.objects.filter(pk=pending.pk).exists())
+        self.assertFalse(self.loan.payments.filter(status="pending").exists())
+
+    def test_balloon_edit_removes_trailing_stub_and_single_terminal_zero(self):
+        """Stephanie-style overshoot: balloon + tiny stub + full tail → rebalance."""
+        first = self._add_payment("147.18")
+        stub = self._add_payment("0.01")
+        self._add_payment("147.18", days=14)
+        self._add_payment("147.18", days=28)
+        self._add_payment("147.18", days=42)
+        self._add_payment("147.18", days=56)
+        self._add_payment("147.19", days=70)
+        # 147.18*5 + 0.01 + 147.19 = 883.10 → already 0.01 over total.
+        self.assertGreater(self._open_sum(), self.loan.total_amount)
+
+        response = self.client.patch(
+            f"/api/payments/{first.id}/",
+            {"amount": "295.00"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        first.refresh_from_db()
+        self.assertEqual(first.amount, Decimal("295.00"))
+        self.assertEqual(self._open_sum(), self.loan.total_amount)
+
+        balances = list(self._balance_after_map().values())
+        # Consistent schedule → exactly one terminal Balance After $0.
+        self.assertEqual(balances[-1], Decimal("0.00"))
+        self.assertTrue(all(b > 0 for b in balances[:-1]), balances)
+        self.assertEqual(balances.count(Decimal("0.00")), 1)
+
+    def test_balloon_edit_does_not_reduce_pending_sibling(self):
+        pending = self._add_payment("200.00", status="pending")
+        first = self._add_payment("100.00", days=14)
+        later = self._add_payment("583.09", days=28)
+
+        response = self.client.patch(
+            f"/api/payments/{first.id}/",
+            {"amount": "400.00"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        pending.refresh_from_db()
+        first.refresh_from_db()
+        self.assertEqual(pending.amount, Decimal("200.00"))
+        self.assertEqual(first.amount, Decimal("400.00"))
+        # Remaining overshoot is taken from later scheduled rows only.
+        if Payment.objects.filter(pk=later.pk).exists():
+            later.refresh_from_db()
+            self.assertLess(later.amount, Decimal("583.09"))
+        self.assertEqual(self._open_sum(), self.loan.total_amount)
+
+    def test_balloon_edit_preserves_deferral_fee_row(self):
+        from loans.services import LoanService
+
+        first = self._add_payment("100.00")
+        fee = self._add_payment(
+            "35.00",
+            days=0,
+            notes=LoanService.DEFERRAL_FEE_NOTE,
+        )
+        later = self._add_payment("748.09", days=14)
+
+        response = self.client.patch(
+            f"/api/payments/{first.id}/",
+            {"amount": "500.00"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertTrue(Payment.objects.filter(pk=fee.pk, amount=Decimal("35.00")).exists())
+        first.refresh_from_db()
+        self.assertEqual(first.amount, Decimal("500.00"))
+        if Payment.objects.filter(pk=later.pk).exists():
+            later.refresh_from_db()
+            self.assertEqual(
+                first.amount + fee.amount + later.amount,
+                self.loan.total_amount,
+            )
+
+    def test_lowering_installment_does_not_auto_inflate_others(self):
+        first = self._add_payment("300.00")
+        second = self._add_payment("300.00", days=14)
+        third = self._add_payment("283.09", days=28)
+
+        response = self.client.patch(
+            f"/api/payments/{first.id}/",
+            {"amount": "50.00"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        first.refresh_from_db()
+        second.refresh_from_db()
+        third.refresh_from_db()
+        self.assertEqual(first.amount, Decimal("50.00"))
+        self.assertEqual(second.amount, Decimal("300.00"))
+        self.assertEqual(third.amount, Decimal("283.09"))
+        self.assertLess(self._open_sum(), self.loan.total_amount)
+
+    def test_date_only_edit_does_not_rebalance_amounts(self):
+        first = self._add_payment("200.00")
+        second = self._add_payment("683.09", days=14)
+        new_date = timezone.localdate() + timedelta(days=3)
+
+        response = self.client.patch(
+            f"/api/payments/{first.id}/",
+            {"scheduled_date": new_date.isoformat()},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(first.scheduled_date, new_date)
+        self.assertEqual(first.amount, Decimal("200.00"))
+        self.assertEqual(second.amount, Decimal("683.09"))
+
+    def test_rebalance_accounts_for_completed_payments(self):
+        self._add_payment("200.00", days=-14, status="completed")
+        self.loan.balance = Decimal("683.09")
+        self.loan.save(update_fields=["balance", "updated_at"])
+        first = self._add_payment("100.00")
+        second = self._add_payment("300.00", days=14)
+        third = self._add_payment("283.09", days=28)
+        # Open sum currently 683.09; balloon first by 200 → overshoot 200.
+        response = self.client.patch(
+            f"/api/payments/{first.id}/",
+            {"amount": "300.00"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        first.refresh_from_db()
+        self.assertEqual(first.amount, Decimal("300.00"))
+        open_total = self._open_sum()
+        completed_total = sum(
+            (p.amount for p in self.loan.payments.filter(status="completed")),
+            Decimal("0.00"),
+        )
+        self.assertEqual(open_total + completed_total, self.loan.total_amount)
+
+    def test_balance_after_skips_cancelled_and_matches_display_order(self):
+        older = self._add_payment("300.00")
+        cancelled = self._add_payment("50.00")
+        cancelled.status = "cancelled"
+        cancelled.save(update_fields=["status"])
+        newer = self._add_payment("583.09")
+
+        ordered = list(self.loan.payments.all())
+        self.assertEqual([p.id for p in ordered], [older.id, cancelled.id, newer.id])
+
+        balances = self._balance_after_map()
+        self.assertNotIn(str(cancelled.id), balances)
+        self.assertEqual(balances[str(older.id)], Decimal("583.09"))
+        self.assertEqual(balances[str(newer.id)], Decimal("0.00"))
+
+    def test_balance_after_same_day_pending_then_scheduled_is_monotonic(self):
+        pending = self._add_payment("295.00", status="pending")
+        scheduled = self._add_payment("0.01")
+        # Force overshoot schedule like production screenshot, without edit API.
+        self._add_payment("147.18", days=14)
+        self._add_payment("147.18", days=28)
+        self._add_payment("147.18", days=42)
+        self._add_payment("147.18", days=56)
+        self._add_payment("147.19", days=70)
+
+        rows = list(self.loan.payments.exclude(status="cancelled"))
+        self.assertEqual(rows[0].id, pending.id)
+        self.assertEqual(rows[1].id, scheduled.id)
+
+        balances = [self._balance_after_map()[str(p.id)] for p in rows]
+        # Display order matches cumulative subtraction order (no newer-first inversion).
+        self.assertEqual(balances[0], Decimal("588.09"))
+        self.assertEqual(balances[1], Decimal("588.08"))
+        for earlier, later in zip(balances, balances[1:]):
+            self.assertGreaterEqual(earlier, later)
+        # Overshoot still clamps, but values stay non-increasing in table order.
+        self.assertEqual(balances[-1], Decimal("0.00"))
+
+    def test_edit_rejects_payment_with_processing_collection(self):
+        payment = self._add_payment("147.18")
+        CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=payment,
+            amount=payment.amount,
+            status="processing",
+        )
+
+        response = self.client.patch(
+            f"/api/payments/{payment.id}/",
+            {"amount": "200.00"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        payment.refresh_from_db()
+        self.assertEqual(payment.amount, Decimal("147.18"))
+
+    def test_failed_installment_edit_resets_status_and_rebalances(self):
+        failed = self._add_payment("100.00", status="failed")
+        later = self._add_payment("783.09", days=14)
+
+        response = self.client.patch(
+            f"/api/payments/{failed.id}/",
+            {"amount": "400.00"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        failed.refresh_from_db()
+        self.assertEqual(failed.status, "scheduled")
+        self.assertEqual(failed.amount, Decimal("400.00"))
+        self.assertEqual(self._open_sum(), self.loan.total_amount)
+        if Payment.objects.filter(pk=later.pk).exists():
+            later.refresh_from_db()
+            self.assertEqual(failed.amount + later.amount, self.loan.total_amount)
+
+    def test_protects_edited_amount_when_no_other_scheduled_to_trim(self):
+        """If only the edited row is scheduled, overshoot cannot be trimmed away."""
+        only = self._add_payment("100.00")
+        self._add_payment("200.00", status="pending")
+
+        response = self.client.patch(
+            f"/api/payments/{only.id}/",
+            {"amount": "800.00"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        only.refresh_from_db()
+        self.assertEqual(only.amount, Decimal("800.00"))
+        # Pending sibling untouched; open sum may still exceed total.
+        self.assertEqual(self.loan.payments.get(status="pending").amount, Decimal("200.00"))
+        self.assertGreater(self._open_sum(), self.loan.total_amount)
 
 
 @override_settings(ZUMRAILS_DRY_RUN=True)

@@ -513,7 +513,8 @@ class Payment(models.Model):
     
     class Meta:
         db_table = 'loans_payment'
-        ordering = ['scheduled_date', '-created_at']
+        # Oldest-first on the same date so the table matches Balance After math.
+        ordering = ['scheduled_date', 'created_at', 'id']
     
     def __str__(self):
         return f"Payment ${self.amount} for Loan #{str(self.loan_id)[:8]} on {self.scheduled_date}"

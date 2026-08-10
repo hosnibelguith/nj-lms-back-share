@@ -924,6 +924,17 @@ class LoanService:
         if balance_due <= 0:
             raise ValueError('This loan has no remaining balance to schedule.')
 
+        # Pending installments are in-flight collections. Rebuilding only deleted
+        # "scheduled" rows before, which left Pending + a new schedule (duplicate
+        # same-day payments and Balance After clamping to $0 twice).
+        if loan.payments.filter(
+            collection_attempts__status='processing'
+        ).exists() or loan.payments.filter(status='pending').exists():
+            raise ValueError(
+                'Cannot adjust schedule while a payment collection is pending. '
+                'Wait for the collection to finish or fail, then try again.'
+            )
+
         if calculation_mode == 'number_of_payments':
             detail = (
                 f'Schedule adjusted to {num_payments} {frequency} payment(s) '
@@ -935,7 +946,10 @@ class LoanService:
                 f'from {start_date}; target payment ${payment_amount}.'
             )
 
-        Payment.objects.filter(loan=loan, status='scheduled').delete()
+        Payment.objects.filter(
+            loan=loan,
+            status__in=['scheduled', 'failed', 'nsf'],
+        ).delete()
 
         loan.formula = formula
         loan.fee = LoanService.money(total_amount - principal)
@@ -1021,6 +1035,59 @@ class LoanService:
         return payments
 
     @staticmethod
+    def rebalance_open_schedule_to_total(loan: Loan, *, protect_payment_id=None) -> None:
+        """Keep open installments aligned with loan.total_amount after a manual edit.
+
+        Overschedule (e.g. balloon one payment without lowering the rest) causes
+        multiple trailing Balance After $0 rows. Reduce/remove later scheduled
+        installments; never touch pending/in-flight or deferral-fee rows.
+        """
+        money = LoanService.money
+        payments = list(
+            loan.payments.exclude(status='cancelled').order_by(
+                'scheduled_date', 'created_at', 'id'
+            )
+        )
+        completed_sum = sum(
+            (money(p.amount or Decimal('0.00')) for p in payments if p.status == 'completed'),
+            Decimal('0.00'),
+        )
+        target_open = money((loan.total_amount or Decimal('0.00')) - completed_sum)
+        if target_open < 0:
+            target_open = Decimal('0.00')
+
+        open_payments = [
+            p for p in payments if p.status in ('scheduled', 'pending', 'failed', 'nsf')
+        ]
+        open_sum = sum(
+            (money(p.amount or Decimal('0.00')) for p in open_payments),
+            Decimal('0.00'),
+        )
+        delta = money(open_sum - target_open)
+        # Only correct overshoot (ballooned installment / leftover stubs).
+        # Underschedule is left alone — staff use Adjust Schedule to rebuild.
+        if delta <= 0:
+            return
+
+        for payment in reversed(open_payments):
+            if delta <= 0:
+                break
+            if protect_payment_id and payment.id == protect_payment_id:
+                continue
+            if payment.status != 'scheduled':
+                continue
+            if LoanService.is_deferral_fee_payment(payment):
+                continue
+            amount = money(payment.amount or Decimal('0.00'))
+            if amount <= delta:
+                delta = money(delta - amount)
+                payment.delete()
+            else:
+                payment.amount = money(amount - delta)
+                payment.save(update_fields=['amount'])
+                delta = Decimal('0.00')
+
+    @staticmethod
     @transaction.atomic
     def update_scheduled_payment(
         payment: Payment,
@@ -1058,6 +1125,7 @@ class LoanService:
         previous_date = payment.scheduled_date
         previous_amount = payment.amount
         update_fields = []
+        amount_changed = False
 
         if scheduled_date is not None and scheduled_date != payment.scheduled_date:
             payment.scheduled_date = scheduled_date
@@ -1070,6 +1138,7 @@ class LoanService:
             if amount != payment.amount:
                 payment.amount = amount
                 update_fields.append('amount')
+                amount_changed = True
 
         if not update_fields:
             return payment
@@ -1082,6 +1151,13 @@ class LoanService:
             update_fields.extend(['status', 'failure_reason', 'processed_at'])
 
         payment.save(update_fields=list(dict.fromkeys(update_fields)))
+
+        if amount_changed:
+            LoanService.rebalance_open_schedule_to_total(
+                loan,
+                protect_payment_id=payment.id,
+            )
+            payment.refresh_from_db()
 
         from activity.services import actor_label, log_staff_action
 

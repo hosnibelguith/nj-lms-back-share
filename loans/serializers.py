@@ -136,23 +136,34 @@ class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
     def get_balance_after(self, obj):
         """
         Remaining loan total after this installment in schedule order.
-        Uses all payments (including scheduled) so the table declines correctly
-        before any collections are completed.
+        Uses all non-cancelled payments (including scheduled) so the table
+        declines correctly before any collections are completed.
         """
+        from .services import LoanService
+
         loan = obj.loan
-        payments = list(
-            loan.payments.order_by('scheduled_date', 'created_at', 'id').only(
-                'id', 'amount', 'scheduled_date', 'created_at'
+        cache = self.context.setdefault('_balance_after_by_loan', {})
+        loan_key = str(loan.id)
+        if loan_key not in cache:
+            money = LoanService.money
+            payments = list(
+                loan.payments.exclude(status='cancelled')
+                .order_by('scheduled_date', 'created_at', 'id')
+                .only('id', 'amount', 'scheduled_date', 'created_at')
             )
-        )
+            running_balance = money(loan.total_amount or Decimal('0.00'))
+            mapping = {}
+            for payment in payments:
+                running_balance = money(
+                    running_balance - money(payment.amount or Decimal('0.00'))
+                )
+                mapping[payment.id] = max(running_balance, Decimal('0.00'))
+            cache[loan_key] = mapping
 
-        running_balance = loan.total_amount or Decimal('0.00')
-        for payment in payments:
-            running_balance -= payment.amount or Decimal('0.00')
-            if payment.id == obj.id:
-                return max(running_balance, Decimal('0.00'))
-
-        return max(loan.balance or Decimal('0.00'), Decimal('0.00'))
+        mapped = cache[loan_key].get(obj.id)
+        if mapped is not None:
+            return mapped
+        return max(LoanService.money(loan.balance or Decimal('0.00')), Decimal('0.00'))
 
 
 class FundedPaymentSerializer(serializers.ModelSerializer):
