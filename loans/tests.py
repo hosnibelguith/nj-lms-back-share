@@ -26,6 +26,7 @@ from .zumrails import (
     ZumRailsRequestError,
     ZumRailsService,
     funding_configuration_ready,
+    normalize_zum_status,
 )
 
 
@@ -390,8 +391,24 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(approved_row["created_by_name"], "Agent User")
 
     def test_configure_rejected_after_funding_locked(self):
+        # Locks only stick while an active (processing/completed) funding exists.
+        FundedPayment.objects.create(
+            loan=self.loan,
+            amount=self.loan.principal,
+            method="eft",
+            status="completed",
+            processor_transaction_id="locked-config-tx-1",
+            completed_at=timezone.now(),
+        )
         self.loan.funding_destination_locked_at = timezone.now()
-        self.loan.save(update_fields=["funding_destination_locked_at", "updated_at"])
+        self.loan.collections_account_locked_at = timezone.now()
+        self.loan.save(
+            update_fields=[
+                "funding_destination_locked_at",
+                "collections_account_locked_at",
+                "updated_at",
+            ]
+        )
 
         response = self.client.patch(
             f"/api/loans/{self.loan.id}/funding/configuration/",
@@ -934,12 +951,14 @@ class ZumRailsWorkflowTests(APITestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.loan.funded_payments.count(), 2)
-        self.assertEqual(self.loan.funded_payments.order_by("-created_at").first().status, "processing")
+        latest = self.loan.funded_payments.order_by("-created_at").first()
+        self.assertEqual(latest.status, "completed")
         self.loan.refresh_from_db()
-        self.assertEqual(self.loan.status, "pending_funding")
-        self.assertIsNone(self.loan.funded_at)
+        self.assertEqual(self.loan.status, "active")
+        self.assertIsNotNone(self.loan.funded_at)
 
-    def test_funding_initiate_waits_for_completed_webhook(self):
+    def test_funding_initiate_completes_on_create_and_activates_loan(self):
+        """Zūm AP create acceptance activates the loan; do not wait for Completed webhook."""
         response = self.client.post(
             f"/api/loans/{self.loan.id}/funding/initiate/",
             {"method": "eft", "schedule_confirmed": True, "override_confirmed": True},
@@ -949,11 +968,20 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.loan.refresh_from_db()
         funding = self.loan.funded_payments.order_by("-created_at").first()
-        self.assertEqual(funding.status, "processing")
-        self.assertEqual(self.loan.status, "pending_funding")
-        self.assertIsNone(self.loan.funded_at)
+        self.assertEqual(funding.status, "completed")
+        self.assertIsNotNone(funding.processor_transaction_id)
+        self.assertIsNotNone(funding.completed_at)
+        self.assertEqual(self.loan.status, "active")
+        self.assertTrue(self.loan.is_active)
+        self.assertIsNotNone(self.loan.funded_at)
         self.assertIsNotNone(self.loan.funding_destination_locked_at)
         self.assertIsNotNone(self.loan.collections_account_locked_at)
+
+        # Activated loans must not linger in the Pending Funding queue.
+        listed = self.client.get("/api/loans/", {"status": "pending_funding"})
+        self.assertEqual(listed.status_code, 200)
+        listed_ids = {row["id"] for row in listed.data["results"]}
+        self.assertNotIn(str(self.loan.id), listed_ids)
 
     @patch(
         "loans.zumrails.ZumRailsService.initiate_transaction",
@@ -1159,7 +1187,8 @@ class ZumRailsWorkflowTests(APITestCase):
 
         alert.refresh_from_db()
         self.assertTrue(alert.metadata.get("is_resolved"))
-        self.assertEqual(alert.metadata.get("resolved_reason"), "new_funding_initiated")
+        # Complete-on-create resolves alerts as funding_completed (same attempt).
+        self.assertEqual(alert.metadata.get("resolved_reason"), "funding_completed")
 
         alerts = self.client.get("/api/activities/funding-alerts/")
         self.assertEqual(alerts.status_code, 200)
@@ -1312,6 +1341,74 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(self.loan.status, "pending_funding")
         self.assertFalse(self.loan.is_active)
         self.assertIsNone(self.loan.funded_at)
+
+    def test_inprogress_webhook_after_complete_on_create_keeps_loan_active(self):
+        """Zūm often reports InProgress after AP create — must not undo local completion."""
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/funding/initiate/",
+            {"method": "etransfer", "schedule_confirmed": True, "override_confirmed": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        funding = self.loan.funded_payments.get()
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "active")
+        self.assertEqual(funding.status, "completed")
+
+        webhook = self.post_webhook({
+            "Type": "Transaction",
+            "Data": {
+                "Id": funding.processor_transaction_id,
+                "Status": "InProgress",
+                "ClientTransactionId": str(funding.id),
+            },
+        })
+        self.assertEqual(webhook.status_code, 200)
+        funding.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(funding.status, "completed")
+        self.assertEqual(normalize_zum_status(funding.zum_status), "InProgress")
+        self.assertEqual(self.loan.status, "active")
+        self.assertIsNotNone(self.loan.funded_at)
+
+    def test_failure_webhook_after_complete_on_create_reopens_pending_funding(self):
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/funding/initiate/",
+            {"method": "eft", "schedule_confirmed": True, "override_confirmed": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        funding = self.loan.funded_payments.get()
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "active")
+
+        failed = self.post_webhook({
+            "Type": "Transaction",
+            "Data": {
+                "Id": funding.processor_transaction_id,
+                "Status": "Failed",
+                "FailedTransactionEvent": "InteracFailedSecurityQuestion",
+                "ClientTransactionId": str(funding.id),
+            },
+        })
+        self.assertEqual(failed.status_code, 200)
+        funding.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(funding.status, "failed")
+        self.assertEqual(self.loan.status, "pending_funding")
+        self.assertFalse(self.loan.is_active)
+        self.assertIsNone(self.loan.funded_at)
+        self.assertIsNone(self.loan.funding_destination_locked_at)
+
+        retry = self.client.post(
+            f"/api/loans/{self.loan.id}/funding/initiate/",
+            {"method": "eft", "schedule_confirmed": True, "override_confirmed": True},
+            format="json",
+        )
+        self.assertEqual(retry.status_code, 200, retry.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "active")
+        self.assertEqual(self.loan.funded_payments.filter(status="completed").count(), 1)
 
     def test_funding_failure_webhook_stores_zum_reason_and_allows_retry(self):
         from activity.models import ActivityHistory
@@ -2396,6 +2493,55 @@ class PaymentScheduleIntegrityTests(APITestCase):
         # Pending sibling untouched; open sum may still exceed total.
         self.assertEqual(self.loan.payments.get(status="pending").amount, Decimal("200.00"))
         self.assertGreater(self._open_sum(), self.loan.total_amount)
+
+    def test_adjust_schedule_can_run_multiple_times_when_no_pending_collection(self):
+        """Staff may rebuild the schedule repeatedly before collections start."""
+        self._add_payment("200.00")
+        self._add_payment("683.09", days=14)
+        start_a = timezone.localdate() + timedelta(days=3)
+        start_b = timezone.localdate() + timedelta(days=10)
+
+        first = self.client.patch(
+            f"/api/loans/{self.loan.id}/adjust-schedule/",
+            {
+                "payment_amount": "200.00",
+                "frequency": "bi-weekly",
+                "start_date": start_a.isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(first.status_code, 200, first.data)
+        after_first = list(
+            self.loan.payments.filter(status="scheduled").order_by("scheduled_date")
+        )
+        self.assertGreaterEqual(len(after_first), 1)
+        self.assertEqual(after_first[0].scheduled_date, start_a)
+
+        second = self.client.patch(
+            f"/api/loans/{self.loan.id}/adjust-schedule/",
+            {
+                "calculation_mode": "number_of_payments",
+                "number_of_payments": 4,
+                "frequency": "weekly",
+                "start_date": start_b.isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(second.status_code, 200, second.data)
+        self.loan.refresh_from_db()
+        after_second = list(
+            self.loan.payments.filter(status="scheduled").order_by("scheduled_date")
+        )
+        self.assertEqual(len(after_second), 4)
+        self.assertEqual(after_second[0].scheduled_date, start_b)
+        self.assertEqual(
+            sum((p.amount for p in after_second), Decimal("0.00")),
+            self.loan.balance,
+        )
+        # Prior rebuild rows are fully replaced.
+        self.assertFalse(
+            any(p.scheduled_date == start_a for p in after_second)
+        )
 
 
 @override_settings(ZUMRAILS_DRY_RUN=True)

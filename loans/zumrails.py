@@ -386,11 +386,17 @@ def apply_funded_payment_zum_status(
 
     if status_value == "Completed":
         funding.zum_status = status_value
+        # Stale Completed after a terminal failure/return must not revive the attempt
+        # (Zum can replay Completed after Returned / Interac failure).
+        if funding.status in ("returned", "failed", "cancelled"):
+            funding.save(update_fields=["zum_status", "updated_at"])
+            return funding
+
         was_incomplete = funding.status != "completed"
         loan_was_inactive = funding.loan.status != "active"
 
         if funding.status != "completed":
-            # Heal processing/failed/cancelled rows when Zum confirms completion.
+            # Heal processing rows (and complete-on-create already-completed is idempotent).
             funding.failure_reason = None
             funding.status = "completed"
             if not funding.completed_at:
@@ -1354,28 +1360,45 @@ class FundingService:
                 )
             raise
 
+        # Zūm accepted the AP create. Mark complete locally and activate the loan
+        # immediately (Interac/EFT often stay InProgress at Zūm for a long time).
+        # Failure / Returned / Cancelled webhooks reopen the loan for retry.
         funding.processor_transaction_id = processor_id
         funding.reference = processor_id
         funding.failure_reason = None
+        funding.status = "completed"
+        funding.completed_at = timezone.now()
         funding.save(update_fields=[
             "processor_transaction_id",
             "reference",
             "failure_reason",
+            "status",
+            "completed_at",
             "updated_at",
         ])
 
-        # New attempt accepted by Zūm — clear prior failure alerts from the bell.
+        loan.refresh_from_db()
+        loan.mark_funding_completed(
+            method=method,
+            reference=processor_id,
+            user=user,
+        )
+
         from activity.services import actor_label, resolve_funding_failure_alerts
 
-        resolve_funding_failure_alerts(loan, reason="new_funding_initiated")
+        resolve_funding_failure_alerts(loan, reason="funding_completed")
 
         recommended_method = FundingMethodRecommendation.for_date()
         actor = actor_label(user)
         log_activity(
             loan,
-            "system",
-            "Funding Initiated",
-            f"Funding initiated by {actor} via {method.upper()} and sent to ZūmRails for processing.",
+            "loan_funded",
+            "Funding Completed",
+            (
+                f"Funding accepted by ZūmRails via {method.upper()} and marked complete by "
+                f"{actor}. Loan activated; a failure webhook will reopen funding if Zūm "
+                "later reports a failure."
+            ),
             created_by=getattr(user, "id", "system"),
             metadata={
                 "funded_payment_id": str(funding.id),
@@ -1385,6 +1408,7 @@ class FundingService:
                     recommended_method and recommended_method != method
                 ),
                 "loan_id": str(loan.id),
+                "completed_on_create": True,
             },
         )
         FundingService._queue_funding_email(loan)
