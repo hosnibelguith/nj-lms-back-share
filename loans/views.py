@@ -184,6 +184,12 @@ class LoanViewSet(viewsets.ModelViewSet):
             qs = qs.filter(status='pending_funding').filter(Exists(self._failed_funding_exists()))
             qs = self._exclude_active_funding(qs)
 
+        contract_signed_param = (self.request.query_params.get('contract_signed') or '').strip().lower()
+        if contract_signed_param in ('true', '1', 'yes'):
+            qs = qs.filter(Q(contract_signed_at__isnull=False) | Q(customer__contract_completed=True))
+        elif contract_signed_param in ('false', '0', 'no'):
+            qs = qs.filter(contract_signed_at__isnull=True, customer__contract_completed=False)
+
         ai_decision_param = self.request.query_params.get('ai_decision')
         if ai_decision_param:
             qs = qs.filter(ai_decision=ai_decision_param)
@@ -333,7 +339,13 @@ class LoanViewSet(viewsets.ModelViewSet):
         pending_funding_qs = self._exclude_active_funding(
             qs.filter(status='pending_funding')
         )
-        pending_funding_count = pending_funding_qs.count()
+        approved_pending_signature_count = pending_funding_qs.filter(
+            contract_signed_at__isnull=True,
+            customer__contract_completed=False,
+        ).count()
+        pending_funding_count = pending_funding_qs.filter(
+            Q(contract_signed_at__isnull=False) | Q(customer__contract_completed=True)
+        ).count()
         funding_failed_count = pending_funding_qs.filter(
             Exists(self._failed_funding_exists())
         ).count()
@@ -342,6 +354,7 @@ class LoanViewSet(viewsets.ModelViewSet):
             'ibv_pending': by_status.get('ibv_pending', 0),
             'pending': by_status.get('pending', 0),
             'pending_signature': by_status.get('pending_signature', 0),
+            'approved_pending_signature': approved_pending_signature_count,
             'pending_funding': pending_funding_count,
             'funding_failed': funding_failed_count,
             'active': by_status.get('active', 0),

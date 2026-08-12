@@ -1514,6 +1514,43 @@ class ZumRailsWorkflowTests(APITestCase):
         summary = self.client.get("/api/loans/status-summary/")
         self.assertEqual(summary.status_code, 200)
         self.assertEqual(summary.data["pending_funding"], 1)
+        self.assertEqual(summary.data["approved_pending_signature"], 0)
+
+    def test_pending_funding_can_filter_signed_and_unsigned_approved_loans(self):
+        unsigned_approved = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("300.00"),
+            fee=Decimal("60.00"),
+            total_amount=Decimal("360.00"),
+            balance=Decimal("360.00"),
+            status="pending_funding",
+            contract_signed_at=None,
+            bank_account=self.account,
+            collections_account=self.account,
+        )
+
+        signed_response = self.client.get(
+            "/api/loans/",
+            {"status": "pending_funding", "contract_signed": "true"},
+        )
+        self.assertEqual(signed_response.status_code, 200)
+        signed_ids = {row["id"] for row in signed_response.data["results"]}
+        self.assertIn(str(self.loan.id), signed_ids)
+        self.assertNotIn(str(unsigned_approved.id), signed_ids)
+
+        unsigned_response = self.client.get(
+            "/api/loans/",
+            {"status": "pending_funding", "contract_signed": "false"},
+        )
+        self.assertEqual(unsigned_response.status_code, 200)
+        unsigned_ids = {row["id"] for row in unsigned_response.data["results"]}
+        self.assertNotIn(str(self.loan.id), unsigned_ids)
+        self.assertIn(str(unsigned_approved.id), unsigned_ids)
+
+        summary = self.client.get("/api/loans/status-summary/")
+        self.assertEqual(summary.status_code, 200)
+        self.assertEqual(summary.data["pending_funding"], 1)
+        self.assertEqual(summary.data["approved_pending_signature"], 1)
 
     def test_funding_failure_list_alerts_and_retry_filter(self):
         from activity.models import ActivityHistory
