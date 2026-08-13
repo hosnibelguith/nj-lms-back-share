@@ -7,8 +7,8 @@ from rest_framework.response import Response
 
 from django.utils import timezone
 from django.utils.dateparse import parse_date
-from django.db.models import Q, Sum, Count, F, Value, CharField, Exists, OuterRef, Subquery
-from django.db.models.functions import TruncDate, Concat
+from django.db.models import Q, Sum, Count, Value, CharField, Exists, OuterRef, Subquery
+from django.db.models.functions import Coalesce, TruncDate, Concat
 
 from banking.models import BankAccount
 
@@ -857,7 +857,12 @@ class LoanViewSet(viewsets.ModelViewSet):
             )
 
         funded_payments = FundedPayment.objects.all()
-        collected_payments = Payment.objects.all()
+        processing_collections = CollectionPayment.objects.filter(status='processing')
+        completed_collections = CollectionPayment.objects.filter(
+            status='completed',
+        ).annotate(
+            completed_date=TruncDate(Coalesce('settled_at', 'updated_at'))
+        )
         nsf_payments = Payment.objects.filter(
             status='nsf',
             processed_at__isnull=False,
@@ -866,18 +871,21 @@ class LoanViewSet(viewsets.ModelViewSet):
 
         if source in ('arrive', 'organic'):
             funded_payments = funded_payments.filter(loan__customer__source=source)
-            collected_payments = collected_payments.filter(loan__customer__source=source)
+            processing_collections = processing_collections.filter(loan__customer__source=source)
+            completed_collections = completed_collections.filter(loan__customer__source=source)
             nsf_payments = nsf_payments.filter(loan__customer__source=source)
             sent_payments = sent_payments.filter(loan__customer__source=source)
 
         if date_from:
             funded_payments = funded_payments.filter(initiated_at__date__gte=date_from)
-            collected_payments = collected_payments.filter(scheduled_date__gte=date_from)
+            processing_collections = processing_collections.filter(initiated_at__date__gte=date_from)
+            completed_collections = completed_collections.filter(completed_date__gte=date_from)
             nsf_payments = nsf_payments.filter(processed_at__date__gte=date_from)
             sent_payments = sent_payments.filter(created_at__date__gte=date_from)
         if date_to:
             funded_payments = funded_payments.filter(initiated_at__date__lte=date_to)
-            collected_payments = collected_payments.filter(scheduled_date__lte=date_to)
+            processing_collections = processing_collections.filter(initiated_at__date__lte=date_to)
+            completed_collections = completed_collections.filter(completed_date__lte=date_to)
             nsf_payments = nsf_payments.filter(processed_at__date__lte=date_to)
             sent_payments = sent_payments.filter(created_at__date__lte=date_to)
 
@@ -891,10 +899,23 @@ class LoanViewSet(viewsets.ModelViewSet):
             .annotate(value=Sum('amount')) \
             .order_by('date')
 
-        collected_series = collected_payments \
-            .values(date=F('scheduled_date')) \
+        processing_collection_series = processing_collections \
+            .annotate(date=TruncDate('initiated_at')) \
+            .values('date') \
             .annotate(value=Sum('amount')) \
             .order_by('date')
+
+        completed_collection_series = completed_collections \
+            .values('completed_date') \
+            .annotate(value=Sum('amount')) \
+            .order_by('completed_date')
+        completed_collection_series = [
+            {"date": item["completed_date"], "value": item["value"]}
+            for item in completed_collection_series
+        ]
+
+        processing_collection_total = processing_collections.aggregate(total=Sum('amount'))['total'] or 0
+        completed_collection_total = completed_collections.aggregate(total=Sum('amount'))['total'] or 0
 
         received_arrive = received_loans.filter(customer__source='arrive')
         received_organic = received_loans.exclude(customer__source='arrive')
@@ -903,7 +924,9 @@ class LoanViewSet(viewsets.ModelViewSet):
         # counts still use LoanStateEvent for trend compatibility.
         totals = {
             "funded_payments_amount": str(funded_payments.aggregate(total=Sum('amount'))['total'] or 0),
-            "collected_payments_amount": str(collected_payments.aggregate(total=Sum('amount'))['total'] or 0),
+            "processing_collection_payments_amount": str(processing_collection_total),
+            "completed_collection_payments_amount": str(completed_collection_total),
+            "collected_payments_amount": str(completed_collection_total),
             "received_applications_count": received_loans.count(),
             "received_arrive_count": received_arrive.count(),
             "received_organic_count": received_organic.count(),
@@ -929,7 +952,9 @@ class LoanViewSet(viewsets.ModelViewSet):
             "totals": totals,
             "series": {
                 "funded_payments_amount": funded_series,
-                "collected_payments_amount": collected_series,
+                "processing_collection_payments_amount": processing_collection_series,
+                "completed_collection_payments_amount": completed_collection_series,
+                "collected_payments_amount": completed_collection_series,
                 "received_applications_count": series(received_loans, 'created_at'),
                 "received_arrive_count": series(received_arrive, 'created_at'),
                 "received_organic_count": series(received_organic, 'created_at'),

@@ -4,7 +4,7 @@ import hmac
 import json
 import uuid
 from decimal import Decimal
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
 
 import requests
@@ -30,6 +30,104 @@ from .zumrails import (
     funding_configuration_ready,
     normalize_zum_status,
 )
+
+
+@override_settings(ZUMRAILS_DRY_RUN=True)
+class DashboardAnalyticsTests(APITestCase):
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            email="dashboard-agent@example.com",
+            password="password123",
+            full_name="Dashboard Agent",
+            user_type="staff",
+            is_staff=True,
+            permission_level=4,
+        )
+        self.customer = Customer.objects.create(
+            first_name="Dash",
+            last_name="Customer",
+            email="dashboard-customer@example.com",
+            phone="4165550101",
+            province="ON",
+            status="active",
+        )
+        self.loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("100.00"),
+            total_amount=Decimal("600.00"),
+            balance=Decimal("600.00"),
+            status="active",
+            is_active=True,
+        )
+        self.client.force_authenticate(user=self.staff)
+
+    def test_dashboard_collection_amounts_are_split_by_processing_and_completed(self):
+        report_date = datetime(2026, 8, 13, 12, 0)
+        initiated_at = timezone.make_aware(report_date)
+        settled_at = timezone.make_aware(datetime(2026, 8, 13, 14, 0))
+
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=initiated_at.date(),
+            status="scheduled",
+        )
+        processing_payment = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("50.00"),
+            scheduled_date=initiated_at.date(),
+            status="pending",
+        )
+        completed_payment = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("35.00"),
+            scheduled_date=initiated_at.date(),
+            status="completed",
+            processed_at=settled_at,
+        )
+        CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=processing_payment,
+            amount=Decimal("50.00"),
+            status="processing",
+            initiated_at=initiated_at,
+        )
+        CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=completed_payment,
+            amount=Decimal("35.00"),
+            status="completed",
+            initiated_at=initiated_at,
+            settled_at=settled_at,
+        )
+
+        response = self.client.get(
+            "/api/loans/dashboard/analytics/",
+            {"date_from": "2026-08-13", "date_to": "2026-08-13"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(
+            Decimal(response.data["totals"]["processing_collection_payments_amount"]),
+            Decimal("50.00"),
+        )
+        self.assertEqual(
+            Decimal(response.data["totals"]["completed_collection_payments_amount"]),
+            Decimal("35.00"),
+        )
+        self.assertEqual(
+            Decimal(response.data["totals"]["collected_payments_amount"]),
+            Decimal("35.00"),
+        )
+        self.assertEqual(
+            list(response.data["series"]["processing_collection_payments_amount"]),
+            [{"date": initiated_at.date(), "value": Decimal("50")}],
+        )
+        self.assertEqual(
+            response.data["series"]["completed_collection_payments_amount"],
+            [{"date": settled_at.date(), "value": Decimal("35")}],
+        )
 
 
 @override_settings(
