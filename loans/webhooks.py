@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import uuid
 
@@ -24,6 +25,8 @@ from .zumrails import (
     release_funding_locks,
     verify_zumrails_signature,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _transaction_id(event_data):
@@ -115,6 +118,20 @@ class ZumRailsWebhookView(APIView):
         processor_transaction_id = _transaction_id(event_data)
         event_name = event_data.get("Event") or event_data.get("Status") or event_data.get("TransactionStatus")
         digest = payload_hash(raw_payload)
+        fields = extract_zum_transaction_fields(event_data)
+        transaction_data = event_data.get("Transaction")
+        client_transaction_id = event_data.get("ClientTransactionId")
+        if not client_transaction_id and isinstance(transaction_data, dict):
+            client_transaction_id = transaction_data.get("ClientTransactionId")
+
+        logger.info(
+            "ZumRails webhook received type=%s event=%s status=%s tx=%s client_tx=%s",
+            event_type,
+            event_name,
+            fields.get("status") or event_data.get("Status") or event_data.get("TransactionStatus"),
+            processor_transaction_id,
+            client_transaction_id,
+        )
 
         webhook_event, created = WebhookEvent.objects.get_or_create(
             payload_hash=digest,
@@ -172,6 +189,14 @@ class ZumRailsWebhookView(APIView):
                     collection.processor_transaction_id = processor_transaction_id
                     collection.save(update_fields=["processor_transaction_id", "updated_at"])
         if collection:
+            logger.info(
+                "ZumRails webhook matched collection id=%s status=%s zum_status=%s event=%s tx=%s",
+                collection.id,
+                collection.status,
+                collection.zum_status,
+                event_name,
+                processor_transaction_id,
+            )
             history = collection.event_history if isinstance(collection.event_history, list) else []
             history.append(history_item)
             collection.event_history = history
@@ -212,6 +237,14 @@ class ZumRailsWebhookView(APIView):
                         "updated_at",
                     ])
         if funding:
+            logger.info(
+                "ZumRails webhook matched funding id=%s status=%s zum_status=%s event=%s tx=%s",
+                funding.id,
+                funding.status,
+                funding.zum_status,
+                event_name,
+                processor_transaction_id,
+            )
             history = funding.event_history if isinstance(funding.event_history, list) else []
             history.append(history_item)
             funding.event_history = history
@@ -255,10 +288,18 @@ class ZumRailsWebhookView(APIView):
                     collection.processor_transaction_id = processor_transaction_id
                     collection.save(update_fields=["processor_transaction_id", "updated_at"])
         if collection:
+            logger.info(
+                "ZumRails transaction matched collection id=%s status=%s zum_status=%s incoming_status=%s tx=%s",
+                collection.id,
+                collection.status,
+                collection.zum_status,
+                status_value,
+                processor_transaction_id,
+            )
             if status_value == "Completed":
                 collection.zum_status = status_value
                 if not collection.settlement_due_at:
-                    collection.settlement_due_at = add_business_days(timezone.now(), 4)
+                    collection.settlement_due_at = add_business_days(collection.initiated_at, 4)
                 collection.save(update_fields=["zum_status", "settlement_due_at", "updated_at"])
                 return
 
@@ -304,6 +345,14 @@ class ZumRailsWebhookView(APIView):
                         "updated_at",
                     ])
         if funding:
+            logger.info(
+                "ZumRails transaction matched funding id=%s status=%s zum_status=%s incoming_status=%s tx=%s",
+                funding.id,
+                funding.status,
+                funding.zum_status,
+                status_value,
+                processor_transaction_id,
+            )
             fields = extract_zum_transaction_fields(event_data)
             resolved_status = status_value or fields.get("status")
             reason = _failure_reason(event_data, resolved_status or "Failed")

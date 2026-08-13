@@ -27,6 +27,7 @@ from .zumrails import (
     ZumRailsConfigurationError,
     ZumRailsRequestError,
     ZumRailsService,
+    add_business_days,
     funding_configuration_ready,
     normalize_zum_status,
 )
@@ -1879,7 +1880,7 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(collection.status, "failed")
         self.assertEqual(collection.event_history[0]["event"], "EftFailedFundsNotFree")
 
-    def test_collection_completed_webhook_waits_for_settlement(self):
+    def test_collection_completed_webhook_keeps_original_settlement_window(self):
         self.loan.status = "active"
         self.loan.save(update_fields=["status", "updated_at"])
         collection = CollectionPayment.objects.create(
@@ -1887,6 +1888,7 @@ class ZumRailsWorkflowTests(APITestCase):
             amount=Decimal("100.00"),
             status="processing",
             processor_transaction_id="collection-tx-1",
+            initiated_at=timezone.now() - timedelta(days=1),
             account_snapshot={"id": str(self.account.id)},
         )
 
@@ -1899,6 +1901,7 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(collection.zum_status, "Completed")
         self.assertEqual(collection.status, "processing")
         self.assertIsNotNone(collection.settlement_due_at)
+        self.assertLess(collection.settlement_due_at, add_business_days(timezone.now(), 4))
 
         collection.settlement_due_at = timezone.now() - timedelta(minutes=1)
         collection.save(update_fields=["settlement_due_at"])
@@ -2010,7 +2013,7 @@ class ZumRailsWorkflowTests(APITestCase):
                 audit = CollectionsAccountChangeAudit.objects.get(failed_payment=failed)
                 self.assertEqual(audit.failure_reason, failure_reason)
 
-    def test_process_collection_settlements_task(self):
+    def test_process_collection_settlements_task_completes_without_completed_webhook(self):
         from loans.tasks import process_collection_settlements
 
         self.loan.status = "active"
@@ -2020,7 +2023,6 @@ class ZumRailsWorkflowTests(APITestCase):
             amount=Decimal("50.00"),
             status="processing",
             processor_transaction_id="settlement-task-1",
-            zum_status="Completed",
             settlement_due_at=timezone.now() - timedelta(minutes=1),
             account_snapshot={"id": str(self.account.id)},
         )
@@ -2030,6 +2032,29 @@ class ZumRailsWorkflowTests(APITestCase):
         collection.refresh_from_db()
         self.loan.refresh_from_db()
         self.assertEqual(result["completed"], 1)
+        self.assertEqual(collection.status, "completed")
+        self.assertEqual(self.loan.balance, Decimal("550.00"))
+
+    def test_process_collection_settlements_backfills_missing_due_date(self):
+        from loans.tasks import process_collection_settlements
+
+        self.loan.status = "active"
+        self.loan.save(update_fields=["status", "updated_at"])
+        collection = CollectionPayment.objects.create(
+            loan=self.loan,
+            amount=Decimal("50.00"),
+            status="processing",
+            processor_transaction_id="settlement-task-legacy",
+            initiated_at=timezone.now() - timedelta(days=7),
+            account_snapshot={"id": str(self.account.id)},
+        )
+
+        result = process_collection_settlements()
+
+        collection.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(result["completed"], 1)
+        self.assertIsNotNone(collection.settlement_due_at)
         self.assertEqual(collection.status, "completed")
         self.assertEqual(self.loan.balance, Decimal("550.00"))
 

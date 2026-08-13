@@ -1681,6 +1681,7 @@ class CollectionService:
                     amount=amount,
                     status="processing",
                     account_snapshot=account_snapshot(account),
+                    settlement_due_at=add_business_days(timezone.now(), 4),
                     initiated_by=user,
                 )
                 if payment and payment.status == "scheduled":
@@ -1943,10 +1944,10 @@ class SettlementService:
     @staticmethod
     @transaction.atomic
     def complete_if_eligible(collection: CollectionPayment):
-        collection = CollectionPayment.objects.select_for_update().select_related("loan", "payment").get(pk=collection.pk)
+        collection = CollectionPayment.objects.select_for_update().select_related("loan").get(pk=collection.pk)
         if collection.status != "processing":
             return False
-        if collection.zum_status != "Completed" or not collection.settlement_due_at:
+        if not collection.processor_transaction_id or not collection.settlement_due_at:
             return False
         if collection.settlement_due_at > timezone.now():
             return False
@@ -1976,9 +1977,18 @@ class SettlementService:
 
     @staticmethod
     def process_due():
+        missing_due = CollectionPayment.objects.filter(
+            status="processing",
+            processor_transaction_id__isnull=False,
+            settlement_due_at__isnull=True,
+        )
+        for collection in missing_due:
+            collection.settlement_due_at = add_business_days(collection.initiated_at, 4)
+            collection.save(update_fields=["settlement_due_at", "updated_at"])
+
         due = CollectionPayment.objects.filter(
             status="processing",
-            zum_status="Completed",
+            processor_transaction_id__isnull=False,
             settlement_due_at__lte=timezone.now(),
         )
         completed = 0
