@@ -8,16 +8,18 @@ class CommunicationHistorySerializer(serializers.ModelSerializer):
     customer_name = serializers.SerializerMethodField()
     sender = serializers.SerializerMethodField()
     recipient = serializers.SerializerMethodField()
+    created_by_name = serializers.SerializerMethodField()
     timestamp = serializers.DateTimeField(source='created_at', read_only=True)
     body = serializers.CharField(source='content', read_only=True)
 
     class Meta:
         model = Communication
         fields = [
-            'id', 'customer', 'customer_name', 'type', 'direction',
+            'id', 'customer', 'customer_name', 'loan', 'type', 'direction',
             'subject', 'sender', 'recipient', 'status', 'incoming_status',
             'is_answered', 'is_unknown_sender', 'opened_at', 'answered_at',
-            'opened_by', 'error_message',
+            'opened_by', 'error_message', 'sent_at', 'delivered_at', 'read_at',
+            'template_name', 'created_by', 'created_by_name',
             'timestamp', 'body'
         ]
 
@@ -37,6 +39,13 @@ class CommunicationHistorySerializer(serializers.ModelSerializer):
         if obj.type == 'email':
             return obj.to_address
         return obj.to_phone or obj.to_address
+
+    def get_created_by_name(self, obj):
+        if obj.created_by:
+            return obj.created_by.full_name or obj.created_by.email
+        if obj.template_name:
+            return 'Automation'
+        return None
 
 
 class CommunicationSerializer(serializers.ModelSerializer):

@@ -34,7 +34,7 @@ class CommunicationViewSet(viewsets.ModelViewSet):
         return CommunicationSerializer
     
     def get_queryset(self):
-        queryset = Communication.objects.select_related('customer', 'loan')
+        queryset = Communication.objects.select_related('customer', 'loan', 'created_by')
         
         # Filter by customer
         customer_id = self.request.query_params.get('customer_id')
@@ -79,7 +79,7 @@ class CommunicationViewSet(viewsets.ModelViewSet):
 
         if limit:
             try:
-                limit = min(int(limit), 200)
+                limit = min(int(limit), 500)
                 queryset = queryset[:limit]
             except ValueError:
                 pass
@@ -457,6 +457,7 @@ class CommunicationViewSet(viewsets.ModelViewSet):
 # Name-based lookups used by loan/account workflow automation — keep these intact.
 WORKFLOW_TEMPLATE_NAMES = frozenset({
     'Deny Template',
+    'DENIED',
     'Fund/Approve Template',
     'We Have Received Your Request Template',
     'IBV Reminder Template',

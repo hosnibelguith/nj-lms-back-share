@@ -25,6 +25,7 @@ from communications.twilio_sms import (
     map_message_status,
     normalize_e164,
 )
+from loans.models import Loan
 
 TWILIO_SETTINGS = dict(
     TWILIO_ACCOUNT_SID='AC00000000000000000000000000000001',
@@ -670,3 +671,49 @@ class EmailInboxGroupingTests(APITestCase):
         self.assertTrue(today.is_answered)
         self.assertFalse(yesterday.is_answered)
         self.assertEqual(yesterday.incoming_status, "new")
+
+    def test_customer_history_includes_automation_and_loan_metadata(self):
+        loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("100.00"),
+            total_amount=Decimal("600.00"),
+            balance=Decimal("600.00"),
+            status="human_declined",
+            declined_at=timezone.now(),
+        )
+        automated = Communication.objects.create(
+            customer=self.customer,
+            loan=loan,
+            type="email",
+            direction="outbound",
+            subject="Loan application update",
+            to_address=self.customer.email,
+            content="Decline message",
+            status="sent",
+            sent_at=timezone.now(),
+            template_name="Deny Template",
+        )
+        manual = Communication.objects.create(
+            customer=self.customer,
+            loan=loan,
+            type="sms",
+            direction="outbound",
+            to_phone=self.customer.phone,
+            content="Manual follow-up",
+            status="sent",
+            created_by=self.staff,
+        )
+
+        response = self.client.get(
+            "/api/communications/history/",
+            {"customer_id": str(self.customer.id), "limit": 500},
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        by_id = {item["id"]: item for item in response.data}
+        self.assertEqual(str(by_id[str(automated.id)]["loan"]), str(loan.id))
+        self.assertEqual(by_id[str(automated.id)]["template_name"], "Deny Template")
+        self.assertEqual(by_id[str(automated.id)]["created_by_name"], "Automation")
+        self.assertEqual(str(by_id[str(manual.id)]["created_by"]), str(self.staff.id))
+        self.assertEqual(by_id[str(manual.id)]["created_by_name"], self.staff.full_name)

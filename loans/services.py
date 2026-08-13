@@ -433,19 +433,19 @@ class LoanService:
         from accounts.arrive_integration import queue_decision_webhook
         queue_decision_webhook(loan, 'declined')
 
-        template_name = 'Deny Template'
+        decline_template_names = ['Deny Template', 'DENIED']
         from communications.models import CommunicationTemplate
         from communications.tasks import send_template_message
 
         template = CommunicationTemplate.objects.filter(
-            name=template_name,
+            name__in=decline_template_names,
             type='email',
             is_active=True,
-        ).first()
+        ).order_by('name').first()
         if template and not loan.communications.filter(
             direction='outbound',
             type='email',
-            template_name=template_name,
+            template_name__in=decline_template_names,
         ).exists():
             customer_id = str(loan.customer_id)
             loan_id = str(loan.id)

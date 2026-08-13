@@ -16,8 +16,10 @@ from rest_framework.test import APITestCase
 
 from accounts.models import Customer, User
 from banking.models import BankAccount, BankConnection
+from communications.models import Communication, CommunicationTemplate
 
 from .models import CollectionPayment, CollectionsAccountChangeAudit, FundedPayment, FundingMethodRecommendation, Loan, LoanFormula, LoanStateEvent, Payment
+from .services import LoanService
 from .webhooks import _reopen_loan_after_funding_failure
 from .zumrails import (
     CollectionService,
@@ -321,6 +323,97 @@ class ZumRailsWorkflowTests(APITestCase):
                 description__contains="Unacceptable bank",
             ).exists()
         )
+
+    @patch("accounts.arrive_integration.queue_decision_webhook")
+    @patch("communications.tasks.send_template_message.delay")
+    @patch("loans.services.transaction.on_commit")
+    def test_decline_queues_production_denied_template(
+        self,
+        on_commit,
+        send_template_delay,
+        _queue_decision_webhook,
+    ):
+        on_commit.side_effect = lambda callback: callback()
+        denied_template = CommunicationTemplate.objects.create(
+            name="DENIED",
+            type="email",
+            trigger="manual",
+            subject="Loan application update",
+            content="Denied body",
+            is_active=True,
+        )
+        pending_loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("250.00"),
+            fee=Decimal("50.00"),
+            total_amount=Decimal("300.00"),
+            balance=Decimal("300.00"),
+            status="pending",
+            bank_account=self.account,
+            is_active=True,
+        )
+
+        LoanService.decline_loan(
+            loan=pending_loan,
+            reason="Unacceptable bank",
+            declined_by=self.staff,
+            reason_label="Unacceptable bank",
+        )
+
+        send_template_delay.assert_called_once_with(
+            str(self.customer.id),
+            str(denied_template.id),
+            str(pending_loan.id),
+        )
+
+    @patch("accounts.arrive_integration.queue_decision_webhook")
+    @patch("communications.tasks.send_template_message.delay")
+    @patch("loans.services.transaction.on_commit")
+    def test_decline_does_not_duplicate_existing_deny_template_send(
+        self,
+        on_commit,
+        send_template_delay,
+        _queue_decision_webhook,
+    ):
+        on_commit.side_effect = lambda callback: callback()
+        CommunicationTemplate.objects.create(
+            name="DENIED",
+            type="email",
+            trigger="manual",
+            subject="Loan application update",
+            content="Denied body",
+            is_active=True,
+        )
+        pending_loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("250.00"),
+            fee=Decimal("50.00"),
+            total_amount=Decimal("300.00"),
+            balance=Decimal("300.00"),
+            status="pending",
+            bank_account=self.account,
+            is_active=True,
+        )
+        Communication.objects.create(
+            customer=self.customer,
+            loan=pending_loan,
+            type="email",
+            direction="outbound",
+            to_address=self.customer.email,
+            subject="Loan application update",
+            content="Already sent",
+            status="sent",
+            template_name="Deny Template",
+        )
+
+        LoanService.decline_loan(
+            loan=pending_loan,
+            reason="Unacceptable bank",
+            declined_by=self.staff,
+            reason_label="Unacceptable bank",
+        )
+
+        send_template_delay.assert_not_called()
 
     def test_staff_actions_write_detailed_activity_history(self):
         from activity.models import ActivityHistory
