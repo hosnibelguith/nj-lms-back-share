@@ -47,7 +47,7 @@ def _queue_workflow_reminder(loan, template_name: str, extra_context: dict, toda
 
     max_days = _setting_int(
         "LOAN_WORKFLOW_REMINDER_MAX_DAYS",
-        getattr(settings, "LOAN_WORKFLOW_REMINDER_MAX_DAYS", 7),
+        getattr(settings, "LOAN_WORKFLOW_REMINDER_MAX_DAYS", 3),
     )
     sent_count = loan.communications.filter(
         direction="outbound",
@@ -78,6 +78,40 @@ def _queue_workflow_reminder(loan, template_name: str, extra_context: dict, toda
             **extra_context,
         },
     )
+    return True
+
+
+def _expire_ibv_application(loan, today) -> bool:
+    from communications.models import CommunicationTemplate
+
+    template_name = "Application Expired Template"
+    previous_status = loan.status
+    loan.status = "expired"
+    loan.is_active = False
+    loan.save(update_fields=["status", "is_active", "updated_at"])
+    loan.log_state_event(
+        event_type="expired",
+        previous_status=previous_status,
+        new_status=loan.status,
+        notes="IBV application expired after the reminder window.",
+    )
+
+    if not _workflow_reminder_already_sent_today(loan, template_name, today):
+        template = CommunicationTemplate.objects.filter(
+            name=template_name,
+            type="email",
+            is_active=True,
+        ).first()
+        if template:
+            frontend_url = getattr(settings, "FRONTEND_URL", "http://localhost:3000").rstrip("/")
+            send_template_message.delay(
+                str(loan.customer_id),
+                str(template.id),
+                str(loan.id),
+                extra_context={"portal_url": f"{frontend_url}/customer/login"},
+            )
+        else:
+            logger.warning("Workflow reminder template missing: %s", template_name)
     return True
 
 
@@ -197,6 +231,7 @@ def send_loan_workflow_reminders():
         today = timezone.localtime(timezone.now(), ZoneInfo("America/New_York")).date()
 
     ibv_sent = 0
+    ibv_expired = 0
     signature_sent = 0
 
     ibv_loans = Loan.objects.select_related("customer").filter(
@@ -205,6 +240,20 @@ def send_loan_workflow_reminders():
         is_active=True,
     )
     for loan in ibv_loans:
+        max_days = _setting_int(
+            "LOAN_WORKFLOW_REMINDER_MAX_DAYS",
+            getattr(settings, "LOAN_WORKFLOW_REMINDER_MAX_DAYS", 3),
+        )
+        sent_count = loan.communications.filter(
+            direction="outbound",
+            type="email",
+            template_name="IBV Reminder Template",
+        ).count()
+        if sent_count >= max_days:
+            if _expire_ibv_application(loan, today):
+                ibv_expired += 1
+            continue
+
         if _queue_workflow_reminder(
             loan,
             "IBV Reminder Template",
@@ -228,7 +277,7 @@ def send_loan_workflow_reminders():
         ):
             signature_sent += 1
 
-    result = {"ibv_sent": ibv_sent, "signature_sent": signature_sent}
+    result = {"ibv_sent": ibv_sent, "ibv_expired": ibv_expired, "signature_sent": signature_sent}
     logger.info("Loan workflow reminders queued: %s", result)
     return result
 

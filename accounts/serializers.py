@@ -422,7 +422,9 @@ class CustomerPortalRequestOTPSerializer(serializers.Serializer):
             ).first()
 
             if not user:
-                raise serializers.ValidationError("Unable to process request.")
+                raise serializers.ValidationError(
+                    "Customer does not exist. Please create an account first."
+                )
 
             attrs["identifier"] = email
             attrs["purpose"] = AuthOTPChallenge.PURPOSE_LOGIN_EMAIL
@@ -438,7 +440,9 @@ class CustomerPortalRequestOTPSerializer(serializers.Serializer):
         ).first()
 
         if not customer or not customer.portal_user:
-            raise serializers.ValidationError("Unable to process request.")
+            raise serializers.ValidationError(
+                "Customer does not exist. Please create an account first."
+            )
 
         attrs["identifier"] = phone_normalized
         attrs["purpose"] = AuthOTPChallenge.PURPOSE_LOGIN_SMS

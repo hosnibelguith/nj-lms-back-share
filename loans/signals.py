@@ -36,6 +36,7 @@ def loan_status_changed(sender, instance, **kwargs):
                         'ibv_pending': ('system', 'IBV Pending'),
                         'pending_signature': ('contract_sent', 'Pending Signature'),
                         'human_declined': ('system', 'Loan Declined'),
+                        'expired': ('system', 'Application Expired'),
                         'pending_funding': ('system', 'Loan Approved'),
                         'active': ('loan_funded', 'Loan Funded'),
                         'paid_off': ('loan_paid_off', 'Loan Paid Off'),

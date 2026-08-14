@@ -359,6 +359,7 @@ class LoanViewSet(viewsets.ModelViewSet):
             'funding_failed': funding_failed_count,
             'active': by_status.get('active', 0),
             'declined': by_status.get('human_declined', 0),
+            'expired': by_status.get('expired', 0),
             'paid_off': by_status.get('paid_off', 0),
             'defaulted': by_status.get('defaulted', 0),
         })

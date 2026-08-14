@@ -55,7 +55,7 @@ SETTINGS = [
     },
     {
         "key": "LOAN_WORKFLOW_REMINDER_MAX_DAYS",
-        "value": "7",
+        "value": "3",
         "description": "Maximum number of daily workflow reminders to send per loan and reminder type.",
     },
     {

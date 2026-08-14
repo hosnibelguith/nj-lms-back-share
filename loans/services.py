@@ -277,17 +277,17 @@ class LoanService:
 
     @staticmethod
     def can_start_new_application(customer: Customer) -> bool:
-        """Denied applicants only — no open application or active loan."""
+        """Terminal declined/expired applicants can open a fresh application."""
         loans = customer.loans.all()
         if loans.filter(status__in=LoanService.BLOCKING_APPLICATION_STATUSES).exists():
             return False
-        return loans.filter(status='human_declined').exists()
+        return loans.filter(status__in=['human_declined', 'expired']).exists()
 
     @staticmethod
     @transaction.atomic
     def start_new_application(customer: Customer) -> Loan:
         """
-        Open a fresh application for a declined customer.
+        Open a fresh application for a declined or expired customer.
 
         Previous loans are kept. Customer onboarding is reset so IBV and
         contract run again on the new loan.
@@ -299,8 +299,8 @@ class LoanService:
                 'A new application cannot be started while another '
                 'application or loan is in progress.'
             )
-        if not customer.loans.filter(status='human_declined').exists():
-            raise ValueError('Only declined applicants can start a new application.')
+        if not customer.loans.filter(status__in=['human_declined', 'expired']).exists():
+            raise ValueError('Only declined or expired applicants can start a new application.')
 
         from banking.models import BankConnection
         from activity.services import log_staff_action

@@ -291,7 +291,7 @@ LOAN_WORKFLOW_REMINDERS_ENABLED = os.environ.get(
     "LOAN_WORKFLOW_REMINDERS_ENABLED",
     "True",
 ).lower() == "true"
-LOAN_WORKFLOW_REMINDER_MAX_DAYS = int(os.environ.get("LOAN_WORKFLOW_REMINDER_MAX_DAYS", "7"))
+LOAN_WORKFLOW_REMINDER_MAX_DAYS = int(os.environ.get("LOAN_WORKFLOW_REMINDER_MAX_DAYS", "3"))
 LOAN_WORKFLOW_REMINDER_TIMEZONE = os.environ.get(
     "LOAN_WORKFLOW_REMINDER_TIMEZONE",
     "America/New_York",
@@ -341,7 +341,7 @@ TWILIO_MESSAGING_PHONE_NUMBER = os.environ.get("TWILIO_MESSAGING_PHONE_NUMBER", 
 TWILIO_MESSAGING_SERVICE_SID = os.environ.get("TWILIO_MESSAGING_SERVICE_SID", "")
 # Optional: per-message delivery receipt URL when it is not set on the number.
 TWILIO_STATUS_CALLBACK_URL = os.environ.get("TWILIO_STATUS_CALLBACK_URL", "")
-DEV_OTP_CODE = os.environ.get("DEV_OTP_CODE", "123456" if DEBUG else "")
+DEV_OTP_CODE = os.environ.get("DEV_OTP_CODE", "")
 
 
 # -------------------------------------------------------------------

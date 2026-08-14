@@ -521,7 +521,7 @@ class BackendApiWorkflowTests(APITestCase):
         )
         GlobalSetting.objects.update_or_create(
             key="LOAN_WORKFLOW_REMINDER_MAX_DAYS",
-            defaults={"value": "7"},
+            defaults={"value": "3"},
         )
 
         self.loan.status = "ibv_pending"
@@ -541,8 +541,8 @@ class BackendApiWorkflowTests(APITestCase):
         first_result = send_loan_workflow_reminders()
         second_result = send_loan_workflow_reminders()
 
-        self.assertEqual(first_result, {"ibv_sent": 1, "signature_sent": 1})
-        self.assertEqual(second_result, {"ibv_sent": 0, "signature_sent": 0})
+        self.assertEqual(first_result, {"ibv_sent": 1, "ibv_expired": 0, "signature_sent": 1})
+        self.assertEqual(second_result, {"ibv_sent": 0, "ibv_expired": 0, "signature_sent": 0})
         self.assertEqual(
             self.loan.communications.filter(template_name="IBV Reminder Template").count(),
             1,
@@ -587,10 +587,55 @@ class BackendApiWorkflowTests(APITestCase):
         result = send_loan_workflow_reminders()
 
         self.assertEqual(result["ibv_sent"], 0)
+        self.assertEqual(result["ibv_expired"], 1)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "expired")
+
+    def test_loan_workflow_reminders_expire_ibv_after_three_reminders_and_email(self):
+        CommunicationTemplate.objects.create(
+            name="Application Expired Template",
+            type="email",
+            subject="Expired",
+            content="Application expired. Start again at {{portal_url}}",
+            is_active=True,
+        )
+        GlobalSetting.objects.update_or_create(
+            key="LOAN_WORKFLOW_REMINDERS_ENABLED",
+            defaults={"value": "True"},
+        )
+        GlobalSetting.objects.update_or_create(
+            key="LOAN_WORKFLOW_REMINDER_MAX_DAYS",
+            defaults={"value": "3"},
+        )
+        self.loan.status = "ibv_pending"
+        self.loan.save(update_fields=["status", "updated_at"])
+        for index in range(3):
+            Communication.objects.create(
+                customer=self.customer,
+                loan=self.loan,
+                type="email",
+                direction="outbound",
+                to_address=self.customer.email,
+                subject=f"IBV reminder {index + 1}",
+                content="Existing reminder",
+                status="sent",
+                template_name="IBV Reminder Template",
+            )
+
+        result = send_loan_workflow_reminders()
+
+        self.loan.refresh_from_db()
+        self.assertEqual(result, {"ibv_sent": 0, "ibv_expired": 1, "signature_sent": 0})
+        self.assertEqual(self.loan.status, "expired")
+        self.assertFalse(self.loan.is_active)
+        self.assertEqual(
+            self.loan.communications.filter(template_name="Application Expired Template").count(),
+            1,
+        )
 
 
 class StartNewApplicationTests(APITestCase):
-    """Declined customers can open a second loan while keeping the old one."""
+    """Terminal declined/expired customers can open a second loan."""
 
     def setUp(self):
         self.portal_user = User.objects.create_user(
@@ -710,3 +755,21 @@ class StartNewApplicationTests(APITestCase):
             self.client.get("/api/portal/me/dashboard/").data["can_start_new_application"]
         )
 
+    def test_expired_customer_can_start_new_application(self):
+        self.declined_loan.status = "expired"
+        self.declined_loan.is_active = False
+        self.declined_loan.declined_at = None
+        self.declined_loan.decline_reason = None
+        self.declined_loan.save()
+
+        dashboard = self.client.get("/api/portal/me/dashboard/")
+        self.assertEqual(dashboard.status_code, 200, dashboard.data)
+        self.assertEqual(dashboard.data["portal_state"], "expired")
+        self.assertTrue(dashboard.data["can_start_new_application"])
+
+        response = self.client.post("/api/portal/me/start-new-application/", {}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+
+        new_loan = Loan.objects.get(id=response.data["loan_id"])
+        self.assertEqual(new_loan.status, "ibv_pending")
+        self.assertEqual(self.customer.loans.count(), 2)

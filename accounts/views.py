@@ -553,6 +553,7 @@ class CustomerPortalBaseView(APIView):
         'pending_funding',
         'active',
         'defaulted',
+        'expired',
         'human_declined',
         'paid_off',
     ]
@@ -698,6 +699,11 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
             next_step = 'start_new_application' if can_start_new_application else 'appeal'
             next_url = '/customer/loans'
             can_appeal = True
+
+        elif loan.status == 'expired':
+            portal_state = 'expired'
+            next_step = 'start_new_application'
+            next_url = '/customer/loans'
 
         elif loan.status == 'paid_off':
             portal_state = 'paid_off'

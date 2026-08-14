@@ -137,6 +137,7 @@ class Loan(models.Model):
         ('pending', 'Pending Human Decision'),
         ('pending_signature', 'Pending Signature'),
         ('human_declined', 'Human Declined'),
+        ('expired', 'Expired'),
         ('pending_funding', 'Pending Funding'),
         ('active', 'Active'),
         ('paid_off', 'Paid Off'),
@@ -772,6 +773,7 @@ class LoanStateEvent(models.Model):
         ('amount_updated', 'Amount Updated'),
         ('human_approved', 'Human Approved'),
         ('human_declined', 'Human Declined'),
+        ('expired', 'Expired'),
 
         ('funded', 'Funded'),
         ('paid_off', 'Paid Off'),
