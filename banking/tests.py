@@ -1,3 +1,4 @@
+from datetime import timedelta
 from decimal import Decimal
 from io import StringIO
 from unittest.mock import patch
@@ -7,6 +8,7 @@ import requests
 from django.core import mail
 from django.core.management import call_command
 from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from accounts.models import Customer, User
@@ -1361,3 +1363,118 @@ class FlinksGadRepullTests(TestCase):
         payload = response.data if isinstance(response.data, list) else response.data.get('results', [])
         ids = {str(row['id']) for row in payload}
         self.assertNotIn(str(account.id), ids)
+
+
+@override_settings(CELERY_TASK_ALWAYS_EAGER=True)
+class RepullPendingIbvCommandTests(TestCase):
+    """Ops command / script only queues stuck Flinks IBV — never verified+synced."""
+
+    def setUp(self):
+        from loans.models import Loan
+
+        self.user = User.objects.create_user(
+            email='stuck-ibv@example.com',
+            password='password123',
+            full_name='Stuck IBV',
+            user_type='customer',
+        )
+        self.customer = Customer.objects.create(
+            portal_user=self.user,
+            first_name='Stuck',
+            last_name='IBV',
+            email='stuck-ibv@example.com',
+            phone='4165550399',
+            phone_normalized='4165550399',
+            province='ON',
+            status='pending',
+            onboarding_stage='banking_verification',
+            banking_verified=False,
+        )
+        self.connection = BankConnection.objects.create(
+            customer=self.customer,
+            login_id=str(uuid4()),
+            provider='flinks',
+            is_active=True,
+            sync_status='failed',
+            sync_error='Read timed out',
+        )
+        self.loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal('300.00'),
+            fee=Decimal('60.00'),
+            total_amount=Decimal('360.00'),
+            balance=Decimal('360.00'),
+            status='ibv_pending',
+            is_active=True,
+        )
+
+    def test_dry_run_does_not_queue(self):
+        out = StringIO()
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            call_command('repull_pending_ibv', stdout=out)
+        mocked.assert_not_called()
+        self.connection.refresh_from_db()
+        self.assertEqual(self.connection.sync_status, 'failed')
+        self.assertIn('DRY-RUN: 1 pending IBV', out.getvalue())
+        self.assertIn('WOULD REPULL', out.getvalue())
+
+    def test_apply_queues_failed_pending_ibv(self):
+        out = StringIO()
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            call_command('repull_pending_ibv', apply=True, stdout=out)
+        mocked.assert_called_once_with(str(self.connection.id))
+        self.connection.refresh_from_db()
+        self.assertEqual(self.connection.sync_status, 'pending')
+        self.assertTrue(
+            ActivityHistory.objects.filter(
+                customer=self.customer,
+                title='IBV Re-pull Started',
+            ).exists()
+        )
+        self.assertIn('Queued 1 IBV re-pull', out.getvalue())
+
+    def test_skips_verified_synced_connection(self):
+        self.customer.banking_verified = True
+        self.customer.save(update_fields=['banking_verified', 'updated_at'])
+        self.connection.sync_status = 'synced'
+        self.connection.sync_error = None
+        self.connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
+        self.loan.status = 'pending_signature'
+        self.loan.save(update_fields=['status', 'updated_at'])
+
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            call_command('repull_pending_ibv', apply=True, stdout=StringIO())
+        mocked.assert_not_called()
+
+    def test_skips_manual_connection(self):
+        self.connection.provider = 'manual'
+        self.connection.login_id = f'manual-{self.customer.id}'
+        self.connection.save(update_fields=['provider', 'login_id', 'updated_at'])
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            call_command('repull_pending_ibv', apply=True, stdout=StringIO())
+        mocked.assert_not_called()
+
+    def test_picks_latest_connection_per_customer(self):
+        older = BankConnection.objects.create(
+            customer=self.customer,
+            login_id=str(uuid4()),
+            provider='flinks',
+            is_active=False,
+            sync_status='failed',
+        )
+        BankConnection.objects.filter(id=older.id).update(
+            created_at=timezone.now() - timedelta(hours=2)
+        )
+
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            call_command('repull_pending_ibv', apply=True, stdout=StringIO())
+        mocked.assert_called_once_with(str(self.connection.id))
+
+    def test_includes_inactive_connection_after_new_application(self):
+        self.connection.is_active = False
+        self.connection.save(update_fields=['is_active', 'updated_at'])
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            call_command('repull_pending_ibv', apply=True, stdout=StringIO())
+        mocked.assert_called_once_with(str(self.connection.id))
+        self.connection.refresh_from_db()
+        self.assertTrue(self.connection.is_active)

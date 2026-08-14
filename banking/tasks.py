@@ -385,6 +385,46 @@ def apply_flinks_accounts_detail(connection, accounts_json) -> bool:
     return _mark_banking_success(connection, customer, flinks_email, flinks_phone, flinks_name)
 
 
+def pending_ibv_repull_targets(*, since=None, customer_id=None, include_syncing=False):
+    """Latest Flinks LoginId per customer that still needs IBV.
+
+    Includes failed / pending (and inactive post-reapply) connections. Skips
+    verified+synced and manual void-cheque rows. Currently ``syncing`` rows are
+    skipped unless ``include_syncing`` so we do not double-queue a live pull.
+    """
+    from django.db.models import Exists, OuterRef, Q
+    from loans.models import Loan
+
+    pending_loan = Loan.objects.filter(
+        customer_id=OuterRef('customer_id'),
+        status='ibv_pending',
+    )
+    qs = (
+        BankConnection.objects.select_related('customer')
+        .filter(provider='flinks')
+        .exclude(login_id='')
+        .filter(Q(customer__banking_verified=False) | Exists(pending_loan))
+        .exclude(customer__banking_verified=True, sync_status='synced')
+    )
+    if customer_id:
+        qs = qs.filter(customer_id=customer_id)
+    if since is not None:
+        qs = qs.filter(updated_at__gte=since)
+    if not include_syncing:
+        qs = qs.exclude(sync_status='syncing')
+
+    seen = set()
+    targets = []
+    for connection in qs.order_by('-created_at', '-id'):
+        if not str(connection.login_id or '').strip():
+            continue
+        if connection.customer_id in seen:
+            continue
+        seen.add(connection.customer_id)
+        targets.append(connection)
+    return targets
+
+
 def queue_flinks_gad_repull(connection, *, user=None):
     """Re-queue Authorize + GetAccountsDetail for an existing Flinks LoginId.
 

@@ -101,3 +101,25 @@ heroku run "python manage.py heal_schedule_keeping_pending --loan-id 54fe7b2b-e3
 # Apply
 heroku run "python manage.py heal_schedule_keeping_pending --loan-id 54fe7b2b-e32f-4883-b902-e2506c308875 --payment-amount 147.18 --frequency bi-weekly --start-date 2026-08-20 --apply --notes 'Ops heal keep Pending'" -a nj-lms-back
 ```
+
+## Ops: re-pull pending IBV
+
+`repull_pending_ibv` re-queues Flinks GetAccountsDetail for customers still stuck on IBV (failed / pending / inactive LoginId after a new application). Uses the stored LoginId — no new Connect. Default is **dry-run**; pass `--apply` to enqueue Celery tasks.
+
+| Flag | What it does |
+|------|----------------|
+| `--since` | Only connections updated on/after `YYYY-MM-DD` |
+| `--customer-id` | Limit to one customer |
+| `--include-syncing` | Also re-queue rows currently marked `syncing` |
+| `--limit` | Cap how many customers to queue |
+| `--apply` | Enqueue re-pulls (without this flag: print only) |
+
+```bash
+# Local dry-run / apply
+./scripts/repull_pending_ibv.sh
+./scripts/repull_pending_ibv.sh --since 2026-08-14 --apply
+
+# Heroku — quote the Django command
+heroku run "python manage.py repull_pending_ibv --since 2026-08-14" -a nj-lms-back
+heroku run "python manage.py repull_pending_ibv --since 2026-08-14 --apply" -a nj-lms-back
+```
