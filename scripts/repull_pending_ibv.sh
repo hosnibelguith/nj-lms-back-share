@@ -6,9 +6,10 @@
 #   ./scripts/repull_pending_ibv.sh
 #   ./scripts/repull_pending_ibv.sh --since 2026-08-14 --apply
 #
-# Heroku — quote the whole command so flags are not eaten by the CLI:
-#   heroku run "python manage.py repull_pending_ibv --since 2026-08-14" -a nj-lms-back
-#   heroku run "python manage.py repull_pending_ibv --since 2026-08-14 --apply" -a nj-lms-back
+# Heroku — put `--` before python so Heroku does not swallow --apply.
+# Use --inline on one-off dynos (they often cannot publish to Redis):
+#   heroku run -- python manage.py repull_pending_ibv --since 2026-08-01 -a nj-lms-back
+#   heroku run -- python manage.py repull_pending_ibv --since 2026-08-01 --apply --inline -a nj-lms-back
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

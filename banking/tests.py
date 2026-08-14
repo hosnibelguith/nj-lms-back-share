@@ -1433,6 +1433,16 @@ class RepullPendingIbvCommandTests(TestCase):
         )
         self.assertIn('Queued 1 IBV re-pull', out.getvalue())
 
+    def test_inline_runs_task_without_celery_delay(self):
+        out = StringIO()
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as delayed, patch(
+            'banking.tasks.fetch_flinks_accounts_only.apply'
+        ) as applied:
+            call_command('repull_pending_ibv', inline=True, stdout=out)
+        delayed.assert_not_called()
+        applied.assert_called_once_with(args=[str(self.connection.id)])
+        self.assertIn('Ran 1 IBV re-pull', out.getvalue())
+
     def test_skips_verified_synced_connection(self):
         self.customer.banking_verified = True
         self.customer.save(update_fields=['banking_verified', 'updated_at'])

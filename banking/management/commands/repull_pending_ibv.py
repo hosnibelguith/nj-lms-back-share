@@ -7,7 +7,10 @@ Examples:
   python manage.py repull_pending_ibv --since 2026-08-14 --apply
 """
 
+from datetime import datetime, time
+
 from django.core.management.base import BaseCommand, CommandError
+from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 
 from banking.tasks import pending_ibv_repull_targets, queue_flinks_gad_repull
@@ -46,6 +49,14 @@ class Command(BaseCommand):
             action="store_true",
             help="Enqueue re-pulls. Without this flag only print the plan.",
         )
+        parser.add_argument(
+            "--inline",
+            action="store_true",
+            help=(
+                "Run each pull in this process instead of Celery/Redis. "
+                "Required on Heroku one-off dynos when Redis publish fails."
+            ),
+        )
 
     def handle(self, *args, **options):
         since = self._parse_since(options["since"])
@@ -60,7 +71,8 @@ class Command(BaseCommand):
                 raise CommandError("--limit must be >= 1")
             targets = targets[:limit]
 
-        mode = "APPLY" if options["apply"] else "DRY-RUN"
+        apply = options["apply"] or options["inline"]
+        mode = "APPLY" if apply else "DRY-RUN"
         self.stdout.write(f"{mode}: {len(targets)} pending IBV connection(s).")
         queued = 0
         skipped = 0
@@ -70,21 +82,27 @@ class Command(BaseCommand):
                 f"  customer={customer.email} connection={connection.id} "
                 f"status={connection.sync_status} active={connection.is_active}"
             )
-            if not options["apply"]:
+            if not apply:
                 self.stdout.write(f"WOULD REPULL{line}")
                 continue
             try:
-                queue_flinks_gad_repull(connection, user=None)
+                queue_flinks_gad_repull(
+                    connection, user=None, inline=options["inline"]
+                )
             except ValueError as exc:
                 skipped += 1
                 self.stdout.write(f"SKIP{line} reason={exc}")
                 continue
             queued += 1
-            self.stdout.write(f"QUEUED{line}")
+            label = "RAN" if options["inline"] else "QUEUED"
+            self.stdout.write(f"{label}{line}")
 
-        if options["apply"]:
+        if apply:
             self.stdout.write(
-                self.style.SUCCESS(f"Queued {queued} IBV re-pull(s); skipped {skipped}.")
+                self.style.SUCCESS(
+                    f"{'Ran' if options['inline'] else 'Queued'} {queued} "
+                    f"IBV re-pull(s); skipped {skipped}."
+                )
             )
         else:
             self.stdout.write("No tasks queued (dry-run). Pass --apply to enqueue.")
@@ -96,4 +114,8 @@ class Command(BaseCommand):
         parsed = parse_datetime(raw) or parse_date(raw)
         if parsed is None:
             raise CommandError(f"Invalid --since value: {raw}")
+        if not isinstance(parsed, datetime):
+            parsed = datetime.combine(parsed, time.min)
+        if timezone.is_naive(parsed):
+            parsed = timezone.make_aware(parsed, timezone.get_current_timezone())
         return parsed

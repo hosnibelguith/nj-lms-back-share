@@ -425,11 +425,14 @@ def pending_ibv_repull_targets(*, since=None, customer_id=None, include_syncing=
     return targets
 
 
-def queue_flinks_gad_repull(connection, *, user=None):
+def queue_flinks_gad_repull(connection, *, user=None, inline=False):
     """Re-queue Authorize + GetAccountsDetail for an existing Flinks LoginId.
 
     Used when a prior pull failed or timed out — Flinks Connect does not need
     to run again; the stored LoginId is enough to restart GAD.
+
+    ``inline=True`` runs the pull in-process (Heroku one-off dynos cannot
+    always publish to Redis).
     """
     if connection.provider != 'flinks':
         raise ValueError('Only Flinks connections support GetAccountsDetail re-pull.')
@@ -449,7 +452,10 @@ def queue_flinks_gad_repull(connection, *, user=None):
         update_fields=['is_active', 'sync_status', 'sync_error', 'updated_at']
     )
 
-    fetch_flinks_accounts_only.delay(str(connection.id))
+    if inline:
+        fetch_flinks_accounts_only.apply(args=[str(connection.id)])
+    else:
+        fetch_flinks_accounts_only.delay(str(connection.id))
 
     actor = 'system'
     if user is not None:
