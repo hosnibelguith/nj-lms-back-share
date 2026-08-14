@@ -4,6 +4,7 @@ import time
 import requests
 from celery import shared_task
 from django.conf import settings
+from django.db import transaction
 from django.utils.timezone import now
 
 from .constants import (
@@ -18,6 +19,11 @@ logger = logging.getLogger(__name__)
 
 FLINKS_ASYNC_POLL_INTERVAL_SECONDS = 10
 FLINKS_ASYNC_MAX_WAIT_SECONDS = 30 * 60
+# Fresh Authorize (not MostRecentCached) — cached pulls often return 0 txs for
+# newly linked KOHO / neo-banks while Flinks toolbox already shows history.
+FLINKS_MOST_RECENT_CACHED = False
+FLINKS_ZERO_TX_RETRIES = 3
+FLINKS_ZERO_TX_RETRY_SECONDS = 5
 ZERO_TRANSACTIONS_MESSAGE = (
     'We could not retrieve transaction history from your bank account. '
     'Please reconnect your bank account.'
@@ -276,36 +282,37 @@ def _persist_accounts(connection, customer, accounts_data):
 
 
 def _mark_banking_success(connection, customer, flinks_email=None, flinks_phone=None, flinks_name=None):
-    connection.last_synced_at = now()
-    connection.sync_status = 'synced'
-    connection.sync_error = None
-    connection.is_active = True
-    connection.save(update_fields=['last_synced_at', 'sync_status', 'sync_error', 'is_active', 'updated_at'])
+    with transaction.atomic():
+        connection.last_synced_at = now()
+        connection.sync_status = 'synced'
+        connection.sync_error = None
+        connection.is_active = True
+        connection.save(update_fields=['last_synced_at', 'sync_status', 'sync_error', 'is_active', 'updated_at'])
 
-    customer.banking_verified = True
-    if customer.onboarding_stage == 'banking_verification':
-        customer.onboarding_stage = 'contract'
-    customer.save(update_fields=['banking_verified', 'onboarding_stage', 'updated_at'])
+        customer.banking_verified = True
+        if customer.onboarding_stage == 'banking_verification':
+            customer.onboarding_stage = 'contract'
+        customer.save(update_fields=['banking_verified', 'onboarding_stage', 'updated_at'])
 
-    from loans.services import LoanService
-    for loan in customer.loans.filter(status='ibv_pending'):
-        LoanService.mark_pending_signature(loan)
+        from loans.services import LoanService
+        for loan in customer.loans.filter(status='ibv_pending'):
+            LoanService.mark_pending_signature(loan)
 
-    portal_user = customer.portal_user
-    if portal_user:
-        update_fields = []
-        if flinks_email:
-            portal_user.flinks_email = flinks_email
-            update_fields.append('flinks_email')
-        if flinks_phone:
-            portal_user.flinks_phone = flinks_phone
-            update_fields.append('flinks_phone')
-        if flinks_name:
-            portal_user.flinks_name = flinks_name
-            update_fields.append('flinks_name')
-        if update_fields:
-            update_fields.append('updated_at')
-            portal_user.save(update_fields=update_fields)
+        portal_user = customer.portal_user
+        if portal_user:
+            update_fields = []
+            if flinks_email:
+                portal_user.flinks_email = flinks_email
+                update_fields.append('flinks_email')
+            if flinks_phone:
+                portal_user.flinks_phone = flinks_phone
+                update_fields.append('flinks_phone')
+            if flinks_name:
+                portal_user.flinks_name = flinks_name
+                update_fields.append('flinks_name')
+            if update_fields:
+                update_fields.append('updated_at')
+                portal_user.save(update_fields=update_fields)
 
     try:
         from activity.models import ActivityHistory
@@ -408,19 +415,65 @@ def fetch_flinks_accounts_only(self, connection_id):
 
     auth_url = f'https://{instance}-api.private.fin.ag/v3/{customer_id}/BankingServices/Authorize'
 
-    try:
+    def _authorize():
         logger.info(
-            'Flinks Authorize request customer_id=%s connection_id=%s login_id=%s',
+            'Flinks Authorize request customer_id=%s connection_id=%s login_id=%s most_recent_cached=%s',
             customer.id,
             connection.id,
             mask_identifier(login_id),
+            FLINKS_MOST_RECENT_CACHED,
         )
-        auth_resp = requests.post(
+        return requests.post(
             auth_url,
-            json={'LoginId': str(login_id), 'MostRecentCached': True},
+            json={
+                'LoginId': str(login_id),
+                'MostRecentCached': FLINKS_MOST_RECENT_CACHED,
+            },
             headers=headers,
             timeout=30,
         )
+
+    def _get_accounts_detail(request_id):
+        logger.info(
+            'Flinks GetAccountsDetail request customer_id=%s connection_id=%s request_id=%s',
+            customer.id,
+            connection.id,
+            mask_identifier(request_id),
+        )
+        acct_resp = requests.post(
+            acct_url,
+            json={'RequestId': request_id, 'DaysOfTransactions': 'Days365'},
+            headers=headers,
+            timeout=30,
+        )
+        logger.info(
+            'Flinks GetAccountsDetail response customer_id=%s connection_id=%s request_id=%s status=%s',
+            customer.id,
+            connection.id,
+            mask_identifier(request_id),
+            acct_resp.status_code,
+        )
+        if acct_resp.status_code == 200:
+            return acct_resp.json()
+        if acct_resp.status_code == 202:
+            logger.info(
+                'Flinks GetAccountsDetail async accepted customer_id=%s connection_id=%s request_id=%s',
+                customer.id,
+                connection.id,
+                mask_identifier(request_id),
+            )
+            return _poll_get_accounts_detail_async(instance, customer_id, request_id, headers)
+        logger.error(
+            'Flinks GetAccountsDetail failed customer_id=%s connection_id=%s status=%s body=%s',
+            customer.id,
+            connection.id,
+            acct_resp.status_code,
+            acct_resp.text,
+        )
+        return None
+
+    try:
+        auth_resp = _authorize()
     except requests.RequestException as exc:
         logger.exception(
             'Flinks Authorize request error customer_id=%s connection_id=%s login_id=%s',
@@ -452,18 +505,7 @@ def fetch_flinks_accounts_only(self, connection_id):
     acct_url = f'https://{instance}-api.private.fin.ag/v3/{customer_id}/BankingServices/GetAccountsDetail'
 
     try:
-        logger.info(
-            'Flinks GetAccountsDetail request customer_id=%s connection_id=%s request_id=%s',
-            customer.id,
-            connection.id,
-            mask_identifier(request_id),
-        )
-        acct_resp = requests.post(
-            acct_url,
-            json={'RequestId': request_id, 'DaysOfTransactions': 'Days365'},
-            headers=headers,
-            timeout=30,
-        )
+        accounts_json = _get_accounts_detail(request_id)
     except requests.RequestException as exc:
         logger.exception(
             'Flinks GetAccountsDetail request error customer_id=%s connection_id=%s request_id=%s',
@@ -473,35 +515,10 @@ def fetch_flinks_accounts_only(self, connection_id):
         )
         return _mark_banking_failed(connection, customer, str(exc))
 
-    logger.info(
-        'Flinks GetAccountsDetail response customer_id=%s connection_id=%s request_id=%s status=%s',
-        customer.id,
-        connection.id,
-        mask_identifier(request_id),
-        acct_resp.status_code,
-    )
-    if acct_resp.status_code == 200:
-        accounts_json = acct_resp.json()
-    elif acct_resp.status_code == 202:
-        logger.info(
-            'Flinks GetAccountsDetail async accepted customer_id=%s connection_id=%s request_id=%s',
-            customer.id,
-            connection.id,
-            mask_identifier(request_id),
-        )
-        accounts_json = _poll_get_accounts_detail_async(instance, customer_id, request_id, headers)
-    else:
-        return _mark_banking_failed(
-            connection,
-            customer,
-            f'Flinks GetAccountsDetail failed ({acct_resp.status_code})',
-        )
-
     if not accounts_json:
         return _mark_banking_failed(connection, customer, 'Failed to fetch accounts from Flinks')
 
     accounts_data = accounts_json.get('Accounts') or []
-
     if not accounts_data:
         return _mark_banking_failed(connection, customer, NO_ACCOUNTS_MESSAGE)
 
@@ -513,6 +530,45 @@ def fetch_flinks_accounts_only(self, connection_id):
         len(accounts_data),
         total_transactions,
     )
+
+    # Cached/partial pulls can return accounts before transactions land (common for
+    # KOHO / Arrive). Retry GetAccountsDetail before failing IBV.
+    for retry in range(1, FLINKS_ZERO_TX_RETRIES + 1):
+        if total_transactions > 0:
+            break
+        logger.info(
+            'Flinks zero-transaction retry=%s/%s customer_id=%s connection_id=%s',
+            retry,
+            FLINKS_ZERO_TX_RETRIES,
+            customer.id,
+            connection.id,
+        )
+        time.sleep(FLINKS_ZERO_TX_RETRY_SECONDS)
+        try:
+            # Re-authorize for a fresh RequestId, then pull detail again.
+            auth_resp = _authorize()
+            if auth_resp.status_code != 200:
+                continue
+            request_id = auth_resp.json().get('RequestId') or request_id
+            accounts_json = _get_accounts_detail(request_id)
+        except requests.RequestException:
+            logger.exception(
+                'Flinks zero-transaction retry failed customer_id=%s connection_id=%s',
+                customer.id,
+                connection.id,
+            )
+            continue
+        if not accounts_json:
+            continue
+        accounts_data = accounts_json.get('Accounts') or accounts_data
+        total_transactions = _count_transactions(accounts_data)
+        logger.info(
+            'Flinks zero-transaction retry result customer_id=%s connection_id=%s transactions=%s',
+            customer.id,
+            connection.id,
+            total_transactions,
+        )
+
     if total_transactions == 0:
         return _mark_banking_failed(connection, customer, ZERO_TRANSACTIONS_MESSAGE)
 

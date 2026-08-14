@@ -4,6 +4,7 @@ from datetime import datetime
 
 from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework import permissions, status
 from rest_framework.response import Response
@@ -150,6 +151,81 @@ def _apply_primary_eft_account(connection: BankConnection, primary: dict):
     return account
 
 
+def _complete_ibv_from_mohawk_analysis(connection, *, primary: dict, source_transactions) -> bool:
+    """Advance stuck IBV when Mohawk analysis proves banking data exists.
+
+    Flinks toolbox / Mohawk can finish while LMS Celery sync still failed
+    (stale MostRecentCached / 0-tx). Analysis webhook is a second signal to
+    leave ``ibv_pending`` so staff are not blocked after a successful IBV.
+    """
+    if connection is None or connection.customer_id is None:
+        return False
+
+    has_coords = _coords_complete(primary if isinstance(primary, dict) else {})
+    has_txs = isinstance(source_transactions, list) and len(source_transactions) > 0
+    has_accounts = connection.accounts.exists()
+    if not (has_coords or has_txs or has_accounts):
+        return False
+
+    customer = connection.customer
+    pending_loans = list(customer.loans.filter(status='ibv_pending'))
+    if customer.banking_verified and not pending_loans:
+        return False
+
+    from loans.services import LoanService
+
+    with transaction.atomic():
+        connection.last_synced_at = timezone.now()
+        connection.sync_status = 'synced'
+        connection.sync_error = None
+        connection.is_active = True
+        connection.save(
+            update_fields=[
+                'last_synced_at',
+                'sync_status',
+                'sync_error',
+                'is_active',
+                'updated_at',
+            ]
+        )
+
+        customer.banking_verified = True
+        if customer.onboarding_stage == 'banking_verification':
+            customer.onboarding_stage = 'contract'
+        customer.save(update_fields=['banking_verified', 'onboarding_stage', 'updated_at'])
+
+        for loan in pending_loans:
+            LoanService.mark_pending_signature(loan)
+
+    try:
+        from activity.models import ActivityHistory
+
+        ActivityHistory.objects.create(
+            customer=customer,
+            type='ibv_completed',
+            title='Banking Verification Completed',
+            description=(
+                'Banking verification completed from Mohawk analysis '
+                '(Flinks data available).'
+            ),
+            created_by='system',
+            metadata={'source': 'mohawk_banking_analysis'},
+        )
+    except Exception:
+        logger.exception(
+            'Failed to log Mohawk IBV completion activity customer=%s',
+            customer.id,
+        )
+
+    logger.info(
+        'IBV completed via Mohawk analysis customer_id=%s connection_id=%s login_id=%s',
+        customer.id,
+        connection.id,
+        mask_identifier(connection.login_id),
+    )
+    return True
+
+
 @transaction.atomic
 def process_banking_analysis_payload(payload: dict):
     event_id = payload.get('event_id')
@@ -271,6 +347,11 @@ def process_banking_analysis_payload(payload: dict):
             event.event_id,
             connection.customer_id,
             connection.id,
+        )
+        _complete_ibv_from_mohawk_analysis(
+            connection,
+            primary=primary,
+            source_transactions=event.source_transactions,
         )
 
     return event, False

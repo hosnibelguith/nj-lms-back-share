@@ -251,6 +251,133 @@ class BankingConnectTests(TestCase):
         self.assertTrue(account.is_payment_blocked)
         self.assertTrue(self.customer_a.banking_verified)
 
+    def test_flinks_authorize_requests_fresh_detail_not_stale_cache(self):
+        connection = BankConnection.objects.create(
+            customer=self.customer_a,
+            login_id=str(uuid4()),
+            provider='flinks',
+            sync_status='pending',
+        )
+        accounts_payload = {
+            'Accounts': [
+                {
+                    'Id': 'acct-fresh',
+                    'Title': 'KOHO',
+                    'Type': 'Chequing',
+                    'Currency': 'CAD',
+                    'InstitutionNumber': '621',
+                    'TransitNumber': '16001',
+                    'AccountNumber': '218122623398',
+                    'Transactions': [
+                        {
+                            'Id': 'tx-1',
+                            'Date': '2026-08-01',
+                            'Description': 'Pay',
+                            'Credit': 10,
+                        }
+                    ],
+                }
+            ]
+        }
+        with patch('banking.tasks.requests.post') as mocked_post:
+            mocked_post.side_effect = [
+                type(
+                    'Resp',
+                    (),
+                    {
+                        'status_code': 200,
+                        'json': lambda self: {'RequestId': 'req-fresh'},
+                        'text': '',
+                    },
+                )(),
+                type(
+                    'Resp',
+                    (),
+                    {
+                        'status_code': 200,
+                        'json': lambda self: accounts_payload,
+                        'text': '',
+                    },
+                )(),
+            ]
+            self.assertTrue(tasks.fetch_flinks_accounts_only(str(connection.id)))
+            auth_kwargs = mocked_post.call_args_list[0].kwargs
+            self.assertFalse(auth_kwargs['json']['MostRecentCached'])
+
+    def test_flinks_zero_tx_retry_then_succeeds(self):
+        connection = BankConnection.objects.create(
+            customer=self.customer_a,
+            login_id=str(uuid4()),
+            provider='flinks',
+            sync_status='pending',
+        )
+        empty_payload = {
+            'Accounts': [
+                {
+                    'Id': 'acct-empty',
+                    'Title': 'KOHO',
+                    'Type': 'Chequing',
+                    'Currency': 'CAD',
+                    'InstitutionNumber': '621',
+                    'TransitNumber': '16001',
+                    'AccountNumber': '218122623398',
+                    'Transactions': [],
+                }
+            ]
+        }
+        filled_payload = {
+            'Accounts': [
+                {
+                    'Id': 'acct-empty',
+                    'Title': 'KOHO',
+                    'Type': 'Chequing',
+                    'Currency': 'CAD',
+                    'InstitutionNumber': '621',
+                    'TransitNumber': '16001',
+                    'AccountNumber': '218122623398',
+                    'Transactions': [
+                        {
+                            'Id': 'tx-later',
+                            'Date': '2026-08-01',
+                            'Description': 'Deposit',
+                            'Credit': 25,
+                        }
+                    ],
+                }
+            ]
+        }
+
+        def _resp(payload):
+            return type(
+                'Resp',
+                (),
+                {
+                    'status_code': 200,
+                    'json': lambda self, p=payload: p,
+                    'text': '',
+                },
+            )()
+
+        with patch('banking.tasks.time.sleep'), patch(
+            'banking.tasks.requests.post'
+        ) as mocked_post:
+            mocked_post.side_effect = [
+                _resp({'RequestId': 'req-1'}),
+                _resp(empty_payload),
+                _resp({'RequestId': 'req-2'}),
+                _resp(filled_payload),
+            ]
+            self.assertTrue(tasks.fetch_flinks_accounts_only(str(connection.id)))
+
+        connection.refresh_from_db()
+        self.customer_a.refresh_from_db()
+        self.assertEqual(connection.sync_status, 'synced')
+        self.assertTrue(self.customer_a.banking_verified)
+        self.assertEqual(
+            BankTransaction.objects.filter(customer=self.customer_a).count(),
+            1,
+        )
+
     def test_purge_command_is_noop_when_no_auto_reject_institutions(self):
         self.customer_a.banking_verified = True
         self.customer_a.onboarding_stage = 'contract'
@@ -705,5 +832,91 @@ class BlockedInstitutionBankingTests(TestCase):
             BankAccount.objects.filter(
                 connection=self.connection,
                 use_for_eft_collections=True,
+            ).exists()
+        )
+
+
+@override_settings(MOHAWK_BANKING_ANALYSIS_API_KEY='test-mohawk-key')
+class MohawkAnalysisIbvHealTests(TestCase):
+    """Mohawk analysis completes IBV when Flinks sync left the loan stuck."""
+
+    def setUp(self):
+        from loans.models import Loan
+
+        self.client = APIClient()
+        self.login_id = '6c776d4b-9ed5-4b37-f377-08def7e2a828'
+        self.user = User.objects.create_user(
+            email='klevis@example.com',
+            password='password123',
+            full_name='Klevis Prendi',
+            user_type='customer',
+        )
+        self.customer = Customer.objects.create(
+            portal_user=self.user,
+            first_name='Klevis',
+            last_name='Prendi',
+            email='zag448126@gmail.com',
+            phone='4168814077',
+            phone_normalized='4168814077',
+            province='ON',
+            status='pending',
+            onboarding_stage='banking_verification',
+            banking_verified=False,
+            source='arrive',
+            requested_loan_amount=Decimal('500.00'),
+        )
+        self.connection = BankConnection.objects.create(
+            customer=self.customer,
+            login_id=self.login_id,
+            provider='flinks',
+            is_active=True,
+            sync_status='failed',
+            sync_error='We could not retrieve transaction history',
+        )
+        self.loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal('500.00'),
+            fee=Decimal('100.00'),
+            total_amount=Decimal('600.00'),
+            balance=Decimal('600.00'),
+            status='ibv_pending',
+            is_active=True,
+        )
+
+    def test_mohawk_analysis_advances_stuck_ibv_pending_loan(self):
+        response = self.client.post(
+            '/api/integrations/mohawk/banking-analysis/',
+            {
+                'schema_version': '1.0',
+                'event': 'banking_analysis.completed',
+                'event_id': 'klevis-ibv-heal-1',
+                'login_id': self.login_id,
+                'tag': 'Mohawk',
+                'primary_bank_account': {
+                    'institution_number': '621',
+                    'transit_number': '16001',
+                    'account_number': '218122623398',
+                },
+                'source_transactions': [{'Id': f'tx-{i}'} for i in range(25)],
+                'report': {},
+                'final_report_text': 'review',
+            },
+            format='json',
+            HTTP_AUTHORIZATION='Token test-mohawk-key',
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+
+        self.customer.refresh_from_db()
+        self.connection.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertTrue(self.customer.banking_verified)
+        self.assertEqual(self.customer.onboarding_stage, 'contract')
+        self.assertEqual(self.connection.sync_status, 'synced')
+        self.assertEqual(self.loan.status, 'pending_signature')
+        self.assertTrue(
+            ActivityHistory.objects.filter(
+                customer=self.customer,
+                title='Banking Verification Completed',
+                metadata__source='mohawk_banking_analysis',
             ).exists()
         )
