@@ -23,7 +23,11 @@ from .serializers import (
     FinancialAnalysisReportSerializer,
     CustomerPortalBankingStatusSerializer,
 )
-from .tasks import fetch_flinks_accounts_only, UNSUPPORTED_IBV_REASON_CODE
+from .tasks import (
+    fetch_flinks_accounts_only,
+    queue_flinks_gad_repull,
+    UNSUPPORTED_IBV_REASON_CODE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +197,63 @@ class ResetPendingBankConnectionView(CustomerPortalBaseView):
         })
 
 
+class RetryFlinksSyncView(CustomerPortalBaseView):
+    """Re-queue GetAccountsDetail for the customer's existing Flinks LoginId.
+
+    Prefer this after a timeout/failed pull. Full Flinks Connect reconnect is
+    only needed when there is no active LoginId (see reset-pending).
+    """
+
+    def post(self, request):
+        customer = self.get_customer(request)
+        if customer.banking_verified:
+            return Response(
+                {"error": "Banking is already verified."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        connection = (
+            BankConnection.objects.filter(
+                customer=customer,
+                provider='flinks',
+                is_active=True,
+            )
+            .order_by('-created_at')
+            .first()
+        )
+        if connection is None:
+            return Response(
+                {
+                    "error": (
+                        "No active Flinks connection to re-pull. "
+                        "Connect your bank again."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            queue_flinks_gad_repull(connection, user=request.user)
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        connection.refresh_from_db()
+        logger.info(
+            'Portal Flinks GAD re-pull customer_id=%s connection_id=%s',
+            customer.id,
+            connection.id,
+        )
+        return Response(
+            {
+                "message": "Bank verification re-pull started.",
+                "status": "SYNCING",
+                "connection_id": str(connection.id),
+                "sync_status": connection.sync_status,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 class CustomerPortalBankingStatusView(CustomerPortalBaseView):
     def get(self, request):
         customer = self.get_customer(request)
@@ -265,6 +326,26 @@ class BankConnectionViewSet(viewsets.ReadOnlyModelViewSet):
             queryset = queryset.filter(customer_id=customer_id)
 
         return queryset.order_by('-created_at')
+
+    @action(detail=True, methods=['post'], url_path='repull')
+    def repull(self, request, pk=None):
+        """Staff: restart GetAccountsDetail using the stored Flinks LoginId."""
+        connection = self.get_object()
+        try:
+            queue_flinks_gad_repull(connection, user=request.user)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        connection.refresh_from_db()
+        return Response(
+            {
+                'message': 'GetAccountsDetail re-pull queued.',
+                'status': 'SYNCING',
+                'connection_id': str(connection.id),
+                'sync_status': connection.sync_status,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class BankAccountViewSet(viewsets.ReadOnlyModelViewSet):
@@ -454,5 +535,15 @@ class FlinksWebhookView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        logger.info('Legacy Flinks webhook received keys=%s', sorted(request.data.keys()))
-        return Response({"message": "Webhook received"}, status=status.HTTP_200_OK)
+        from banking.webhooks import process_flinks_webhook_payload
+
+        payload = request.data if isinstance(request.data, dict) else {}
+        logger.info(
+            'Flinks webhook received keys=%s response_type=%s',
+            sorted(payload.keys()),
+            payload.get('ResponseType') or payload.get('responseType') or '',
+        )
+        result = process_flinks_webhook_payload(payload)
+        # Always 200 so Flinks does not hammer retries on business rejects;
+        # sync outcome is in the body for ops.
+        return Response(result, status=status.HTTP_200_OK)

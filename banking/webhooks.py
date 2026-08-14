@@ -357,6 +357,71 @@ def process_banking_analysis_payload(payload: dict):
     return event, False
 
 
+def process_flinks_webhook_payload(payload: dict) -> dict:
+    """Ingest Flinks GetAccountsDetail webhook (same shape as a successful API pull).
+
+    Flinks delivers account + transaction data here when processing completes. We
+    must apply it even if our Authorize/GetAccountsDetail pull timed out.
+    """
+    if not isinstance(payload, dict):
+        return {'status': 'ignored', 'reason': 'invalid_payload'}
+
+    response_type = payload.get('ResponseType') or payload.get('responseType') or ''
+    accounts = payload.get('Accounts')
+    has_accounts = isinstance(accounts, list)
+
+    if response_type and response_type != 'GetAccountsDetail':
+        logger.info(
+            'Flinks webhook ignored response_type=%s keys=%s',
+            response_type,
+            sorted(payload.keys()),
+        )
+        return {
+            'status': 'ignored',
+            'reason': 'unsupported_response_type',
+            'response_type': response_type,
+        }
+
+    if not has_accounts:
+        logger.info('Flinks webhook ignored reason=no_accounts keys=%s', sorted(payload.keys()))
+        return {'status': 'ignored', 'reason': 'no_accounts'}
+
+    login = payload.get('Login') if isinstance(payload.get('Login'), dict) else {}
+    login_id = login.get('Id') or payload.get('LoginId') or payload.get('login_id')
+    if not login_id:
+        logger.warning('Flinks webhook ignored reason=missing_login_id')
+        return {'status': 'ignored', 'reason': 'missing_login_id'}
+
+    connection = (
+        BankConnection.objects.select_related('customer')
+        .filter(login_id=str(login_id))
+        .order_by('-is_active', '-created_at')
+        .first()
+    )
+    if connection is None:
+        logger.warning(
+            'Flinks webhook connection not found login_id=%s',
+            mask_identifier(login_id),
+        )
+        return {'status': 'ignored', 'reason': 'connection_not_found'}
+
+    from banking.tasks import apply_flinks_accounts_detail
+
+    ok = apply_flinks_accounts_detail(connection, payload)
+    logger.info(
+        'Flinks webhook applied login_id=%s connection_id=%s customer_id=%s ok=%s',
+        mask_identifier(login_id),
+        connection.id,
+        connection.customer_id,
+        ok,
+    )
+    return {
+        'status': 'synced' if ok else 'rejected',
+        'connection_id': str(connection.id),
+        'customer_id': str(connection.customer_id),
+    }
+
+
 class MohawkBankingAnalysisWebhookView(APIView):
     authentication_classes = []
     permission_classes = [permissions.AllowAny]

@@ -183,6 +183,161 @@ def _mark_banking_failed(connection, customer, reason):
     return False
 
 
+def _is_transient_flinks_transport_error(exc) -> bool:
+    """Network / read timeouts — Flinks may still deliver GetAccountsDetail via webhook."""
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return True
+    text = str(exc).lower()
+    return 'timed out' in text or 'timeout' in text or 'connection reset' in text
+
+
+def _mark_awaiting_flinks_webhook(connection, reason: str) -> None:
+    """Keep IBV open after a pull timeout so webhook / Mohawk can complete it."""
+    message = (
+        f'Flinks pull timed out; awaiting GetAccountsDetail webhook. ({reason})'
+    )[:2000]
+    connection.sync_status = 'pending'
+    connection.sync_error = message
+    connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
+    logger.warning(
+        'Flinks sync awaiting webhook customer_id=%s connection_id=%s login_id=%s reason=%s',
+        connection.customer_id,
+        connection.id,
+        mask_identifier(connection.login_id),
+        reason,
+    )
+
+
+def _connection_has_transactions(connection) -> bool:
+    return BankTransaction.objects.filter(account__connection=connection).exists()
+
+
+def _try_complete_ibv_from_mohawk_event(connection) -> bool:
+    """If Mohawk already posted analysis for this login, finish IBV without Flinks pull."""
+    from banking.models import BankingAnalysisEvent
+    from banking.webhooks import (
+        _apply_primary_eft_account,
+        _complete_ibv_from_mohawk_analysis,
+        _coords_complete,
+    )
+
+    event = (
+        BankingAnalysisEvent.objects.filter(login_id=str(connection.login_id or ''))
+        .order_by('-received_at')
+        .first()
+    )
+    if event is None:
+        return False
+
+    primary = event.primary_bank_account if isinstance(event.primary_bank_account, dict) else {}
+    txs = event.source_transactions if isinstance(event.source_transactions, list) else []
+    if _coords_complete(primary):
+        _apply_primary_eft_account(connection, primary)
+    return _complete_ibv_from_mohawk_analysis(
+        connection,
+        primary=primary,
+        source_transactions=txs,
+    )
+
+
+def _handle_flinks_transport_error(task, connection, customer, exc):
+    """Prefer webhook/Mohawk data over hard-failing IBV on Flinks API timeouts."""
+    if _try_complete_ibv_from_mohawk_event(connection):
+        return True
+    if connection.accounts.exists() and _connection_has_transactions(connection):
+        return _mark_banking_success(connection, customer)
+
+    if not _is_transient_flinks_transport_error(exc):
+        return _mark_banking_failed(connection, customer, str(exc))
+
+    _mark_awaiting_flinks_webhook(connection, str(exc))
+    max_retries = task.max_retries if task.max_retries is not None else 3
+    retries = getattr(getattr(task, 'request', None), 'retries', 0) or 0
+    if retries >= max_retries:
+        # Leave pending for Flinks/Mohawk webhook — do not email "verification failed".
+        return False
+    raise
+
+
+def apply_flinks_accounts_detail(connection, accounts_json) -> bool:
+    """Persist a GetAccountsDetail-shaped payload (API pull or Flinks webhook)."""
+    customer = connection.customer
+    accounts_data = (accounts_json or {}).get('Accounts') or []
+    if not accounts_data:
+        return _mark_banking_failed(connection, customer, NO_ACCOUNTS_MESSAGE)
+
+    if _count_transactions(accounts_data) == 0:
+        return _mark_banking_failed(connection, customer, ZERO_TRANSACTIONS_MESSAGE)
+
+    flinks_email, flinks_phone, flinks_name = _extract_holder_identity(accounts_data)
+    _persist_accounts(connection, customer, accounts_data)
+    return _mark_banking_success(connection, customer, flinks_email, flinks_phone, flinks_name)
+
+
+def queue_flinks_gad_repull(connection, *, user=None):
+    """Re-queue Authorize + GetAccountsDetail for an existing Flinks LoginId.
+
+    Used when a prior pull failed or timed out — Flinks Connect does not need
+    to run again; the stored LoginId is enough to restart GAD.
+    """
+    if connection.provider != 'flinks':
+        raise ValueError('Only Flinks connections support GetAccountsDetail re-pull.')
+    if not str(connection.login_id or '').strip():
+        raise ValueError('Connection has no Flinks LoginId to re-pull.')
+
+    customer = connection.customer
+    if customer.banking_verified and connection.sync_status == 'synced':
+        raise ValueError(
+            'Banking is already verified; GetAccountsDetail re-pull is not needed.'
+        )
+
+    connection.is_active = True
+    connection.sync_status = 'pending'
+    connection.sync_error = None
+    connection.save(
+        update_fields=['is_active', 'sync_status', 'sync_error', 'updated_at']
+    )
+
+    fetch_flinks_accounts_only.delay(str(connection.id))
+
+    actor = 'system'
+    if user is not None:
+        actor = str(getattr(user, 'id', None) or getattr(user, 'email', None) or 'staff')
+
+    try:
+        from activity.models import ActivityHistory
+
+        ActivityHistory.objects.create(
+            customer=customer,
+            type='system',
+            title='IBV Re-pull Started',
+            description=(
+                'GetAccountsDetail re-pull queued for the existing Flinks LoginId.'
+            ),
+            created_by=actor,
+            metadata={
+                'action': 'flinks_gad_repull',
+                'connection_id': str(connection.id),
+                'login_id': str(connection.login_id),
+            },
+        )
+    except Exception:
+        logger.exception(
+            'Failed to log Flinks GAD re-pull activity customer=%s connection=%s',
+            customer.id,
+            connection.id,
+        )
+
+    logger.info(
+        'Flinks GAD re-pull queued customer_id=%s connection_id=%s login_id=%s actor=%s',
+        customer.id,
+        connection.id,
+        mask_identifier(connection.login_id),
+        actor,
+    )
+    return connection
+
+
 def _delete_unsupported_banking_connection(connection, customer, reason, institutions):
     logger.warning(
         'Flinks sync deleting unsupported institution connection customer_id=%s connection_id=%s login_id=%s reason=%s',
@@ -481,7 +636,7 @@ def fetch_flinks_accounts_only(self, connection_id):
             connection.id,
             mask_identifier(login_id),
         )
-        return _mark_banking_failed(connection, customer, str(exc))
+        return _handle_flinks_transport_error(self, connection, customer, exc)
 
     logger.info(
         'Flinks Authorize response customer_id=%s connection_id=%s status=%s',
@@ -513,7 +668,7 @@ def fetch_flinks_accounts_only(self, connection_id):
             connection.id,
             mask_identifier(request_id),
         )
-        return _mark_banking_failed(connection, customer, str(exc))
+        return _handle_flinks_transport_error(self, connection, customer, exc)
 
     if not accounts_json:
         return _mark_banking_failed(connection, customer, 'Failed to fetch accounts from Flinks')
@@ -569,11 +724,6 @@ def fetch_flinks_accounts_only(self, connection_id):
             total_transactions,
         )
 
-    if total_transactions == 0:
-        return _mark_banking_failed(connection, customer, ZERO_TRANSACTIONS_MESSAGE)
-
     # 621/623/703 are persisted like any other bank. Agents may decline with
     # "Unsupported bank"; funding UI shows a non-blocking risk warning.
-    flinks_email, flinks_phone, flinks_name = _extract_holder_identity(accounts_data)
-    _persist_accounts(connection, customer, accounts_data)
-    return _mark_banking_success(connection, customer, flinks_email, flinks_phone, flinks_name)
+    return apply_flinks_accounts_detail(connection, {'Accounts': accounts_data})

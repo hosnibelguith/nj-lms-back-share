@@ -3,6 +3,7 @@ from io import StringIO
 from unittest.mock import patch
 from uuid import uuid4
 
+import requests
 from django.core import mail
 from django.core.management import call_command
 from django.test import TestCase, override_settings
@@ -920,3 +921,318 @@ class MohawkAnalysisIbvHealTests(TestCase):
                 metadata__source='mohawk_banking_analysis',
             ).exists()
         )
+
+
+@override_settings(
+    CELERY_TASK_ALWAYS_EAGER=True,
+    EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend',
+)
+class FlinksWebhookAndTimeoutTests(TestCase):
+    """GetAccountsDetail webhook is source of truth when Authorize pull times out."""
+
+    def setUp(self):
+        from loans.models import Loan
+
+        self.client = APIClient()
+        self.login_id = str(uuid4())
+        self.user = User.objects.create_user(
+            email='flinks-webhook@example.com',
+            password='password123',
+            full_name='Webhook Customer',
+            user_type='customer',
+        )
+        self.customer = Customer.objects.create(
+            portal_user=self.user,
+            first_name='Webhook',
+            last_name='Customer',
+            email='flinks-webhook@example.com',
+            phone='4165550199',
+            phone_normalized='4165550199',
+            province='ON',
+            status='pending',
+            onboarding_stage='banking_verification',
+            banking_verified=False,
+        )
+        self.connection = BankConnection.objects.create(
+            customer=self.customer,
+            login_id=self.login_id,
+            provider='flinks',
+            is_active=True,
+            sync_status='pending',
+        )
+        self.loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal('500.00'),
+            fee=Decimal('100.00'),
+            total_amount=Decimal('600.00'),
+            balance=Decimal('600.00'),
+            status='ibv_pending',
+            is_active=True,
+        )
+
+    def _accounts_payload(self):
+        return {
+            'ResponseType': 'GetAccountsDetail',
+            'HttpStatusCode': 200,
+            'Accounts': [
+                {
+                    'Id': 'acct-webhook-1',
+                    'Title': 'Home',
+                    'Type': 'Chequing',
+                    'Currency': 'CAD',
+                    'InstitutionNumber': '001',
+                    'TransitNumber': '12345',
+                    'AccountNumber': '9999999',
+                    'Holder': {
+                        'Name': 'Webhook Customer',
+                        'Email': 'flinks-webhook@example.com',
+                        'PhoneNumber': '4165550199',
+                    },
+                    'Transactions': [
+                        {
+                            'Id': 'tx-wh-1',
+                            'Date': '2026-08-01',
+                            'Description': 'Payroll',
+                            'Credit': 1000,
+                        }
+                    ],
+                }
+            ],
+            'Login': {'Id': self.login_id, 'Username': 'user'},
+            'RequestId': 'req-webhook-1',
+        }
+
+    def test_flinks_get_accounts_detail_webhook_completes_ibv(self):
+        response = self.client.post(
+            '/api/webhooks/flinks/',
+            self._accounts_payload(),
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['status'], 'synced')
+
+        self.customer.refresh_from_db()
+        self.connection.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertTrue(self.customer.banking_verified)
+        self.assertEqual(self.customer.onboarding_stage, 'contract')
+        self.assertEqual(self.connection.sync_status, 'synced')
+        self.assertEqual(self.loan.status, 'pending_signature')
+        self.assertEqual(
+            BankAccount.objects.filter(customer=self.customer).count(),
+            1,
+        )
+        self.assertEqual(
+            BankTransaction.objects.filter(customer=self.customer).count(),
+            1,
+        )
+
+    def test_flinks_kyc_webhook_is_ignored(self):
+        response = self.client.post(
+            '/api/webhooks/flinks/',
+            {
+                'ResponseType': 'KYC',
+                'Login': {'Id': self.login_id},
+                'Accounts': [],
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['status'], 'ignored')
+        self.customer.refresh_from_db()
+        self.assertFalse(self.customer.banking_verified)
+
+    def test_authorize_timeout_awaits_webhook_without_verification_failed(self):
+        with patch.object(tasks.fetch_flinks_accounts_only, 'max_retries', 0), patch(
+            'banking.tasks.requests.post',
+            side_effect=requests.exceptions.ReadTimeout(
+                "HTTPSConnectionPool(host='alphaloans-ca-api.private.fin.ag', port=443): "
+                'Read timed out. (read timeout=30)'
+            ),
+        ):
+            result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        self.assertFalse(result)
+        self.connection.refresh_from_db()
+        self.customer.refresh_from_db()
+        self.assertEqual(self.connection.sync_status, 'pending')
+        self.assertIn('awaiting GetAccountsDetail webhook', self.connection.sync_error)
+        self.assertFalse(self.customer.banking_verified)
+        self.assertFalse(
+            ActivityHistory.objects.filter(
+                customer=self.customer,
+                title='Banking Verification Failed',
+            ).exists()
+        )
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_timeout_then_flinks_webhook_recovers_ibv(self):
+        with patch.object(tasks.fetch_flinks_accounts_only, 'max_retries', 0), patch(
+            'banking.tasks.requests.post',
+            side_effect=requests.exceptions.ReadTimeout('Read timed out'),
+        ):
+            tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        response = self.client.post(
+            '/api/webhooks/flinks/',
+            self._accounts_payload(),
+            format='json',
+        )
+        self.assertEqual(response.data['status'], 'synced')
+        self.customer.refresh_from_db()
+        self.connection.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertTrue(self.customer.banking_verified)
+        self.assertEqual(self.connection.sync_status, 'synced')
+        self.assertEqual(self.loan.status, 'pending_signature')
+
+    def test_timeout_heals_from_existing_mohawk_analysis(self):
+        from banking.models import BankingAnalysisEvent
+
+        BankingAnalysisEvent.objects.create(
+            event_id='timeout-heal-mohawk-1',
+            event='banking_analysis.completed',
+            schema_version='1.0',
+            login_id=self.login_id,
+            tag='Mohawk',
+            connection=self.connection,
+            customer=self.customer,
+            primary_bank_account={
+                'institution_number': '001',
+                'transit_number': '12345',
+                'account_number': '9999999',
+            },
+            source_transactions=[{'Id': 'tx-1'}],
+            processing_status='accepted',
+        )
+
+        with patch.object(tasks.fetch_flinks_accounts_only, 'max_retries', 0), patch(
+            'banking.tasks.requests.post',
+            side_effect=requests.exceptions.ReadTimeout('Read timed out'),
+        ):
+            result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        self.assertTrue(result)
+        self.customer.refresh_from_db()
+        self.connection.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertTrue(self.customer.banking_verified)
+        self.assertEqual(self.connection.sync_status, 'synced')
+        self.assertEqual(self.loan.status, 'pending_signature')
+
+
+@override_settings(
+    CELERY_TASK_ALWAYS_EAGER=True,
+    EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend',
+)
+class FlinksGadRepullTests(TestCase):
+    """Staff/portal can restart GetAccountsDetail without a new Flinks Connect."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.login_id = str(uuid4())
+        self.customer_user = User.objects.create_user(
+            email='gad-repull@example.com',
+            password='password123',
+            full_name='GAD Customer',
+            user_type='customer',
+        )
+        self.staff = User.objects.create_user(
+            email='gad-staff@example.com',
+            password='password123',
+            full_name='GAD Staff',
+            user_type='staff',
+            is_staff=True,
+        )
+        self.customer = Customer.objects.create(
+            portal_user=self.customer_user,
+            first_name='GAD',
+            last_name='Customer',
+            email='gad-repull@example.com',
+            phone='4165550299',
+            phone_normalized='4165550299',
+            province='ON',
+            status='pending',
+            onboarding_stage='banking_verification',
+            banking_verified=False,
+        )
+        self.connection = BankConnection.objects.create(
+            customer=self.customer,
+            login_id=self.login_id,
+            provider='flinks',
+            is_active=True,
+            sync_status='failed',
+            sync_error='Read timed out',
+        )
+
+    def test_staff_repull_queues_existing_login(self):
+        self.client.force_authenticate(user=self.staff)
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            response = self.client.post(
+                f'/api/bank-connections/{self.connection.id}/repull/',
+                {},
+                format='json',
+            )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['status'], 'SYNCING')
+        mocked.assert_called_once_with(str(self.connection.id))
+
+        self.connection.refresh_from_db()
+        self.assertEqual(self.connection.sync_status, 'pending')
+        self.assertIsNone(self.connection.sync_error)
+        self.assertTrue(
+            ActivityHistory.objects.filter(
+                customer=self.customer,
+                title='IBV Re-pull Started',
+            ).exists()
+        )
+
+    def test_staff_repull_rejected_when_already_verified(self):
+        self.customer.banking_verified = True
+        self.customer.save(update_fields=['banking_verified', 'updated_at'])
+        self.connection.sync_status = 'synced'
+        self.connection.sync_error = None
+        self.connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
+
+        self.client.force_authenticate(user=self.staff)
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            response = self.client.post(
+                f'/api/bank-connections/{self.connection.id}/repull/',
+                {},
+                format='json',
+            )
+        self.assertEqual(response.status_code, 400)
+        mocked.assert_not_called()
+
+    def test_portal_retry_sync_queues_gad(self):
+        self.client.force_authenticate(user=self.customer_user)
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            response = self.client.post('/api/banking/retry-sync/', {}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['status'], 'SYNCING')
+        mocked.assert_called_once_with(str(self.connection.id))
+        self.connection.refresh_from_db()
+        self.assertEqual(self.connection.sync_status, 'pending')
+
+    def test_portal_retry_sync_requires_active_flinks_connection(self):
+        self.connection.is_active = False
+        self.connection.save(update_fields=['is_active', 'updated_at'])
+        self.client.force_authenticate(user=self.customer_user)
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            response = self.client.post('/api/banking/retry-sync/', {}, format='json')
+        self.assertEqual(response.status_code, 400)
+        mocked.assert_not_called()
+
+    def test_manual_connection_cannot_repull_gad(self):
+        self.connection.provider = 'manual'
+        self.connection.login_id = f'manual-{self.customer.id}'
+        self.connection.save(update_fields=['provider', 'login_id', 'updated_at'])
+        self.client.force_authenticate(user=self.staff)
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            response = self.client.post(
+                f'/api/bank-connections/{self.connection.id}/repull/',
+                {},
+                format='json',
+            )
+        self.assertEqual(response.status_code, 400)
+        mocked.assert_not_called()
