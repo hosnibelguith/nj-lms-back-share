@@ -19,9 +19,11 @@ logger = logging.getLogger(__name__)
 
 FLINKS_ASYNC_POLL_INTERVAL_SECONDS = 10
 FLINKS_ASYNC_MAX_WAIT_SECONDS = 30 * 60
-# Fresh Authorize (not MostRecentCached) — cached pulls often return 0 txs for
+# Live Authorize first (not cache) — cached pulls often return 0 txs for
 # newly linked KOHO / neo-banks while Flinks toolbox already shows history.
+# Cache is only a fallback after timeout / MFA so we do not fail IBV.
 FLINKS_MOST_RECENT_CACHED = False
+FLINKS_HTTP_TIMEOUT = 60
 FLINKS_ZERO_TX_RETRIES = 3
 FLINKS_ZERO_TX_RETRY_SECONDS = 5
 ZERO_TRANSACTIONS_MESSAGE = (
@@ -80,7 +82,7 @@ def _poll_get_accounts_detail_async(instance, customer_id, request_id, headers):
 
     while time.monotonic() < deadline:
         attempt += 1
-        async_resp = requests.get(async_url, headers=headers, timeout=30)
+        async_resp = requests.get(async_url, headers=headers, timeout=FLINKS_HTTP_TIMEOUT)
         logger.info(
             'Flinks async poll attempt=%s request_id=%s status=%s',
             attempt,
@@ -240,23 +242,132 @@ def _try_complete_ibv_from_mohawk_event(connection) -> bool:
     )
 
 
-def _handle_flinks_transport_error(task, connection, customer, exc):
-    """Prefer webhook/Mohawk data over hard-failing IBV on Flinks API timeouts."""
+def _is_flinks_security_challenge(response) -> bool:
+    """Authorize 203 / SecurityChallenges = MFA, not a completed IBV failure."""
+    if response is None:
+        return False
+    if getattr(response, 'status_code', None) == 203:
+        return True
+    try:
+        body = response.json()
+    except Exception:
+        return False
+    if not isinstance(body, dict):
+        return False
+    return bool(body.get('SecurityChallenges')) or body.get('HttpStatusCode') == 203
+
+
+def _try_cached_flinks_detail(connection, instance, flinks_customer_id, headers, login_id) -> bool:
+    """Use data Flinks already stored from Connect when a live pull cannot finish."""
+    auth_url = (
+        f'https://{instance}-api.private.fin.ag/v3/{flinks_customer_id}/'
+        'BankingServices/Authorize'
+    )
+    acct_url = (
+        f'https://{instance}-api.private.fin.ag/v3/{flinks_customer_id}/'
+        'BankingServices/GetAccountsDetail'
+    )
+    try:
+        auth_resp = requests.post(
+            auth_url,
+            json={'LoginId': str(login_id), 'MostRecentCached': True},
+            headers=headers,
+            timeout=FLINKS_HTTP_TIMEOUT,
+        )
+    except requests.RequestException:
+        logger.exception(
+            'Flinks cached Authorize failed connection_id=%s',
+            connection.id,
+        )
+        return False
+    if auth_resp.status_code != 200:
+        return False
+    request_id = (auth_resp.json() or {}).get('RequestId')
+    if not request_id:
+        return False
+    try:
+        acct_resp = requests.post(
+            acct_url,
+            json={'RequestId': request_id, 'DaysOfTransactions': 'Days365'},
+            headers=headers,
+            timeout=FLINKS_HTTP_TIMEOUT,
+        )
+    except requests.RequestException:
+        logger.exception(
+            'Flinks cached GetAccountsDetail failed connection_id=%s',
+            connection.id,
+        )
+        return False
+    if acct_resp.status_code != 200:
+        return False
+    payload = acct_resp.json() or {}
+    if _count_transactions(payload.get('Accounts') or []) == 0:
+        return False
+    logger.info(
+        'Flinks cached pull recovered IBV connection_id=%s customer_id=%s',
+        connection.id,
+        connection.customer_id,
+    )
+    return apply_flinks_accounts_detail(connection, payload)
+
+
+def _recover_ibv_without_live_pull(
+    task,
+    connection,
+    customer,
+    reason,
+    *,
+    instance,
+    flinks_customer_id,
+    headers,
+    login_id,
+    retry_live=True,
+):
+    """Do not fail IBV when live Authorize timed out or asked for MFA."""
     if _try_complete_ibv_from_mohawk_event(connection):
         return True
     if connection.accounts.exists() and _connection_has_transactions(connection):
         return _mark_banking_success(connection, customer)
+    if _try_cached_flinks_detail(
+        connection, instance, flinks_customer_id, headers, login_id
+    ):
+        return True
 
-    if not _is_transient_flinks_transport_error(exc):
-        return _mark_banking_failed(connection, customer, str(exc))
-
-    _mark_awaiting_flinks_webhook(connection, str(exc))
+    _mark_awaiting_flinks_webhook(connection, reason)
+    if not retry_live:
+        return False
     max_retries = task.max_retries if task.max_retries is not None else 3
     retries = getattr(getattr(task, 'request', None), 'retries', 0) or 0
     if retries >= max_retries:
-        # Leave pending for Flinks/Mohawk webhook — do not email "verification failed".
         return False
     raise
+
+
+def _handle_flinks_transport_error(
+    task,
+    connection,
+    customer,
+    exc,
+    *,
+    instance,
+    flinks_customer_id,
+    headers,
+    login_id,
+):
+    """Prefer cache / webhook / Mohawk over hard-failing IBV on Flinks timeouts."""
+    if not _is_transient_flinks_transport_error(exc):
+        return _mark_banking_failed(connection, customer, str(exc))
+    return _recover_ibv_without_live_pull(
+        task,
+        connection,
+        customer,
+        str(exc),
+        instance=instance,
+        flinks_customer_id=flinks_customer_id,
+        headers=headers,
+        login_id=login_id,
+        retry_live=True,
+    )
 
 
 def apply_flinks_accounts_detail(connection, accounts_json) -> bool:
@@ -585,7 +696,7 @@ def fetch_flinks_accounts_only(self, connection_id):
                 'MostRecentCached': FLINKS_MOST_RECENT_CACHED,
             },
             headers=headers,
-            timeout=30,
+            timeout=FLINKS_HTTP_TIMEOUT,
         )
 
     def _get_accounts_detail(request_id):
@@ -599,7 +710,7 @@ def fetch_flinks_accounts_only(self, connection_id):
             acct_url,
             json={'RequestId': request_id, 'DaysOfTransactions': 'Days365'},
             headers=headers,
-            timeout=30,
+            timeout=FLINKS_HTTP_TIMEOUT,
         )
         logger.info(
             'Flinks GetAccountsDetail response customer_id=%s connection_id=%s request_id=%s status=%s',
@@ -618,6 +729,8 @@ def fetch_flinks_accounts_only(self, connection_id):
                 mask_identifier(request_id),
             )
             return _poll_get_accounts_detail_async(instance, customer_id, request_id, headers)
+        if _is_flinks_security_challenge(acct_resp):
+            return 'SECURITY_CHALLENGE'
         logger.error(
             'Flinks GetAccountsDetail failed customer_id=%s connection_id=%s status=%s body=%s',
             customer.id,
@@ -636,7 +749,16 @@ def fetch_flinks_accounts_only(self, connection_id):
             connection.id,
             mask_identifier(login_id),
         )
-        return _handle_flinks_transport_error(self, connection, customer, exc)
+        return _handle_flinks_transport_error(
+            self,
+            connection,
+            customer,
+            exc,
+            instance=instance,
+            flinks_customer_id=customer_id,
+            headers=headers,
+            login_id=login_id,
+        )
 
     logger.info(
         'Flinks Authorize response customer_id=%s connection_id=%s status=%s',
@@ -644,6 +766,18 @@ def fetch_flinks_accounts_only(self, connection_id):
         connection.id,
         auth_resp.status_code,
     )
+    if _is_flinks_security_challenge(auth_resp):
+        return _recover_ibv_without_live_pull(
+            self,
+            connection,
+            customer,
+            auth_resp.text,
+            instance=instance,
+            flinks_customer_id=customer_id,
+            headers=headers,
+            login_id=login_id,
+            retry_live=False,
+        )
     if auth_resp.status_code != 200:
         return _mark_banking_failed(connection, customer, auth_resp.text)
 
@@ -668,8 +802,29 @@ def fetch_flinks_accounts_only(self, connection_id):
             connection.id,
             mask_identifier(request_id),
         )
-        return _handle_flinks_transport_error(self, connection, customer, exc)
+        return _handle_flinks_transport_error(
+            self,
+            connection,
+            customer,
+            exc,
+            instance=instance,
+            flinks_customer_id=customer_id,
+            headers=headers,
+            login_id=login_id,
+        )
 
+    if accounts_json == 'SECURITY_CHALLENGE':
+        return _recover_ibv_without_live_pull(
+            self,
+            connection,
+            customer,
+            'Flinks GetAccountsDetail returned a security challenge.',
+            instance=instance,
+            flinks_customer_id=customer_id,
+            headers=headers,
+            login_id=login_id,
+            retry_live=False,
+        )
     if not accounts_json:
         return _mark_banking_failed(connection, customer, 'Failed to fetch accounts from Flinks')
 

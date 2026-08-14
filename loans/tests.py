@@ -323,6 +323,33 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertNotIn("Funding destination required.", response.data["blockers"])
         self.assertNotIn("Collections account required.", response.data["blockers"])
 
+    def test_funding_options_does_not_heal_from_inactive_connection(self):
+        """After a new application, deactivated Flinks accounts must not auto-save."""
+        self.connection.is_active = False
+        self.connection.save(update_fields=["is_active", "updated_at"])
+        self.loan.bank_account = None
+        self.loan.collections_account = None
+        self.loan.funding_destination = {}
+        self.loan.status = "ibv_pending"
+        self.loan.save(
+            update_fields=[
+                "bank_account",
+                "collections_account",
+                "funding_destination",
+                "status",
+                "updated_at",
+            ]
+        )
+
+        response = self.client.get(f"/api/loans/{self.loan.id}/funding/options/")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.loan.refresh_from_db()
+        self.assertIsNone(self.loan.bank_account_id)
+        self.assertIsNone(self.loan.collections_account_id)
+        self.assertFalse(response.data["eft_configured"])
+        self.assertFalse(response.data["collections_account_configured"])
+
     def test_configure_accounts_allowed_before_approve(self):
         pending_loan = Loan.objects.create(
             customer=self.customer,

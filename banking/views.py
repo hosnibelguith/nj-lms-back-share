@@ -354,15 +354,23 @@ class BankAccountViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         ordered_transactions = BankTransaction.objects.order_by('-date', '-created_at')
-        queryset = BankAccount.objects.select_related('customer', 'connection').filter(
-            connection__is_active=True
-        ).prefetch_related(
+        queryset = BankAccount.objects.select_related('customer', 'connection').prefetch_related(
             Prefetch('transactions', queryset=ordered_transactions)
         )
 
         customer_id = self.request.query_params.get('customer_id')
         if customer_id:
-            queryset = queryset.filter(customer_id=customer_id)
+            from loans.models import Loan
+
+            referenced = Loan.objects.filter(customer_id=customer_id).exclude(
+                status__in=['paid_off', 'defaulted', 'human_declined']
+            ).values_list('bank_account_id', 'collections_account_id')
+            referenced_ids = {pk for pair in referenced for pk in pair if pk}
+            queryset = queryset.filter(customer_id=customer_id).filter(
+                Q(connection__is_active=True) | Q(pk__in=referenced_ids)
+            )
+        else:
+            queryset = queryset.filter(connection__is_active=True)
 
         return queryset.order_by('-is_primary', 'name')
 

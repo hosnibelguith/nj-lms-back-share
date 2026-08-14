@@ -1120,6 +1120,75 @@ class FlinksWebhookAndTimeoutTests(TestCase):
         self.assertEqual(self.connection.sync_status, 'synced')
         self.assertEqual(self.loan.status, 'pending_signature')
 
+    def test_authorize_203_mfa_does_not_mark_verification_failed(self):
+        challenge = type(
+            'Resp',
+            (),
+            {
+                'status_code': 203,
+                'text': '{"HttpStatusCode":203,"SecurityChallenges":[{"Type":"SMS"}]}',
+                'json': lambda self: {
+                    'HttpStatusCode': 203,
+                    'SecurityChallenges': [{'Type': 'SMS'}],
+                },
+            },
+        )()
+        with patch.object(tasks.fetch_flinks_accounts_only, 'max_retries', 0), patch(
+            'banking.tasks.requests.post',
+            return_value=challenge,
+        ):
+            result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        self.assertFalse(result)
+        self.connection.refresh_from_db()
+        self.customer.refresh_from_db()
+        self.assertEqual(self.connection.sync_status, 'pending')
+        self.assertIn('awaiting GetAccountsDetail webhook', self.connection.sync_error)
+        self.assertFalse(self.customer.banking_verified)
+        self.assertFalse(
+            ActivityHistory.objects.filter(
+                customer=self.customer,
+                title='Banking Verification Failed',
+            ).exists()
+        )
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_timeout_recovers_from_cached_flinks_detail(self):
+        live_timeout = requests.exceptions.ReadTimeout('Read timed out')
+        payload = self._accounts_payload()
+        cached_auth = type(
+            'Resp',
+            (),
+            {
+                'status_code': 200,
+                'text': '',
+                'json': lambda self: {'RequestId': 'cached-req'},
+            },
+        )()
+        cached_detail = type(
+            'Resp',
+            (),
+            {
+                'status_code': 200,
+                'text': '',
+                'json': lambda self, p=payload: p,
+            },
+        )()
+
+        with patch.object(tasks.fetch_flinks_accounts_only, 'max_retries', 0), patch(
+            'banking.tasks.requests.post',
+            side_effect=[live_timeout, cached_auth, cached_detail],
+        ):
+            result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        self.assertTrue(result)
+        self.customer.refresh_from_db()
+        self.connection.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertTrue(self.customer.banking_verified)
+        self.assertEqual(self.connection.sync_status, 'synced')
+        self.assertEqual(self.loan.status, 'pending_signature')
+
 
 @override_settings(
     CELERY_TASK_ALWAYS_EAGER=True,
@@ -1236,3 +1305,59 @@ class FlinksGadRepullTests(TestCase):
             )
         self.assertEqual(response.status_code, 400)
         mocked.assert_not_called()
+
+    def test_staff_bank_accounts_include_loan_referenced_inactive_connection(self):
+        from loans.models import Loan
+
+        self.connection.is_active = False
+        self.connection.save(update_fields=['is_active', 'updated_at'])
+        account = BankAccount.objects.create(
+            connection=self.connection,
+            customer=self.customer,
+            external_id='inactive-acct',
+            name='Home',
+            type='checking',
+            institution_number='828',
+            transit_number='30052',
+            account_number='8282',
+            is_primary=True,
+        )
+        Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal('300.00'),
+            fee=Decimal('60.00'),
+            total_amount=Decimal('360.00'),
+            balance=Decimal('360.00'),
+            status='ibv_pending',
+            bank_account=account,
+            collections_account=account,
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.get(f'/api/bank-accounts/?customer_id={self.customer.id}')
+        self.assertEqual(response.status_code, 200)
+        payload = response.data if isinstance(response.data, list) else response.data.get('results', [])
+        ids = {str(row['id']) for row in payload}
+        self.assertIn(str(account.id), ids)
+
+    def test_staff_bank_accounts_hide_inactive_unreferenced_account(self):
+        self.connection.is_active = False
+        self.connection.save(update_fields=['is_active', 'updated_at'])
+        account = BankAccount.objects.create(
+            connection=self.connection,
+            customer=self.customer,
+            external_id='orphan-acct',
+            name='Old',
+            type='checking',
+            institution_number='003',
+            transit_number='11111',
+            account_number='1111',
+        )
+
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.get(f'/api/bank-accounts/?customer_id={self.customer.id}')
+        self.assertEqual(response.status_code, 200)
+        payload = response.data if isinstance(response.data, list) else response.data.get('results', [])
+        ids = {str(row['id']) for row in payload}
+        self.assertNotIn(str(account.id), ids)

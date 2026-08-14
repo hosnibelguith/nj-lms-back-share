@@ -1789,7 +1789,7 @@ class FundingConfigurationService:
     @staticmethod
     def default_customer_payment_account(customer) -> BankAccount | None:
         """Primary / EFT-flagged payable account — same preference the staff UI shows."""
-        qs = BankAccount.objects.filter(customer=customer)
+        qs = BankAccount.objects.filter(customer=customer, connection__is_active=True)
         return (
             qs.filter(use_for_eft_funding=True).order_by("-is_primary", "name").first()
             or qs.filter(is_primary=True).order_by("name").first()
