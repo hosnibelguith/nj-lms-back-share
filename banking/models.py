@@ -29,6 +29,10 @@ class BankConnection(models.Model):
     sync_status = models.CharField(max_length=20, choices=SYNC_STATUS_CHOICES, default='pending')
     sync_error = models.TextField(blank=True, null=True)
     last_synced_at = models.DateTimeField(null=True, blank=True)
+    attempted_syncs = models.PositiveIntegerField(
+        default=0,
+        help_text='How many Authorize/GetAccountsDetail pulls have been tried for this LoginId.',
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

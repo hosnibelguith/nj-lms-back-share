@@ -289,6 +289,7 @@ class CustomerPortalBankingStatusView(CustomerPortalBaseView):
             'has_connection': connection is not None,
             'connection_status': connection.sync_status if connection else None,
             'last_synced_at': connection.last_synced_at if connection else None,
+            'attempted_syncs': connection.attempted_syncs if connection else 0,
             'account_count': customer.bank_accounts.filter(connection__is_active=True).count(),
             'failure_message': (
                 connection.sync_error

@@ -1179,6 +1179,8 @@ class FlinksWebhookAndTimeoutTests(TestCase):
 
     def test_authorize_timeout_awaits_webhook_without_verification_failed(self):
         with patch.object(tasks.fetch_flinks_accounts_only, 'max_retries', 0), patch(
+            'banking.tasks.fetch_flinks_accounts_only.apply_async'
+        ) as scheduled, patch(
             'banking.tasks.requests.post',
             side_effect=requests.exceptions.ReadTimeout(
                 "HTTPSConnectionPool(host='alphaloans-ca-api.private.fin.ag', port=443): "
@@ -1188,10 +1190,23 @@ class FlinksWebhookAndTimeoutTests(TestCase):
             result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
 
         self.assertFalse(result)
+        scheduled.assert_called_once_with(
+            args=[str(self.connection.id)],
+            countdown=15,
+        )
         self.connection.refresh_from_db()
         self.customer.refresh_from_db()
         self.assertEqual(self.connection.sync_status, 'pending')
-        self.assertIn('awaiting GetAccountsDetail webhook', self.connection.sync_error)
+        self.assertEqual(self.connection.attempted_syncs, 1)
+        self.assertIsNone(self.connection.last_synced_at)
+        self.assertIsNone(self.connection.sync_error)
+        self.assertTrue(
+            ActivityHistory.objects.filter(
+                customer=self.customer,
+                title='IBV Re-pull Started',
+                created_by='system',
+            ).exists()
+        )
         self.assertFalse(self.customer.banking_verified)
         self.assertFalse(
             ActivityHistory.objects.filter(
@@ -1203,6 +1218,8 @@ class FlinksWebhookAndTimeoutTests(TestCase):
 
     def test_timeout_then_flinks_webhook_recovers_ibv(self):
         with patch.object(tasks.fetch_flinks_accounts_only, 'max_retries', 0), patch(
+            'banking.tasks.fetch_flinks_accounts_only.apply_async'
+        ), patch(
             'banking.tasks.requests.post',
             side_effect=requests.exceptions.ReadTimeout('Read timed out'),
         ):
@@ -1242,12 +1259,15 @@ class FlinksWebhookAndTimeoutTests(TestCase):
         )
 
         with patch.object(tasks.fetch_flinks_accounts_only, 'max_retries', 0), patch(
+            'banking.tasks.fetch_flinks_accounts_only.apply_async'
+        ) as scheduled, patch(
             'banking.tasks.requests.post',
             side_effect=requests.exceptions.ReadTimeout('Read timed out'),
         ):
             result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
 
         self.assertTrue(result)
+        scheduled.assert_not_called()
         self.customer.refresh_from_db()
         self.connection.refresh_from_db()
         self.loan.refresh_from_db()
@@ -1269,15 +1289,19 @@ class FlinksWebhookAndTimeoutTests(TestCase):
             },
         )()
         with patch.object(tasks.fetch_flinks_accounts_only, 'max_retries', 0), patch(
+            'banking.tasks.fetch_flinks_accounts_only.apply_async'
+        ) as scheduled, patch(
             'banking.tasks.requests.post',
             return_value=challenge,
         ):
             result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
 
         self.assertFalse(result)
+        scheduled.assert_not_called()
         self.connection.refresh_from_db()
         self.customer.refresh_from_db()
         self.assertEqual(self.connection.sync_status, 'pending')
+        self.assertEqual(self.connection.attempted_syncs, 1)
         self.assertIn('awaiting GetAccountsDetail webhook', self.connection.sync_error)
         self.assertFalse(self.customer.banking_verified)
         self.assertFalse(
@@ -1311,10 +1335,14 @@ class FlinksWebhookAndTimeoutTests(TestCase):
         )()
 
         with patch.object(tasks.fetch_flinks_accounts_only, 'max_retries', 0), patch(
+            'banking.tasks.fetch_flinks_accounts_only.apply_async'
+        ) as scheduled, patch(
             'banking.tasks.requests.post',
             side_effect=[live_timeout, cached_auth, cached_detail],
         ):
             result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        scheduled.assert_not_called()
 
         self.assertTrue(result)
         self.customer.refresh_from_db()
@@ -1621,3 +1649,441 @@ class RepullPendingIbvCommandTests(TestCase):
         mocked.assert_called_once_with(str(self.connection.id))
         self.connection.refresh_from_db()
         self.assertTrue(self.connection.is_active)
+
+
+def _flinks_json_response(status_code, payload):
+    return type(
+        'Resp',
+        (),
+        {
+            'status_code': status_code,
+            'text': str(payload),
+            'json': lambda self, p=payload: p,
+        },
+    )()
+
+
+@override_settings(
+    CELERY_TASK_ALWAYS_EAGER=True,
+    EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend',
+)
+class FlinksGadAutoRepullTests(TestCase):
+    """Timeout / 202 / CARD_IN_USE trigger a fast same-LoginId GAD retry."""
+
+    def setUp(self):
+        from loans.models import Loan
+
+        self.login_id = str(uuid4())
+        self.user = User.objects.create_user(
+            email='auto-repull@example.com',
+            password='password123',
+            full_name='Auto Repull',
+            user_type='customer',
+        )
+        self.customer = Customer.objects.create(
+            portal_user=self.user,
+            first_name='Auto',
+            last_name='Repull',
+            email='auto-repull@example.com',
+            phone='4165550499',
+            phone_normalized='4165550499',
+            province='ON',
+            status='pending',
+            onboarding_stage='banking_verification',
+            banking_verified=False,
+        )
+        self.connection = BankConnection.objects.create(
+            customer=self.customer,
+            login_id=self.login_id,
+            provider='flinks',
+            is_active=True,
+            sync_status='pending',
+        )
+        Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal('300.00'),
+            fee=Decimal('60.00'),
+            total_amount=Decimal('360.00'),
+            balance=Decimal('360.00'),
+            status='ibv_pending',
+            is_active=True,
+        )
+
+    def test_gad_retry_countdown_grows_with_attempts(self):
+        self.assertEqual(tasks.gad_retry_countdown(1), 15)
+        self.assertEqual(tasks.gad_retry_countdown(2), 45)
+        self.assertEqual(tasks.gad_retry_countdown(5), 300)
+        self.assertEqual(tasks.gad_retry_countdown(9), 300)
+
+    def test_card_in_use_schedules_fast_repull_and_does_not_fail(self):
+        with patch('banking.tasks.fetch_flinks_accounts_only.apply_async') as scheduled, patch(
+            'banking.tasks.requests.post',
+            return_value=_flinks_json_response(
+                400,
+                {
+                    'HttpStatusCode': 400,
+                    'FlinksCode': 'CARD_IN_USE',
+                    'Message': 'Call still processing',
+                },
+            ),
+        ):
+            result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        self.assertFalse(result)
+        scheduled.assert_called_once_with(
+            args=[str(self.connection.id)],
+            countdown=15,
+        )
+        self.connection.refresh_from_db()
+        self.customer.refresh_from_db()
+        self.assertEqual(self.connection.sync_status, 'pending')
+        self.assertEqual(self.connection.attempted_syncs, 1)
+        self.assertIsNone(self.connection.last_synced_at)
+        self.assertFalse(self.customer.banking_verified)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_operation_pending_async_timeout_schedules_repull(self):
+        auth = _flinks_json_response(200, {'RequestId': 'req-pending'})
+        pending = _flinks_json_response(
+            202,
+            {
+                'HttpStatusCode': 202,
+                'FlinksCode': 'OPERATION_PENDING',
+                'Message': 'Your operation is still processing.',
+            },
+        )
+        with patch('banking.tasks.FLINKS_ASYNC_MAX_WAIT_SECONDS', 0), patch(
+            'banking.tasks.fetch_flinks_accounts_only.apply_async'
+        ) as scheduled, patch(
+            'banking.tasks._try_cached_flinks_detail',
+            return_value=False,
+        ), patch(
+            'banking.tasks.requests.post',
+            side_effect=[auth, pending],
+        ), patch(
+            'banking.tasks.requests.get',
+            return_value=pending,
+        ):
+            result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        self.assertFalse(result)
+        scheduled.assert_called_once_with(
+            args=[str(self.connection.id)],
+            countdown=15,
+        )
+        self.connection.refresh_from_db()
+        self.assertEqual(self.connection.sync_status, 'pending')
+        self.assertIsNone(self.connection.sync_error)
+        self.assertFalse(
+            ActivityHistory.objects.filter(
+                customer=self.customer,
+                title='Banking Verification Failed',
+            ).exists()
+        )
+
+    def test_invalid_login_still_marks_failed(self):
+        with patch('banking.tasks.fetch_flinks_accounts_only.apply_async') as scheduled, patch(
+            'banking.tasks.requests.post',
+            return_value=_flinks_json_response(
+                401,
+                {
+                    'HttpStatusCode': 401,
+                    'FlinksCode': 'INVALID_LOGIN',
+                    'Message': 'The loginId provided is invalid',
+                },
+            ),
+        ):
+            result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        self.assertFalse(result)
+        scheduled.assert_not_called()
+        self.connection.refresh_from_db()
+        self.assertEqual(self.connection.sync_status, 'failed')
+        self.assertFalse(self.customer.banking_verified)
+        self.assertTrue(
+            ActivityHistory.objects.filter(
+                customer=self.customer,
+                title='Banking Verification Failed',
+            ).exists()
+        )
+
+    def test_max_attempts_does_not_schedule_another_repull(self):
+        self.connection.attempted_syncs = tasks.FLINKS_GAD_MAX_ATTEMPTS
+        self.connection.save(update_fields=['attempted_syncs', 'updated_at'])
+
+        with patch('banking.tasks.fetch_flinks_accounts_only.apply_async') as scheduled, patch(
+            'banking.tasks.requests.post',
+            side_effect=requests.exceptions.ReadTimeout('Read timed out'),
+        ):
+            result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        self.assertFalse(result)
+        scheduled.assert_not_called()
+        self.connection.refresh_from_db()
+        self.assertEqual(
+            self.connection.attempted_syncs,
+            tasks.FLINKS_GAD_MAX_ATTEMPTS + 1,
+        )
+        self.assertEqual(self.connection.sync_status, 'pending')
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_zero_transactions_schedules_repull_instead_of_failing(self):
+        empty_payload = {
+            'Accounts': [
+                {
+                    'Id': 'acct-empty',
+                    'Title': 'KOHO',
+                    'Type': 'Chequing',
+                    'Currency': 'CAD',
+                    'InstitutionNumber': '003',
+                    'TransitNumber': '11111',
+                    'AccountNumber': '2222',
+                    'Transactions': [],
+                }
+            ]
+        }
+        with patch('banking.tasks.time.sleep'), patch(
+            'banking.tasks.fetch_flinks_accounts_only.apply_async'
+        ) as scheduled, patch(
+            'banking.tasks.requests.post',
+            side_effect=[
+                _flinks_json_response(200, {'RequestId': 'req-1'}),
+                _flinks_json_response(200, empty_payload),
+                _flinks_json_response(200, {'RequestId': 'req-2'}),
+                _flinks_json_response(200, empty_payload),
+                _flinks_json_response(200, {'RequestId': 'req-3'}),
+                _flinks_json_response(200, empty_payload),
+                _flinks_json_response(200, {'RequestId': 'req-4'}),
+                _flinks_json_response(200, empty_payload),
+            ],
+        ):
+            result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        self.assertFalse(result)
+        scheduled.assert_called_once_with(
+            args=[str(self.connection.id)],
+            countdown=15,
+        )
+        self.connection.refresh_from_db()
+        self.assertEqual(self.connection.sync_status, 'pending')
+        self.assertIsNone(self.connection.sync_error)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_safety_net_queues_empty_last_synced_at(self):
+        self.connection.attempted_syncs = 1
+        self.connection.sync_error = 'Flinks pull timed out; awaiting GetAccountsDetail webhook.'
+        self.connection.save(update_fields=['attempted_syncs', 'sync_error', 'updated_at'])
+        BankConnection.objects.filter(id=self.connection.id).update(
+            updated_at=timezone.now() - timedelta(minutes=3),
+        )
+        self.connection.refresh_from_db()
+
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            result = tasks.repull_recent_unsynced_ibv()
+
+        self.assertEqual(result['queued'], 1)
+        mocked.assert_called_once_with(str(self.connection.id))
+
+    def test_safety_net_skips_fresh_updated_row(self):
+        self.connection.attempted_syncs = 1
+        self.connection.save(update_fields=['attempted_syncs', 'updated_at'])
+
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            result = tasks.repull_recent_unsynced_ibv()
+
+        self.assertEqual(result['queued'], 0)
+        mocked.assert_not_called()
+
+    def test_safety_net_skips_mfa_challenge(self):
+        self.connection.attempted_syncs = 1
+        self.connection.sync_error = (
+            'Flinks pull timed out; awaiting GetAccountsDetail webhook. '
+            '({"HttpStatusCode":203,"SecurityChallenges":[{"Type":"SMS"}]})'
+        )
+        self.connection.save(update_fields=['attempted_syncs', 'sync_error', 'updated_at'])
+        BankConnection.objects.filter(id=self.connection.id).update(
+            updated_at=timezone.now() - timedelta(minutes=3),
+        )
+        self.connection.refresh_from_db()
+
+        self.assertEqual(tasks.unsynced_ibv_safety_net_targets(), [])
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            result = tasks.repull_recent_unsynced_ibv()
+        self.assertEqual(result['queued'], 0)
+        mocked.assert_not_called()
+
+    def test_safety_net_skips_verified_synced(self):
+        self.customer.banking_verified = True
+        self.customer.save(update_fields=['banking_verified', 'updated_at'])
+        self.connection.sync_status = 'synced'
+        self.connection.last_synced_at = timezone.now()
+        self.connection.save(update_fields=['sync_status', 'last_synced_at', 'updated_at'])
+
+        self.assertEqual(tasks.unsynced_ibv_safety_net_targets(), [])
+
+    def test_portal_status_exposes_attempted_syncs(self):
+        self.connection.attempted_syncs = 2
+        self.connection.save(update_fields=['attempted_syncs', 'updated_at'])
+        client = APIClient()
+        client.force_authenticate(user=self.user)
+        response = client.get('/api/portal/me/banking/')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['attempted_syncs'], 2)
+
+    def test_safety_net_restarts_login_id_older_than_thirty_minutes(self):
+        self.connection.attempted_syncs = 1
+        self.connection.sync_error = 'Flinks pull timed out; awaiting GetAccountsDetail webhook.'
+        self.connection.save(update_fields=['attempted_syncs', 'sync_error', 'updated_at'])
+        BankConnection.objects.filter(id=self.connection.id).update(
+            created_at=timezone.now() - timedelta(hours=6),
+            updated_at=timezone.now() - timedelta(minutes=3),
+        )
+        self.connection.refresh_from_db()
+
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            result = tasks.repull_recent_unsynced_ibv()
+
+        self.assertEqual(result['queued'], 1)
+        mocked.assert_called_once_with(str(self.connection.id))
+
+    def test_safety_net_restarts_again_after_fast_attempts_exhausted(self):
+        self.connection.attempted_syncs = tasks.FLINKS_GAD_MAX_ATTEMPTS
+        self.connection.sync_status = 'failed'
+        self.connection.sync_error = 'Failed to fetch accounts from Flinks'
+        self.connection.save(
+            update_fields=['attempted_syncs', 'sync_status', 'sync_error', 'updated_at']
+        )
+        BankConnection.objects.filter(id=self.connection.id).update(
+            updated_at=timezone.now() - timedelta(minutes=3),
+        )
+        self.connection.refresh_from_db()
+
+        self.assertTrue(
+            tasks.should_schedule_gad_repull(self.connection, automated=True)
+        )
+        self.assertFalse(tasks.should_schedule_gad_repull(self.connection))
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            result = tasks.repull_recent_unsynced_ibv()
+        self.assertEqual(result['queued'], 1)
+        mocked.assert_called_once_with(str(self.connection.id))
+
+    def test_empty_login_id_cannot_be_repulled(self):
+        self.connection.login_id = ''
+        self.connection.save(update_fields=['login_id', 'updated_at'])
+        self.assertFalse(tasks.should_schedule_gad_repull(self.connection))
+        self.assertFalse(
+            tasks.should_schedule_gad_repull(self.connection, automated=True)
+        )
+        BankConnection.objects.filter(id=self.connection.id).update(
+            updated_at=timezone.now() - timedelta(minutes=3),
+        )
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            result = tasks.repull_recent_unsynced_ibv()
+        self.assertEqual(result['queued'], 0)
+        mocked.assert_not_called()
+
+    def test_safety_net_skips_invalid_login(self):
+        self.connection.attempted_syncs = 1
+        self.connection.sync_status = 'failed'
+        self.connection.sync_error = '{"FlinksCode":"INVALID_LOGIN"}'
+        self.connection.save(
+            update_fields=['attempted_syncs', 'sync_status', 'sync_error', 'updated_at']
+        )
+        BankConnection.objects.filter(id=self.connection.id).update(
+            updated_at=timezone.now() - timedelta(minutes=3),
+        )
+        self.connection.refresh_from_db()
+        self.assertEqual(tasks.unsynced_ibv_safety_net_targets(), [])
+
+    def test_arrive_customer_is_included_in_automated_repull(self):
+        self.customer.source = 'arrive'
+        self.customer.arrive_application_id = 'arr-app-1'
+        self.customer.save(
+            update_fields=['source', 'arrive_application_id', 'updated_at']
+        )
+        self.connection.attempted_syncs = 1
+        self.connection.sync_error = 'Flinks pull timed out; awaiting GetAccountsDetail webhook.'
+        self.connection.save(update_fields=['attempted_syncs', 'sync_error', 'updated_at'])
+        BankConnection.objects.filter(id=self.connection.id).update(
+            updated_at=timezone.now() - timedelta(minutes=3),
+        )
+
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            result = tasks.repull_recent_unsynced_ibv()
+
+        self.assertEqual(result['queued'], 1)
+        mocked.assert_called_once_with(str(self.connection.id))
+
+    def test_auto_repull_uses_same_queue_path_as_staff_button(self):
+        self.connection.is_active = False
+        self.connection.sync_status = 'failed'
+        self.connection.sync_error = 'Read timed out'
+        self.connection.attempted_syncs = 1
+        self.connection.save(
+            update_fields=[
+                'is_active',
+                'sync_status',
+                'sync_error',
+                'attempted_syncs',
+                'updated_at',
+            ]
+        )
+
+        with patch('banking.tasks.fetch_flinks_accounts_only.apply_async') as scheduled, patch(
+            'banking.tasks.fetch_flinks_accounts_only.delay'
+        ) as delayed:
+            queued = tasks.schedule_flinks_gad_repull(
+                self.connection, trigger='Read timed out'
+            )
+
+        self.assertTrue(queued)
+        delayed.assert_not_called()
+        scheduled.assert_called_once_with(
+            args=[str(self.connection.id)],
+            countdown=15,
+        )
+        self.connection.refresh_from_db()
+        self.assertTrue(self.connection.is_active)
+        self.assertEqual(self.connection.sync_status, 'pending')
+        self.assertIsNone(self.connection.sync_error)
+        activity = ActivityHistory.objects.get(
+            customer=self.customer,
+            title='IBV Re-pull Started',
+        )
+        self.assertEqual(activity.created_by, 'system')
+        self.assertTrue(activity.metadata.get('automated'))
+        self.assertIn('Read timed out', activity.metadata.get('trigger'))
+
+    def test_auto_repull_runs_inline_when_broker_publish_fails(self):
+        with patch(
+            'banking.tasks.fetch_flinks_accounts_only.apply_async',
+            side_effect=OSError('Connection reset by peer'),
+        ), patch('banking.tasks.fetch_flinks_accounts_only.delay') as delayed, patch(
+            'banking.tasks.fetch_flinks_accounts_only.apply'
+        ) as applied:
+            queued = tasks.schedule_flinks_gad_repull(
+                self.connection, trigger='Read timed out'
+            )
+
+        self.assertTrue(queued)
+        delayed.assert_not_called()
+        applied.assert_called_once_with(args=[str(self.connection.id)])
+
+    def test_empty_accounts_schedules_repull_instead_of_failing(self):
+        with patch('banking.tasks.fetch_flinks_accounts_only.apply_async') as scheduled, patch(
+            'banking.tasks.requests.post',
+            side_effect=[
+                _flinks_json_response(200, {'RequestId': 'req-empty'}),
+                _flinks_json_response(200, {'Accounts': []}),
+            ],
+        ):
+            result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        self.assertFalse(result)
+        scheduled.assert_called_once_with(
+            args=[str(self.connection.id)],
+            countdown=15,
+        )
+        self.connection.refresh_from_db()
+        self.assertEqual(self.connection.sync_status, 'pending')
+        self.assertEqual(len(mail.outbox), 0)

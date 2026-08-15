@@ -5,6 +5,7 @@ import requests
 from celery import shared_task
 from django.conf import settings
 from django.db import transaction
+from django.db.models import F
 from django.utils.timezone import now
 
 from .constants import (
@@ -26,6 +27,32 @@ FLINKS_MOST_RECENT_CACHED = False
 FLINKS_HTTP_TIMEOUT = 60
 FLINKS_ZERO_TX_RETRIES = 3
 FLINKS_ZERO_TX_RETRY_SECONDS = 5
+# Fast GAD re-pull after the errors that mean "LoginId is valid, data not ready yet"
+# (large IBV / live aggregation). First retry is 15s so the contract can unlock
+# without waiting on a 30-minute beat. See Flinks OPERATION_PENDING / DISPATCHED.
+FLINKS_GAD_MAX_ATTEMPTS = 5
+# Fast countdown stops at 5. The 5-minute beat keeps restarting the same
+# LoginId after that so ops do not run a daily script.
+FLINKS_GAD_AUTOMATED_MAX_ATTEMPTS = 36
+FLINKS_GAD_RETRY_COUNTDOWNS = (15, 45, 90, 180, 300)
+FLINKS_TRANSIENT_CODES = frozenset({
+    'OPERATION_PENDING',
+    'OPERATION_DISPATCHED',
+    'CARD_IN_USE',
+    'RETRY_LATER',
+    'CONCURRENT_SESSION',
+})
+FLINKS_TERMINAL_CODES = frozenset({
+    'INVALID_LOGIN',
+    'INVALID_PASSWORD',
+    'INVALID_USERNAME',
+    'DISABLED_LOGIN',
+    'DISABLED_INSTITUTION',
+    'NEW_ACCOUNT',
+    'INVALID_SECURITY_RESPONSE',
+    'INVALID_SECURITY_RESPONSE_NO_RETRY',
+})
+FLINKS_GAD_SAFETY_NET_MIN_AGE_SECONDS = 120
 ZERO_TRANSACTIONS_MESSAGE = (
     'We could not retrieve transaction history from your bank account. '
     'Please reconnect your bank account.'
@@ -193,6 +220,123 @@ def _is_transient_flinks_transport_error(exc) -> bool:
     return 'timed out' in text or 'timeout' in text or 'connection reset' in text
 
 
+def _extract_flinks_code(payload) -> str:
+    if not isinstance(payload, dict):
+        return ''
+    for key in ('FlinksCode', 'flinksCode', 'Code'):
+        value = payload.get(key)
+        if value:
+            return str(value).strip().upper()
+    return ''
+
+
+def _flinks_code_from_response(response) -> str:
+    if response is None:
+        return ''
+    try:
+        body = response.json()
+    except Exception:
+        return ''
+    return _extract_flinks_code(body)
+
+
+def _is_transient_flinks_api_error(response) -> bool:
+    """Flinks codes that mean the LoginId is valid but aggregation is still running."""
+    if response is None:
+        return False
+    if getattr(response, 'status_code', None) == 202:
+        return True
+    return _flinks_code_from_response(response) in FLINKS_TRANSIENT_CODES
+
+
+def _is_mfa_awaiting_error(sync_error: str) -> bool:
+    """203 / SecurityChallenges cannot be completed by a server-side GAD re-pull."""
+    text = sync_error or ''
+    compact = text.lower().replace('_', '').replace(' ', '')
+    return 'securitychallenge' in compact or 'security challenge' in text.lower()
+
+
+def _is_terminal_flinks_failure(reason: str) -> bool:
+    """Credential / institution errors — restarting GAD cannot create a LoginId."""
+    text = (reason or '').upper()
+    return any(code in text for code in FLINKS_TERMINAL_CODES)
+
+
+def gad_retry_countdown(attempted_syncs: int) -> int:
+    """Seconds to wait before the next GAD pull after a transient failure."""
+    if attempted_syncs < 1:
+        return FLINKS_GAD_RETRY_COUNTDOWNS[0]
+    index = min(attempted_syncs - 1, len(FLINKS_GAD_RETRY_COUNTDOWNS) - 1)
+    return FLINKS_GAD_RETRY_COUNTDOWNS[index]
+
+
+def should_schedule_gad_repull(connection, *, automated=False) -> bool:
+    if connection.provider != 'flinks':
+        return False
+    if not str(connection.login_id or '').strip():
+        return False
+    customer = getattr(connection, 'customer', None)
+    if customer is not None and customer.banking_verified and connection.sync_status == 'synced':
+        return False
+    if connection.last_synced_at is not None and connection.sync_status == 'synced':
+        return False
+    if _is_mfa_awaiting_error(connection.sync_error or ''):
+        return False
+    if _is_terminal_flinks_failure(connection.sync_error or ''):
+        return False
+    cap = FLINKS_GAD_AUTOMATED_MAX_ATTEMPTS if automated else FLINKS_GAD_MAX_ATTEMPTS
+    return (connection.attempted_syncs or 0) < cap
+
+
+def schedule_flinks_gad_repull(connection, *, trigger: str) -> bool:
+    """Same GAD restart as the staff IBV Re-pull button, after a short delay."""
+    if not should_schedule_gad_repull(connection):
+        logger.info(
+            'Flinks GAD auto-repull skipped connection_id=%s trigger=%s attempts=%s',
+            connection.id,
+            trigger,
+            connection.attempted_syncs,
+        )
+        return False
+
+    countdown = gad_retry_countdown(connection.attempted_syncs)
+    try:
+        queue_flinks_gad_repull(
+            connection,
+            countdown=countdown,
+            trigger=trigger,
+            allow_inline_fallback=True,
+        )
+    except ValueError:
+        return False
+    return True
+
+
+def unsynced_ibv_safety_net_targets(*, now_value=None):
+    """Flinks connections that have a LoginId and still need IBV.
+
+    Replaces a daily ops script: every 5 minutes, restart GAD when the first
+    pull failed. Rows with no LoginId cannot be re-pulled (frontend listener).
+    """
+    from datetime import timedelta
+
+    now_value = now_value or now()
+    updated_before = now_value - timedelta(seconds=FLINKS_GAD_SAFETY_NET_MIN_AGE_SECONDS)
+
+    targets = []
+    for connection in pending_ibv_repull_targets():
+        if not str(connection.login_id or '').strip():
+            continue
+        if connection.last_synced_at is not None and connection.sync_status == 'synced':
+            continue
+        if connection.updated_at and connection.updated_at > updated_before:
+            continue
+        if not should_schedule_gad_repull(connection, automated=True):
+            continue
+        targets.append(connection)
+    return targets
+
+
 def _mark_awaiting_flinks_webhook(connection, reason: str) -> None:
     """Keep IBV open after a pull timeout so webhook / Mohawk can complete it."""
     message = (
@@ -336,11 +480,10 @@ def _recover_ibv_without_live_pull(
     _mark_awaiting_flinks_webhook(connection, reason)
     if not retry_live:
         return False
-    max_retries = task.max_retries if task.max_retries is not None else 3
-    retries = getattr(getattr(task, 'request', None), 'retries', 0) or 0
-    if retries >= max_retries:
-        return False
-    raise
+    # Fast same-LoginId GAD retry. Celery autoretry is not used here so we
+    # can key off attempted_syncs and the actual Flinks trigger.
+    schedule_flinks_gad_repull(connection, trigger=reason)
+    return False
 
 
 def _handle_flinks_transport_error(
@@ -388,6 +531,9 @@ def apply_flinks_accounts_detail(connection, accounts_json) -> bool:
 def pending_ibv_repull_targets(*, since=None, customer_id=None, include_syncing=False):
     """Latest Flinks LoginId per customer that still needs IBV.
 
+    Includes Arrive and landing-page customers — source is not filtered.
+    Arrive is only the embed channel; GAD still uses the stored Flinks LoginId.
+
     Includes failed / pending (and inactive post-reapply) connections. Skips
     verified+synced and manual void-cheque rows. Currently ``syncing`` rows are
     skipped unless ``include_syncing`` so we do not double-queue a live pull.
@@ -425,14 +571,23 @@ def pending_ibv_repull_targets(*, since=None, customer_id=None, include_syncing=
     return targets
 
 
-def queue_flinks_gad_repull(connection, *, user=None, inline=False):
+def queue_flinks_gad_repull(
+    connection,
+    *,
+    user=None,
+    inline=False,
+    countdown=0,
+    trigger=None,
+    allow_inline_fallback=False,
+):
     """Re-queue Authorize + GetAccountsDetail for an existing Flinks LoginId.
 
-    Used when a prior pull failed or timed out — Flinks Connect does not need
-    to run again; the stored LoginId is enough to restart GAD.
+    Staff IBV Re-pull and automated retry share this path so both reactivate
+    the connection, clear the last error, and run the same GAD task.
 
     ``inline=True`` runs the pull in-process (Heroku one-off dynos cannot
-    always publish to Redis).
+    always publish to Redis). ``allow_inline_fallback`` does the same when
+    the broker publish fails (common on the worker after a Flinks timeout).
     """
     if connection.provider != 'flinks':
         raise ValueError('Only Flinks connections support GetAccountsDetail re-pull.')
@@ -452,10 +607,30 @@ def queue_flinks_gad_repull(connection, *, user=None, inline=False):
         update_fields=['is_active', 'sync_status', 'sync_error', 'updated_at']
     )
 
+    queued = False
     if inline:
         fetch_flinks_accounts_only.apply(args=[str(connection.id)])
+        queued = True
     else:
-        fetch_flinks_accounts_only.delay(str(connection.id))
+        try:
+            if countdown and int(countdown) > 0:
+                fetch_flinks_accounts_only.apply_async(
+                    args=[str(connection.id)],
+                    countdown=int(countdown),
+                )
+            else:
+                fetch_flinks_accounts_only.delay(str(connection.id))
+            queued = True
+        except Exception:
+            if not allow_inline_fallback:
+                raise
+            logger.exception(
+                'Flinks GAD re-pull broker publish failed; running inline '
+                'connection_id=%s',
+                connection.id,
+            )
+            fetch_flinks_accounts_only.apply(args=[str(connection.id)])
+            queued = True
 
     actor = 'system'
     if user is not None:
@@ -464,18 +639,25 @@ def queue_flinks_gad_repull(connection, *, user=None, inline=False):
     try:
         from activity.models import ActivityHistory
 
+        description = (
+            'GetAccountsDetail re-pull queued for the existing Flinks LoginId.'
+        )
+        if trigger:
+            description = f'{description} ({str(trigger)[:180]})'
+
         ActivityHistory.objects.create(
             customer=customer,
             type='system',
             title='IBV Re-pull Started',
-            description=(
-                'GetAccountsDetail re-pull queued for the existing Flinks LoginId.'
-            ),
+            description=description,
             created_by=actor,
             metadata={
                 'action': 'flinks_gad_repull',
                 'connection_id': str(connection.id),
                 'login_id': str(connection.login_id),
+                'automated': user is None,
+                'trigger': (str(trigger)[:200] if trigger else ''),
+                'queued': queued,
             },
         )
     except Exception:
@@ -493,6 +675,34 @@ def queue_flinks_gad_repull(connection, *, user=None, inline=False):
         actor,
     )
     return connection
+
+
+@shared_task
+def repull_recent_unsynced_ibv():
+    """Safety net every few minutes: LoginId present, last_synced_at empty.
+
+    The contract-critical path is the 15s countdown on timeout / 202 / CARD_IN_USE.
+    This only catches rows whose fast retry was lost (e.g. Redis publish failed).
+    """
+    queued = 0
+    skipped = 0
+    for connection in unsynced_ibv_safety_net_targets():
+        try:
+            queue_flinks_gad_repull(
+                connection,
+                trigger='safety_net',
+                allow_inline_fallback=True,
+            )
+        except ValueError:
+            skipped += 1
+            continue
+        queued += 1
+    logger.info(
+        'Flinks GAD safety-net queued=%s skipped=%s',
+        queued,
+        skipped,
+    )
+    return {'queued': queued, 'skipped': skipped}
 
 
 def _delete_unsupported_banking_connection(connection, customer, reason, institutions):
@@ -705,9 +915,13 @@ def fetch_flinks_accounts_only(self, connection_id):
         mask_identifier(login_id),
         getattr(self.request, 'id', None),
     )
-    connection.sync_status = 'syncing'
-    connection.sync_error = None
-    connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
+    BankConnection.objects.filter(id=connection.id).update(
+        sync_status='syncing',
+        sync_error=None,
+        attempted_syncs=F('attempted_syncs') + 1,
+        updated_at=now(),
+    )
+    connection.refresh_from_db()
 
     from accounts.models import GlobalSetting
 
@@ -774,9 +988,22 @@ def fetch_flinks_accounts_only(self, connection_id):
                 connection.id,
                 mask_identifier(request_id),
             )
-            return _poll_get_accounts_detail_async(instance, customer_id, request_id, headers)
+            polled = _poll_get_accounts_detail_async(
+                instance, customer_id, request_id, headers
+            )
+            return polled if polled is not None else 'TRANSIENT'
         if _is_flinks_security_challenge(acct_resp):
             return 'SECURITY_CHALLENGE'
+        if _is_transient_flinks_api_error(acct_resp):
+            logger.warning(
+                'Flinks GetAccountsDetail transient customer_id=%s connection_id=%s '
+                'status=%s code=%s',
+                customer.id,
+                connection.id,
+                acct_resp.status_code,
+                _flinks_code_from_response(acct_resp),
+            )
+            return 'TRANSIENT'
         logger.error(
             'Flinks GetAccountsDetail failed customer_id=%s connection_id=%s status=%s body=%s',
             customer.id,
@@ -784,7 +1011,7 @@ def fetch_flinks_accounts_only(self, connection_id):
             acct_resp.status_code,
             acct_resp.text,
         )
-        return None
+        return 'FAILED'
 
     try:
         auth_resp = _authorize()
@@ -825,6 +1052,18 @@ def fetch_flinks_accounts_only(self, connection_id):
             retry_live=False,
         )
     if auth_resp.status_code != 200:
+        if _is_transient_flinks_api_error(auth_resp):
+            return _recover_ibv_without_live_pull(
+                self,
+                connection,
+                customer,
+                auth_resp.text,
+                instance=instance,
+                flinks_customer_id=customer_id,
+                headers=headers,
+                login_id=login_id,
+                retry_live=True,
+            )
         return _mark_banking_failed(connection, customer, auth_resp.text)
 
     request_id = auth_resp.json().get('RequestId')
@@ -871,11 +1110,36 @@ def fetch_flinks_accounts_only(self, connection_id):
             login_id=login_id,
             retry_live=False,
         )
-    if not accounts_json:
+    if accounts_json == 'TRANSIENT':
+        return _recover_ibv_without_live_pull(
+            self,
+            connection,
+            customer,
+            'OPERATION_PENDING: GetAccountsDetail still processing for a large IBV.',
+            instance=instance,
+            flinks_customer_id=customer_id,
+            headers=headers,
+            login_id=login_id,
+            retry_live=True,
+        )
+    if accounts_json == 'FAILED' or not accounts_json:
+        if connection.attempted_syncs < FLINKS_GAD_MAX_ATTEMPTS:
+            _mark_awaiting_flinks_webhook(
+                connection,
+                'Failed to fetch accounts from Flinks',
+            )
+            schedule_flinks_gad_repull(
+                connection, trigger='FAILED_GET_ACCOUNTS_DETAIL'
+            )
+            return False
         return _mark_banking_failed(connection, customer, 'Failed to fetch accounts from Flinks')
 
     accounts_data = accounts_json.get('Accounts') or []
     if not accounts_data:
+        if connection.attempted_syncs < FLINKS_GAD_MAX_ATTEMPTS:
+            _mark_awaiting_flinks_webhook(connection, NO_ACCOUNTS_MESSAGE)
+            schedule_flinks_gad_repull(connection, trigger='NO_ACCOUNTS')
+            return False
         return _mark_banking_failed(connection, customer, NO_ACCOUNTS_MESSAGE)
 
     total_transactions = _count_transactions(accounts_data)
@@ -914,7 +1178,7 @@ def fetch_flinks_accounts_only(self, connection_id):
                 connection.id,
             )
             continue
-        if not accounts_json:
+        if not isinstance(accounts_json, dict):
             continue
         accounts_data = accounts_json.get('Accounts') or accounts_data
         total_transactions = _count_transactions(accounts_data)
@@ -927,4 +1191,11 @@ def fetch_flinks_accounts_only(self, connection_id):
 
     # 621/623/703 are persisted like any other bank. Agents may decline with
     # "Unsupported bank"; funding UI shows a non-blocking risk warning.
+    if total_transactions == 0 and connection.attempted_syncs < FLINKS_GAD_MAX_ATTEMPTS:
+        _mark_awaiting_flinks_webhook(
+            connection,
+            'NO_TRANSACTION: Flinks returned accounts before history was ready.',
+        )
+        schedule_flinks_gad_repull(connection, trigger='NO_TRANSACTION')
+        return False
     return apply_flinks_accounts_detail(connection, {'Accounts': accounts_data})

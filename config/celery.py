@@ -49,6 +49,13 @@ app.conf.beat_schedule = {
         'task': 'communications.tasks.poll_inbound_email',
         'schedule': crontab(minute='*/5'),
     },
+
+    # Automated GAD restart when LoginId is present and IBV is still open.
+    # Fast 15s retry runs on the pull error; this beat keeps restarting after that.
+    'repull-recent-unsynced-ibv': {
+        'task': 'banking.tasks.repull_recent_unsynced_ibv',
+        'schedule': crontab(minute='*/5'),
+    },
     
     # Check for expired contracts daily at midnight
     'check-expired-contracts': {

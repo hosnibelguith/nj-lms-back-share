@@ -91,6 +91,7 @@ class BankConnectionSerializer(serializers.ModelSerializer):
             'sync_status',
             'sync_error',
             'last_synced_at',
+            'attempted_syncs',
             'created_at',
             'accounts',
         ]
@@ -108,6 +109,7 @@ class CustomerPortalBankingStatusSerializer(serializers.Serializer):
     has_connection = serializers.BooleanField()
     connection_status = serializers.CharField(allow_null=True)
     last_synced_at = serializers.DateTimeField(allow_null=True)
+    attempted_syncs = serializers.IntegerField(required=False)
     account_count = serializers.IntegerField()
     failure_message = serializers.CharField(allow_null=True, required=False)
     failure_reason_code = serializers.CharField(allow_null=True, required=False)
