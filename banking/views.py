@@ -14,6 +14,7 @@ from activity.models import ActivityHistory
 
 from .logging_utils import mask_identifier
 from .models import BankConnection, BankAccount, BankTransaction, FinancialAnalysisReport
+from .repair import apply_synced_ibv_repair, find_repairable_synced_ibv
 from .serializers import (
     BankConnectionSerializer,
     BankAccountSerializer,
@@ -137,6 +138,21 @@ class ConnectBankView(CustomerPortalBaseView):
             customer.id,
             mask_identifier(login_id),
         )
+
+        existing_ibv_plan = find_repairable_synced_ibv(customer, login_id=login_id)
+        if existing_ibv_plan is not None:
+            result = apply_synced_ibv_repair(existing_ibv_plan)
+            logger.info(
+                'Flinks connect restored existing synced IBV customer_id=%s '
+                'connection_id=%s loan_id=%s',
+                customer.id,
+                result.restored_connection_id,
+                result.loan_id,
+            )
+            return Response({
+                "message": "Banking verification completed.",
+                "status": "COMPLETED",
+            }, status=status.HTTP_200_OK)
         
         BankConnection.objects.filter(customer=customer, is_active=True).update(is_active=False)
 

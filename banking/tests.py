@@ -15,6 +15,7 @@ from accounts.models import Customer, User
 from activity.models import ActivityHistory
 from banking.models import BankAccount, BankConnection, BankTransaction
 from banking import tasks
+from loans.models import Loan
 
 
 @override_settings(
@@ -86,6 +87,138 @@ class BankingConnectTests(TestCase):
         connection_b = BankConnection.objects.get(customer=self.customer_b)
         mocked_a.assert_called_once_with(str(connection_a.id))
         mocked_b.assert_called_once_with(str(connection_b.id))
+
+    def test_connect_reuses_existing_synced_ibv_for_same_login(self):
+        loan = Loan.objects.create(
+            customer=self.customer_a,
+            principal=500,
+            fee=100,
+            total_amount=600,
+            balance=600,
+            status='ibv_pending',
+            is_active=True,
+        )
+        old_connection = BankConnection.objects.create(
+            customer=self.customer_a,
+            login_id=self.login_id,
+            provider='flinks',
+            is_active=False,
+            sync_status='synced',
+            last_synced_at=timezone.now(),
+        )
+        account = BankAccount.objects.create(
+            customer=self.customer_a,
+            connection=old_connection,
+            external_id='acct-1',
+            name='Primary Checking',
+            type='checking',
+            balance=100,
+            is_primary=True,
+        )
+        BankTransaction.objects.create(
+            customer=self.customer_a,
+            account=account,
+            external_id='tx-1',
+            date=timezone.localdate(),
+            description='Payroll',
+            credit=100,
+            balance=100,
+        )
+        empty_connection = BankConnection.objects.create(
+            customer=self.customer_a,
+            login_id=self.login_id,
+            provider='flinks',
+            is_active=True,
+            sync_status='failed',
+        )
+
+        self.client.force_authenticate(user=self.user_a)
+        with patch('banking.views.fetch_flinks_accounts_only.delay') as mocked:
+            response = self.client.post(
+                '/api/banking/connect/',
+                {'login_id': self.login_id},
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['status'], 'COMPLETED')
+        mocked.assert_not_called()
+        old_connection.refresh_from_db()
+        empty_connection.refresh_from_db()
+        self.customer_a.refresh_from_db()
+        loan.refresh_from_db()
+        self.assertTrue(old_connection.is_active)
+        self.assertFalse(empty_connection.is_active)
+        self.assertTrue(self.customer_a.banking_verified)
+        self.assertEqual(self.customer_a.onboarding_stage, 'contract')
+        self.assertEqual(loan.status, 'pending_signature')
+        self.assertEqual(loan.bank_account_id, account.id)
+        self.assertTrue(
+            ActivityHistory.objects.filter(
+                customer=self.customer_a,
+                loan=loan,
+                title='IBV Data Restored',
+            ).exists()
+        )
+
+    def test_repair_command_restores_expired_loan_with_existing_ibv(self):
+        loan = Loan.objects.create(
+            customer=self.customer_a,
+            principal=500,
+            fee=100,
+            total_amount=600,
+            balance=600,
+            status='expired',
+            is_active=False,
+        )
+        connection = BankConnection.objects.create(
+            customer=self.customer_a,
+            login_id=self.login_id,
+            provider='flinks',
+            is_active=False,
+            sync_status='synced',
+            last_synced_at=timezone.now(),
+        )
+        account = BankAccount.objects.create(
+            customer=self.customer_a,
+            connection=connection,
+            external_id='acct-expired',
+            name='Expired Checking',
+            type='checking',
+            balance=100,
+            is_primary=True,
+        )
+        BankTransaction.objects.create(
+            customer=self.customer_a,
+            account=account,
+            external_id='tx-expired',
+            date=timezone.localdate(),
+            description='Payroll',
+            credit=100,
+            balance=100,
+        )
+
+        out = StringIO()
+        call_command(
+            'repair_synced_ibv',
+            '--source',
+            'all',
+            '--email',
+            self.customer_a.email,
+            '--apply',
+            stdout=out,
+        )
+
+        self.assertIn('Repaired 1 customer(s)', out.getvalue())
+        connection.refresh_from_db()
+        self.customer_a.refresh_from_db()
+        loan.refresh_from_db()
+        self.assertTrue(connection.is_active)
+        self.assertTrue(self.customer_a.banking_verified)
+        self.assertEqual(self.customer_a.onboarding_stage, 'contract')
+        self.assertEqual(loan.status, 'pending_signature')
+        self.assertTrue(loan.is_active)
+        self.assertEqual(loan.bank_account_id, account.id)
 
     def test_reset_pending_connection_allows_reconnect(self):
         connection = BankConnection.objects.create(
