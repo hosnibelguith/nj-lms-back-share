@@ -186,13 +186,21 @@ def _assert_identity_compatible(
     arrive_application_id: str,
     zum_user_id: str,
 ) -> None:
-    if customer.arrive_application_id and customer.arrive_application_id != arrive_application_id:
-        raise ArriveIdentityConflict(
-            "Email or phone is already linked to a different Arrive application.",
-        )
     if customer.arrive_zum_user_id and customer.arrive_zum_user_id != zum_user_id:
         raise ArriveIdentityConflict(
             "Email or phone is already linked to a different Zum user.",
+        )
+    if customer.arrive_application_id and customer.arrive_application_id != arrive_application_id:
+        has_blocking_application = customer.loans.filter(
+            status__in=LoanService.BLOCKING_APPLICATION_STATUSES,
+        ).exists()
+        has_terminal_application = customer.loans.filter(
+            status__in=["human_declined", "expired"],
+        ).exists()
+        if customer.arrive_zum_user_id == zum_user_id and has_terminal_application and not has_blocking_application:
+            return
+        raise ArriveIdentityConflict(
+            "Email or phone is already linked to a different Arrive application.",
         )
 
 
@@ -402,6 +410,8 @@ def resume_portal_session(
 
 
 def _decline_reasons(loan: Loan) -> list[str]:
+    if loan.status == "expired":
+        return ["expired"]
     reason = (loan.decline_reason or "").strip()
     if not reason:
         return ["Application declined."]

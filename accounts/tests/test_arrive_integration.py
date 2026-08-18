@@ -84,6 +84,77 @@ class ArriveIntegrationTests(TestCase):
         self.assertEqual(Customer.objects.filter(email="arrive.customer@example.com").count(), 1)
         self.assertEqual(Loan.objects.filter(customer=customer).count(), 1)
 
+    def test_terminal_customer_can_start_new_arrive_application_same_zum_user(self):
+        first = self.client.post(
+            "/api/integrations/arrive/leads/",
+            self._lead_payload(),
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(first.status_code, 201)
+        first_body = first.json()
+
+        customer = Customer.objects.get(email="arrive.customer@example.com")
+        first_loan = Loan.objects.get(id=first_body["loan_id"])
+        first_loan.status = "human_declined"
+        first_loan.is_active = False
+        first_loan.declined_at = timezone.now()
+        first_loan.decline_reason = "Wrong bank account selected."
+        first_loan.save(
+            update_fields=[
+                "status",
+                "is_active",
+                "declined_at",
+                "decline_reason",
+                "updated_at",
+            ]
+        )
+
+        second = self.client.post(
+            "/api/integrations/arrive/leads/",
+            self._lead_payload(
+                event_id="a1b2c3d4-e5f6-7890-abcd-ef1234567891",
+                arrive_application_id="arrive-application-uuid-2",
+            ),
+            format="json",
+            **self.headers,
+        )
+
+        self.assertEqual(second.status_code, 200, second.json())
+        second_body = second.json()
+        self.assertNotEqual(second_body["loan_id"], first_body["loan_id"])
+        self.assertEqual(second_body["arrive_application_id"], "arrive-application-uuid-2")
+        self.assertEqual(second_body["status"], "application_in_progress")
+
+        customer.refresh_from_db()
+        self.assertEqual(customer.arrive_application_id, "arrive-application-uuid-2")
+        self.assertEqual(customer.arrive_zum_user_id, "zum-user-1")
+        self.assertEqual(Loan.objects.filter(customer=customer).count(), 2)
+
+    def test_in_progress_customer_cannot_start_new_arrive_application_same_zum_user(self):
+        first = self.client.post(
+            "/api/integrations/arrive/leads/",
+            self._lead_payload(),
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(first.status_code, 201)
+
+        second = self.client.post(
+            "/api/integrations/arrive/leads/",
+            self._lead_payload(
+                event_id="a1b2c3d4-e5f6-7890-abcd-ef1234567891",
+                arrive_application_id="arrive-application-uuid-2",
+            ),
+            format="json",
+            **self.headers,
+        )
+
+        self.assertEqual(second.status_code, 409)
+        self.assertEqual(second.json()["code"], "identity_conflict")
+        customer = Customer.objects.get(email="arrive.customer@example.com")
+        self.assertEqual(Loan.objects.filter(customer=customer).count(), 1)
+
     def test_create_lead_requires_api_key(self):
         response = self.client.post(
             "/api/integrations/arrive/leads/",
@@ -157,6 +228,32 @@ class ArriveIntegrationTests(TestCase):
         self.assertEqual(payload["decision"], "declined")
         self.assertIsNone(payload["approved_amount"])
         self.assertEqual(len(payload["decline_reasons"]), 2)
+
+    def test_decision_payload_expired_reason(self):
+        user = User(email="expired@example.com", full_name="Expired", user_type="customer")
+        user.set_unusable_password()
+        user.save()
+        customer = Customer.objects.create(
+            portal_user=user,
+            first_name="Expired",
+            last_name="Customer",
+            email="expired@example.com",
+            phone="+14165550998",
+            phone_normalized="+14165550998",
+            source=Customer.SOURCE_ARRIVE,
+            arrive_application_id="app-expired",
+            arrive_zum_user_id="zum-expired",
+            requested_loan_amount=Decimal("500.00"),
+        )
+        loan = LoanService.create_initial_application(customer)
+        loan.status = "expired"
+        loan.is_active = False
+        loan.save(update_fields=["status", "is_active", "updated_at"])
+
+        payload = build_decision_payload(loan, decision="declined")
+
+        self.assertEqual(payload["decision"], "declined")
+        self.assertEqual(payload["decline_reasons"], ["expired"])
 
 
 @override_settings(

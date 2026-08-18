@@ -95,6 +95,9 @@ def _expire_ibv_application(loan, today) -> bool:
         new_status=loan.status,
         notes="IBV application expired after the reminder window.",
     )
+    from accounts.arrive_integration import queue_decision_webhook
+
+    queue_decision_webhook(loan, "declined")
 
     if not _workflow_reminder_already_sent_today(loan, template_name, today):
         template = CommunicationTemplate.objects.filter(

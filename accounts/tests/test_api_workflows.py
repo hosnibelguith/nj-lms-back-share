@@ -591,7 +591,11 @@ class BackendApiWorkflowTests(APITestCase):
         self.loan.refresh_from_db()
         self.assertEqual(self.loan.status, "expired")
 
-    def test_loan_workflow_reminders_expire_ibv_after_three_reminders_and_email(self):
+    @patch("accounts.arrive_integration.queue_decision_webhook")
+    def test_loan_workflow_reminders_expire_ibv_after_three_reminders_and_email(
+        self,
+        queue_decision_webhook,
+    ):
         CommunicationTemplate.objects.create(
             name="Application Expired Template",
             type="email",
@@ -628,6 +632,7 @@ class BackendApiWorkflowTests(APITestCase):
         self.assertEqual(result, {"ibv_sent": 0, "ibv_expired": 1, "signature_sent": 0})
         self.assertEqual(self.loan.status, "expired")
         self.assertFalse(self.loan.is_active)
+        queue_decision_webhook.assert_called_once_with(self.loan, "declined")
         self.assertEqual(
             self.loan.communications.filter(template_name="Application Expired Template").count(),
             1,
@@ -773,3 +778,32 @@ class StartNewApplicationTests(APITestCase):
         new_loan = Loan.objects.get(id=response.data["loan_id"])
         self.assertEqual(new_loan.status, "ibv_pending")
         self.assertEqual(self.customer.loans.count(), 2)
+
+    def test_start_new_application_preserves_arrive_customer_source(self):
+        self.customer.source = Customer.SOURCE_ARRIVE
+        self.customer.arrive_application_id = "arrive-app-123"
+        self.customer.arrive_zum_user_id = "zum-user-123"
+        self.customer.arrive_zum_user_card_id = "card-123"
+        self.customer.arrive_event_id = "event-123"
+        self.customer.save(
+            update_fields=[
+                "source",
+                "arrive_application_id",
+                "arrive_zum_user_id",
+                "arrive_zum_user_card_id",
+                "arrive_event_id",
+                "updated_at",
+            ]
+        )
+
+        response = self.client.post("/api/portal/me/start-new-application/", {}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+
+        self.customer.refresh_from_db()
+        new_loan = Loan.objects.get(id=response.data["loan_id"])
+        self.assertEqual(new_loan.customer, self.customer)
+        self.assertEqual(self.customer.source, Customer.SOURCE_ARRIVE)
+        self.assertEqual(self.customer.arrive_application_id, "arrive-app-123")
+        self.assertEqual(self.customer.arrive_zum_user_id, "zum-user-123")
+        self.assertEqual(self.customer.arrive_zum_user_card_id, "card-123")
+        self.assertEqual(self.customer.arrive_event_id, "event-123")
