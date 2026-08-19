@@ -1703,7 +1703,9 @@ class LoanService:
         dry_run: bool = True,
     ) -> dict:
         """Rebuild old generated collection-failure rows into capped fee buckets."""
-        loan = Loan.objects.select_for_update().select_related('formula').get(pk=loan.pk)
+        # Keep the row lock off nullable joins; Postgres rejects FOR UPDATE on
+        # the nullable side of an outer join.
+        loan = Loan.objects.select_for_update().get(pk=loan.pk)
         money = LoanService.money
         frequency_days = LoanService._schedule_frequency_days(loan)
 
