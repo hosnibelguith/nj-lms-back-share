@@ -711,6 +711,27 @@ def apply_collection_failure(collection: CollectionPayment, *, reason: str, stat
             update_fields.extend(["status", "is_active"])
         loan.save(update_fields=update_fields)
 
+    from .services import LoanService
+
+    fee_payment = LoanService.apply_collection_failure_fee(collection, reason=reason)
+    log_activity(
+        collection.loan,
+        "payment_failed",
+        "Collection Failure Fee Added",
+        (
+            f"Zūm collection failed: {reason or 'Unknown reason'}. "
+            "$50 collection failure fee and missed-payment recovery were appended after the schedule."
+        ),
+        metadata={
+            "collection_payment_id": str(collection.id),
+            "fee_payment_id": str(fee_payment.id) if fee_payment else None,
+            "failure_reason": reason,
+            "staff_alert": True,
+            "alert_kind": "collection_failure",
+            "is_resolved": False,
+        },
+    )
+
 
 def log_activity(loan: Loan, type_value: str, title: str, description: str, created_by="system", metadata=None):
     try:

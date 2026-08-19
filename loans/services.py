@@ -8,7 +8,7 @@ from datetime import timedelta
 from django.db import models, transaction
 from django.utils import timezone
 from accounts.models import Customer
-from .models import Loan, Payment, LoanFormula, FundedPayment
+from .models import CollectionPayment, FundedPayment, Loan, LoanFormula, Payment
 
 
 class LoanService:
@@ -1447,7 +1447,7 @@ class LoanService:
                 continue
             if payment.status != 'scheduled':
                 continue
-            if LoanService.is_deferral_fee_payment(payment):
+            if LoanService.is_non_installment_fee_payment(payment):
                 continue
             amount = money(payment.amount or Decimal('0.00'))
             if amount <= delta:
@@ -1565,6 +1565,10 @@ class LoanService:
 
     DEFERRAL_FEE_AMOUNT = Decimal('35.00')
     DEFERRAL_FEE_NOTE = 'Deferral fee $35'
+    COLLECTION_FAILURE_FEE_AMOUNT = Decimal('50.00')
+    COLLECTION_FAILURE_FEE_NOTE = 'Collection failure fee $50'
+    COLLECTION_FAILURE_RECOVERY_NOTE = 'Failed collection recovery'
+    COLLECTION_FAILURE_INTEREST_NOTE = 'Collection failure daily interest'
 
     @staticmethod
     def is_deferral_fee_payment(payment: Payment) -> bool:
@@ -1572,6 +1576,124 @@ class LoanService:
         return (
             payment.amount == LoanService.DEFERRAL_FEE_AMOUNT
             and notes.startswith('Deferral fee')
+        )
+
+    @staticmethod
+    def is_collection_failure_fee_payment(payment: Payment) -> bool:
+        notes = (payment.notes or '').strip()
+        return notes.startswith(LoanService.COLLECTION_FAILURE_FEE_NOTE)
+
+    @staticmethod
+    def is_collection_failure_recovery_payment(payment: Payment) -> bool:
+        notes = (payment.notes or '').strip()
+        return notes.startswith(LoanService.COLLECTION_FAILURE_RECOVERY_NOTE)
+
+    @staticmethod
+    def is_collection_failure_interest_payment(payment: Payment) -> bool:
+        notes = (payment.notes or '').strip()
+        return notes.startswith(LoanService.COLLECTION_FAILURE_INTEREST_NOTE)
+
+    @staticmethod
+    def collection_failure_interest_amount(payment: Payment) -> Decimal:
+        for line in (payment.notes or '').splitlines():
+            if not line.startswith('Extension interest: $'):
+                continue
+            try:
+                return LoanService.money(Decimal(line.split('$', 1)[1]))
+            except Exception:
+                return Decimal('0.00')
+        return Decimal('0.00')
+
+    @staticmethod
+    def _collection_failure_payment_cap(
+        loan: Loan,
+        failed_payment: Payment | None,
+        missed_amount: Decimal,
+    ) -> Decimal:
+        money = LoanService.money
+        if (
+            failed_payment is not None
+            and (failed_payment.amount or Decimal('0.00')) > 0
+        ):
+            return money(failed_payment.amount)
+        if missed_amount > 0:
+            return money(missed_amount)
+        for payment in loan.payments.order_by('scheduled_date', 'created_at', 'id'):
+            if LoanService.is_non_installment_fee_payment(payment):
+                continue
+            if payment.amount and payment.amount > 0:
+                return money(payment.amount)
+        return Decimal('0.00')
+
+    @staticmethod
+    def _allocate_collection_failure_extra(
+        loan: Loan,
+        *,
+        amount: Decimal,
+        cap: Decimal,
+        first_bucket_date,
+        frequency_days: int,
+        failure_note: str,
+    ) -> Payment | None:
+        money = LoanService.money
+        remaining = money(amount)
+        if remaining <= 0:
+            return None
+
+        buckets = list(
+            loan.payments.filter(
+                notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+            ).order_by('scheduled_date', 'created_at', 'id')
+        )
+        touched_bucket = None
+
+        if cap <= 0:
+            cap = remaining
+
+        if buckets:
+            active_bucket = buckets[-1]
+            current_amount = money(active_bucket.amount or Decimal('0.00'))
+            space = money(max(cap - current_amount, Decimal('0.00')))
+            if space > 0:
+                addition = min(remaining, space)
+                active_bucket.amount = money(current_amount + addition)
+                active_bucket.notes = (
+                    f'{(active_bucket.notes or "").strip()}\n{failure_note}'
+                ).strip()
+                active_bucket.save(update_fields=['amount', 'notes'])
+                touched_bucket = active_bucket
+                remaining = money(remaining - addition)
+            next_date = (active_bucket.scheduled_date or first_bucket_date) + timedelta(
+                days=frequency_days
+            )
+        else:
+            next_date = first_bucket_date
+
+        while remaining > 0:
+            bucket_amount = min(remaining, cap)
+            touched_bucket = Payment.objects.create(
+                loan=loan,
+                amount=bucket_amount,
+                type='scheduled',
+                status='scheduled',
+                scheduled_date=next_date,
+                notes=(
+                    f'{LoanService.COLLECTION_FAILURE_FEE_NOTE}\n'
+                    f'{failure_note}'
+                ),
+            )
+            remaining = money(remaining - bucket_amount)
+            next_date = next_date + timedelta(days=frequency_days)
+
+        return touched_bucket
+
+    @staticmethod
+    def is_non_installment_fee_payment(payment: Payment) -> bool:
+        return (
+            LoanService.is_deferral_fee_payment(payment)
+            or LoanService.is_collection_failure_fee_payment(payment)
+            or LoanService.is_collection_failure_recovery_payment(payment)
+            or LoanService.is_collection_failure_interest_payment(payment)
         )
 
     @staticmethod
@@ -1583,7 +1705,7 @@ class LoanService:
         """
         dates = []
         for payment in loan.payments.order_by('scheduled_date', 'created_at', 'id'):
-            if LoanService.is_deferral_fee_payment(payment):
+            if LoanService.is_non_installment_fee_payment(payment):
                 continue
             if payment.scheduled_date is None:
                 continue
@@ -1630,7 +1752,7 @@ class LoanService:
 
         deferral_fee_total = Decimal('0.00')
         for payment in loan.payments.all():
-            if LoanService.is_deferral_fee_payment(payment):
+            if LoanService.is_non_installment_fee_payment(payment):
                 deferral_fee_total += money(payment.amount or Decimal('0.00'))
 
         planned_interest = money(
@@ -1791,6 +1913,126 @@ class LoanService:
         payment.refresh_from_db()
         fee_payment.refresh_from_db()
         return payment, fee_payment
+
+    @staticmethod
+    @transaction.atomic
+    def apply_collection_failure_fee(
+        collection: CollectionPayment,
+        *,
+        reason: str = '',
+    ) -> Payment | None:
+        """Apply the schedule changes for a failed Zūm collection.
+
+        The failed installment stays as history and does not pay down the
+        balance. Recovery rows are added before collection-failure fee/interest
+        rows. The $50 fee plus extension interest fills capped extra rows at
+        the normal installment amount before spilling into a new row.
+        """
+        collection = CollectionPayment.objects.select_for_update().select_related(
+            'loan',
+            'payment',
+        ).get(pk=collection.pk)
+        loan = Loan.objects.select_for_update().get(pk=collection.loan_id)
+        failed_payment = collection.payment
+        fee_amount = LoanService.money(LoanService.COLLECTION_FAILURE_FEE_AMOUNT)
+        collection_id = str(collection.id)
+
+        already_applied = loan.payments.filter(
+            notes__contains=f'Collection failure id: {collection_id}',
+        ).first()
+        if already_applied:
+            existing_bucket = loan.payments.filter(
+                notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+                notes__contains=f'Collection failure id: {collection_id}',
+            ).order_by('scheduled_date', 'created_at', 'id').first()
+            if existing_bucket:
+                return existing_bucket
+            return loan.payments.filter(
+                notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+            ).order_by('scheduled_date', 'created_at', 'id').first()
+
+        frequency_days = LoanService._schedule_frequency_days(loan)
+        last_schedule_date = (
+            loan.payments.exclude(status='cancelled')
+            .order_by('-scheduled_date', '-created_at', '-id')
+            .values_list('scheduled_date', flat=True)
+            .first()
+        )
+        base_date = (
+            last_schedule_date
+            or (
+                failed_payment.scheduled_date
+                if failed_payment is not None
+                else timezone.localdate(collection.initiated_at)
+            )
+        )
+        existing_fee_payment = loan.payments.filter(
+            notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+        ).order_by('scheduled_date', 'created_at', 'id').first()
+
+        if existing_fee_payment:
+            fee_date = existing_fee_payment.scheduled_date
+            missed_date = fee_date - timedelta(days=frequency_days)
+        else:
+            missed_date = base_date + timedelta(days=frequency_days)
+            fee_date = missed_date + timedelta(days=frequency_days)
+        missed_amount = LoanService.money(collection.amount or Decimal('0.00'))
+        if failed_payment is not None:
+            missed_amount = LoanService.money(failed_payment.amount or missed_amount)
+        payment_cap = LoanService._collection_failure_payment_cap(
+            loan,
+            failed_payment,
+            missed_amount,
+        )
+        extension_days = frequency_days * 2
+        extra_interest = LoanService._deferral_extra_interest(loan, extension_days)
+
+        recovery_payment = None
+        if missed_amount > 0:
+            recovery_payment = Payment.objects.create(
+                loan=loan,
+                amount=missed_amount,
+                type='scheduled',
+                status='scheduled',
+                scheduled_date=missed_date,
+                notes=(
+                    f'{LoanService.COLLECTION_FAILURE_RECOVERY_NOTE} ${missed_amount}\n'
+                    f'Collection failure id: {collection_id}\n'
+                    f'Reason: {(reason or collection.failure_reason or "Unknown").strip()}'
+                ),
+            )
+        failure_note = (
+            f'Collection failure id: {collection_id}\n'
+            f'Reason: {(reason or collection.failure_reason or "Unknown").strip()}'
+        )
+        extra_amount = LoanService.money(fee_amount + extra_interest)
+        fee_payment = LoanService._allocate_collection_failure_extra(
+            loan,
+            amount=extra_amount,
+            cap=payment_cap,
+            first_bucket_date=fee_date,
+            frequency_days=frequency_days,
+            failure_note=(
+                f'{failure_note}\n'
+                f'NSF fee: ${fee_amount}\n'
+                f'Extension interest: ${extra_interest}'
+            ),
+        )
+
+        total_delta = extra_amount
+        loan.fee = LoanService.money((loan.fee or Decimal('0.00')) + total_delta)
+        loan.total_amount = LoanService.money(
+            (loan.total_amount or Decimal('0.00')) + total_delta
+        )
+        loan.balance = LoanService.money((loan.balance or Decimal('0.00')) + total_delta)
+        update_fields = ['fee', 'total_amount', 'balance', 'updated_at']
+        if loan.status != 'defaulted':
+            loan.status = 'defaulted'
+            loan.is_active = False
+            update_fields.extend(['status', 'is_active'])
+        loan.save(update_fields=update_fields)
+
+        return fee_payment
     @staticmethod
     @transaction.atomic
     def mark_deferral_fee_paid(

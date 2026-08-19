@@ -19,6 +19,54 @@ from accounts.serializers import CustomerSerializer
 from banking.serializers import BankAccountSerializer
 
 
+def _payment_balance_after(obj, context):
+    """
+    Remaining loan total after this schedule row in display order.
+
+    Failed collection rows are history only and do not reduce the balance.
+    Added recovery and fee rows after the original schedule are collectible,
+    so they reduce the displayed balance in order.
+    """
+    from .services import LoanService
+
+    loan = obj.loan
+    cache = context.setdefault('_balance_after_by_loan', {})
+    loan_key = str(loan.id)
+    if loan_key not in cache:
+        money = LoanService.money
+        payments = list(
+            loan.payments.exclude(status='cancelled')
+            .order_by('scheduled_date', 'created_at', 'id')
+            .only('id', 'amount', 'status', 'notes', 'scheduled_date', 'created_at')
+        )
+        running_balance = money(loan.balance or loan.total_amount or Decimal('0.00'))
+        mapping = {}
+        for payment in payments:
+            amount = money(payment.amount or Decimal('0.00'))
+            if payment.status not in ('failed', 'nsf'):
+                running_balance = money(running_balance - amount)
+            mapping[payment.id] = max(running_balance, Decimal('0.00'))
+        cache[loan_key] = mapping
+
+    mapped = cache[loan_key].get(obj.id)
+    if mapped is not None:
+        return mapped
+    return max(LoanService.money(loan.balance or Decimal('0.00')), Decimal('0.00'))
+
+
+def _loan_collected_amount(obj):
+    from .services import LoanService
+
+    return sum(
+        (
+            LoanService.money(payment.amount or Decimal('0.00'))
+            for payment in obj.payments.all()
+            if payment.status == 'completed'
+        ),
+        Decimal('0.00'),
+    )
+
+
 class LoanFormulaSerializer(serializers.ModelSerializer):
     brokerage_fee = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     subtotal = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
@@ -81,6 +129,7 @@ class PaymentSerializer(serializers.ModelSerializer):
     """Payment serializer."""
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     type_display = serializers.CharField(source='get_type_display', read_only=True)
+    balance_after = serializers.SerializerMethodField()
 
     class Meta:
         model = Payment
@@ -88,9 +137,12 @@ class PaymentSerializer(serializers.ModelSerializer):
             'id', 'loan', 'amount', 'type', 'type_display',
             'status', 'status_display', 'scheduled_date',
             'processed_at', 'failure_reason', 'reference', 'notes',
-            'created_at', 'created_by'
+            'balance_after', 'created_at', 'created_by'
         ]
         read_only_fields = ['id', 'created_at', 'processed_at']
+
+    def get_balance_after(self, obj):
+        return _payment_balance_after(obj, self.context)
 
 
 class PaymentCreateSerializer(serializers.ModelSerializer):
@@ -134,36 +186,7 @@ class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
         return LoanService.is_deferral_fee_payment(obj)
 
     def get_balance_after(self, obj):
-        """
-        Remaining loan total after this installment in schedule order.
-        Uses all non-cancelled payments (including scheduled) so the table
-        declines correctly before any collections are completed.
-        """
-        from .services import LoanService
-
-        loan = obj.loan
-        cache = self.context.setdefault('_balance_after_by_loan', {})
-        loan_key = str(loan.id)
-        if loan_key not in cache:
-            money = LoanService.money
-            payments = list(
-                loan.payments.exclude(status='cancelled')
-                .order_by('scheduled_date', 'created_at', 'id')
-                .only('id', 'amount', 'scheduled_date', 'created_at')
-            )
-            running_balance = money(loan.total_amount or Decimal('0.00'))
-            mapping = {}
-            for payment in payments:
-                running_balance = money(
-                    running_balance - money(payment.amount or Decimal('0.00'))
-                )
-                mapping[payment.id] = max(running_balance, Decimal('0.00'))
-            cache[loan_key] = mapping
-
-        mapped = cache[loan_key].get(obj.id)
-        if mapped is not None:
-            return mapped
-        return max(LoanService.money(loan.balance or Decimal('0.00')), Decimal('0.00'))
+        return _payment_balance_after(obj, self.context)
 
 
 class FundedPaymentSerializer(serializers.ModelSerializer):
@@ -304,7 +327,7 @@ class CurrentApplicationSerializer(serializers.ModelSerializer):
         ]
 
     def get_collected_amount(self, obj):
-        return max(obj.total_amount - obj.balance, 0)
+        return _loan_collected_amount(obj)
 
 
 class CustomerLoanDetailSerializer(serializers.ModelSerializer):
@@ -349,7 +372,7 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
         ]
 
     def get_collected_amount(self, obj):
-        return max(obj.total_amount - obj.balance, 0)
+        return _loan_collected_amount(obj)
 
     def get_funded_at(self, obj):
         return obj.funded_at.isoformat() if obj.funded_at else None
@@ -484,7 +507,7 @@ class LoanListSerializer(serializers.ModelSerializer):
         return None
 
     def get_collected_amount(self, obj):
-        return max(obj.total_amount - obj.balance, 0)
+        return _loan_collected_amount(obj)
 
     def get_ibv_status(self, obj):
         return 'completed' if obj.customer.banking_verified else 'pending'

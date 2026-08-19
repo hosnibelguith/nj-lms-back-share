@@ -840,14 +840,17 @@ class LoanViewSet(viewsets.ModelViewSet):
         received_loans = loans
         approved_loans = loans.filter(approved_at__isnull=False)
         funded_loans = loans.filter(funded_at__isnull=False)
+        defaulted_loans = loans.filter(status='defaulted')
         if date_from:
             received_loans = received_loans.filter(created_at__date__gte=date_from)
             approved_loans = approved_loans.filter(approved_at__date__gte=date_from)
             funded_loans = funded_loans.filter(funded_at__date__gte=date_from)
+            defaulted_loans = defaulted_loans.filter(updated_at__date__gte=date_from)
         if date_to:
             received_loans = received_loans.filter(created_at__date__lte=date_to)
             approved_loans = approved_loans.filter(approved_at__date__lte=date_to)
             funded_loans = funded_loans.filter(funded_at__date__lte=date_to)
+            defaulted_loans = defaulted_loans.filter(updated_at__date__lte=date_to)
 
         def series(qs, date_field='created_at'):
             return list(
@@ -935,10 +938,10 @@ class LoanViewSet(viewsets.ModelViewSet):
             "declined_loans_count": events.filter(event_type='human_declined').count(),
             "funded_loans_count": funded_loans.count(),
             "paid_off_loans_count": events.filter(event_type='paid_off').count(),
-            "defaulted_loans_count": events.filter(event_type='defaulted').count(),
+            "defaulted_loans_count": defaulted_loans.count(),
             "reactivated_loans_count": events.filter(event_type='reactivated').count(),
             "current_active_loans_count": Loan.objects.filter(is_active=True).count(),
-            "current_defaulted_loans_count": Loan.objects.filter(is_active=False).count(),
+            "current_defaulted_loans_count": Loan.objects.filter(status='defaulted').count(),
             "nsf_payments_count": nsf_payments_count,
             "sent_payments_count": sent_payments_count,
             "nsf_ratio": nsf_ratio,
