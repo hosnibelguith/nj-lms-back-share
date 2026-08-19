@@ -302,10 +302,41 @@ def extract_zum_transaction_fields(payload) -> dict:
         or nested.get("MemberMessage")
         or data.get("MemberMessage")
     )
+    history_failure = None
+    for blob in (source, nested, data):
+        if not isinstance(blob, dict):
+            continue
+        history = blob.get("TransactionHistory")
+        if not isinstance(history, list):
+            continue
+        for item in reversed(history):
+            if not isinstance(item, dict):
+                continue
+            event = item.get("Event") or item.get("event")
+            if isinstance(event, str) and (
+                event in ALL_FAILURE_EVENTS
+                or event.startswith(("EftFailed", "InteracFailed"))
+            ):
+                history_failure = event
+                break
+        if history_failure:
+            break
     if isinstance(reason, str):
         reason = reason.strip() or None
     if isinstance(status_value, str):
         status_value = status_value.strip() or None
+    status_is_failure = isinstance(status_value, str) and (
+        "Failed" in status_value or status_value in TERMINAL_FAILURE_STATUSES
+    )
+    reason_is_failure = isinstance(reason, str) and (
+        reason in ALL_FAILURE_EVENTS
+        or reason.startswith(("EftFailed", "InteracFailed"))
+    )
+    # NSF/return can land after Succeeded. Prefer the failure over a leftover Completed status.
+    if not status_is_failure and (history_failure or reason_is_failure):
+        status_value = "Failed"
+        if not reason_is_failure:
+            reason = history_failure
     return {
         "status": status_value,
         "reason": reason,
@@ -1998,7 +2029,8 @@ class SettlementService:
     @transaction.atomic
     def sync_from_zum(collection: CollectionPayment) -> CollectionPayment:
         """Apply a Zūm collection failure that webhooks missed. Never auto-completes."""
-        collection = CollectionPayment.objects.select_for_update().select_related(
+        # Postgres cannot FOR UPDATE a nullable payment outer join.
+        collection = CollectionPayment.objects.select_for_update(of=("self",)).select_related(
             "loan",
             "payment",
         ).get(pk=collection.pk)

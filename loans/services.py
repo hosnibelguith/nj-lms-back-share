@@ -2350,7 +2350,8 @@ class LoanService:
         original remainder installment to the normal installment amount,
         then fills capped extra rows before spilling into a new row.
         """
-        collection = CollectionPayment.objects.select_for_update().select_related(
+        # Postgres cannot FOR UPDATE a nullable payment outer join.
+        collection = CollectionPayment.objects.select_for_update(of=("self",)).select_related(
             'loan',
             'payment',
         ).get(pk=collection.pk)

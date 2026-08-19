@@ -16,7 +16,9 @@ from .zumrails import (
     add_business_days,
     apply_collection_failure,
     apply_funded_payment_zum_status,
+    collection_failure_status_from_zum,
     extract_zum_transaction_fields,
+    is_terminal_zum_collection_failure,
     is_zum_failed_status,
     log_activity,
     normalize_zum_status,
@@ -48,14 +50,6 @@ def _failure_reason(event_data, fallback="Failed"):
     return fields.get("reason") or fields.get("status") or fallback
 
 
-def _is_failed_status(status_value):
-    return is_zum_failed_status(status_value)
-
-
-def _is_returned_or_rejected(status_value):
-    return status_value in TERMINAL_FAILURE_STATUSES
-
-
 def _is_failure_event(event_name):
     if not isinstance(event_name, str) or not event_name.strip():
         return False
@@ -78,6 +72,53 @@ def _client_transaction_uuid(event_data):
         return uuid.UUID(str(value)) if value else None
     except (TypeError, ValueError, AttributeError):
         return None
+
+
+def _payload_is_collection_failure(event_name, event_data, status_value=None):
+    fields = extract_zum_transaction_fields(event_data)
+    resolved_status = status_value or fields.get("status")
+    reason = fields.get("reason") or event_name
+    return _is_failure_event(event_name) or is_terminal_zum_collection_failure(
+        resolved_status,
+        reason,
+    )
+
+
+def _find_collection(processor_transaction_id, event_data):
+    qs = CollectionPayment.objects.select_for_update().select_related("loan")
+    collection = None
+    if processor_transaction_id:
+        collection = qs.filter(processor_transaction_id=processor_transaction_id).first()
+    if collection is None:
+        client_transaction_id = _client_transaction_uuid(event_data)
+        if client_transaction_id:
+            collection = qs.filter(pk=client_transaction_id).first()
+            if (
+                collection
+                and processor_transaction_id
+                and not collection.processor_transaction_id
+            ):
+                collection.processor_transaction_id = processor_transaction_id
+                collection.save(update_fields=["processor_transaction_id", "updated_at"])
+    return collection
+
+
+def _unmatched_failure_should_reprocess(event_name, event_data, processor_transaction_id):
+    """True when a duplicate failure webhook still has a local collection to heal."""
+    if not _payload_is_collection_failure(event_name, event_data):
+        return False
+    collection = None
+    if processor_transaction_id:
+        collection = CollectionPayment.objects.filter(
+            processor_transaction_id=processor_transaction_id
+        ).first()
+    if collection is None:
+        client_transaction_id = _client_transaction_uuid(event_data)
+        if client_transaction_id:
+            collection = CollectionPayment.objects.filter(pk=client_transaction_id).first()
+    if collection is None:
+        return False
+    return collection.status not in ("failed", "returned", "rejected", "cancelled")
 
 
 def _reopen_loan_after_funding_failure(funding):
@@ -144,7 +185,12 @@ class ZumRailsWebhookView(APIView):
         )
 
         if not created and webhook_event.processed_at:
-            return Response({"message": "Duplicate webhook ignored"}, status=status.HTTP_200_OK)
+            if not _unmatched_failure_should_reprocess(
+                event_name,
+                event_data,
+                processor_transaction_id,
+            ):
+                return Response({"message": "Duplicate webhook ignored"}, status=status.HTTP_200_OK)
 
         try:
             if event_type == "TransactionEvent":
@@ -153,9 +199,22 @@ class ZumRailsWebhookView(APIView):
                     event_name,
                     event_data,
                 )
-            elif event_type == "Transaction":
-                status_value = event_data.get("Status") or event_data.get("TransactionStatus")
+            elif event_type == "Transaction" or (
+                not event_type
+                and (fields.get("status") or event_data.get("TransactionStatus") or event_data.get("Status"))
+            ):
+                status_value = (
+                    fields.get("status")
+                    or event_data.get("TransactionStatus")
+                    or event_data.get("Status")
+                )
                 self._process_transaction(processor_transaction_id, status_value, event_data)
+            elif _is_failure_event(event_name):
+                self._process_transaction_event(
+                    processor_transaction_id,
+                    event_name,
+                    event_data,
+                )
 
             webhook_event.processed_at = timezone.now()
             webhook_event.save(update_fields=["processed_at"])
@@ -166,7 +225,7 @@ class ZumRailsWebhookView(APIView):
         return Response({"message": "Webhook processed"}, status=status.HTTP_200_OK)
 
     def _process_transaction_event(self, processor_transaction_id, event_name, event_data):
-        if not processor_transaction_id:
+        if not processor_transaction_id and not _client_transaction_uuid(event_data):
             return
 
         event_timestamp = (
@@ -176,18 +235,7 @@ class ZumRailsWebhookView(APIView):
         )
         history_item = {"event": event_name, "timestamp": event_timestamp}
 
-        collection = CollectionPayment.objects.select_for_update().select_related("loan").filter(
-            processor_transaction_id=processor_transaction_id
-        ).first()
-        if not collection:
-            client_transaction_id = _client_transaction_uuid(event_data)
-            if client_transaction_id:
-                collection = CollectionPayment.objects.select_for_update().select_related(
-                    "loan"
-                ).filter(pk=client_transaction_id).first()
-                if collection and not collection.processor_transaction_id:
-                    collection.processor_transaction_id = processor_transaction_id
-                    collection.save(update_fields=["processor_transaction_id", "updated_at"])
+        collection = _find_collection(processor_transaction_id, event_data)
         if collection:
             logger.info(
                 "ZumRails webhook matched collection id=%s status=%s zum_status=%s event=%s tx=%s",
@@ -219,9 +267,11 @@ class ZumRailsWebhookView(APIView):
                 collection.save(update_fields=["event_history", "updated_at"])
             return
 
-        funding = FundedPayment.objects.select_for_update().select_related("loan").filter(
-            processor_transaction_id=processor_transaction_id
-        ).first()
+        funding = None
+        if processor_transaction_id:
+            funding = FundedPayment.objects.select_for_update().select_related("loan").filter(
+                processor_transaction_id=processor_transaction_id
+            ).first()
         if not funding:
             client_transaction_id = _client_transaction_uuid(event_data)
             if client_transaction_id:
@@ -272,21 +322,10 @@ class ZumRailsWebhookView(APIView):
                 )
 
     def _process_transaction(self, processor_transaction_id, status_value, event_data):
-        if not processor_transaction_id:
+        if not processor_transaction_id and not _client_transaction_uuid(event_data):
             return
 
-        collection = CollectionPayment.objects.select_for_update().select_related("loan").filter(
-            processor_transaction_id=processor_transaction_id
-        ).first()
-        if not collection:
-            client_transaction_id = _client_transaction_uuid(event_data)
-            if client_transaction_id:
-                collection = CollectionPayment.objects.select_for_update().select_related(
-                    "loan"
-                ).filter(pk=client_transaction_id).first()
-                if collection and not collection.processor_transaction_id:
-                    collection.processor_transaction_id = processor_transaction_id
-                    collection.save(update_fields=["processor_transaction_id", "updated_at"])
+        collection = _find_collection(processor_transaction_id, event_data)
         if collection:
             logger.info(
                 "ZumRails transaction matched collection id=%s status=%s zum_status=%s incoming_status=%s tx=%s",
@@ -296,40 +335,49 @@ class ZumRailsWebhookView(APIView):
                 status_value,
                 processor_transaction_id,
             )
-            if status_value == "Completed":
-                collection.zum_status = status_value
-                if not collection.settlement_due_at:
-                    collection.settlement_due_at = add_business_days(collection.initiated_at, 4)
-                collection.save(update_fields=["zum_status", "settlement_due_at", "updated_at"])
-                return
-
-            if _is_failed_status(status_value) or _is_returned_or_rejected(status_value):
-                reason = _failure_reason(event_data, status_value)
-                failure_status = "returned" if status_value == "Returned" else "failed"
-                if status_value == "Rejected":
-                    failure_status = "rejected"
+            fields = extract_zum_transaction_fields(event_data)
+            resolved_status = status_value or fields.get("status")
+            reason = fields.get("reason") or resolved_status
+            if is_terminal_zum_collection_failure(resolved_status, reason):
+                failure_status = collection_failure_status_from_zum(resolved_status)
                 was_terminal = collection.status in ("failed", "returned", "rejected")
                 if not was_terminal:
-                    apply_collection_failure(collection, reason=reason, status=failure_status)
-                collection.zum_status = status_value
+                    apply_collection_failure(
+                        collection,
+                        reason=reason or resolved_status or "Failed",
+                        status=failure_status,
+                    )
+                if is_zum_failed_status(resolved_status) or normalize_zum_status(resolved_status) in TERMINAL_FAILURE_STATUSES:
+                    collection.zum_status = resolved_status
+                else:
+                    collection.zum_status = "Failed"
                 collection.save(update_fields=["zum_status", "updated_at"])
                 if not was_terminal:
                     log_activity(
                         collection.loan,
                         "payment_failed",
                         "Collection Failed",
-                        reason,
+                        reason or resolved_status,
                         metadata={"collection_payment_id": str(collection.id)},
                     )
                 return
 
-            collection.zum_status = status_value
+            if resolved_status == "Completed":
+                collection.zum_status = resolved_status
+                if not collection.settlement_due_at:
+                    collection.settlement_due_at = add_business_days(collection.initiated_at, 4)
+                collection.save(update_fields=["zum_status", "settlement_due_at", "updated_at"])
+                return
+
+            collection.zum_status = resolved_status
             collection.save(update_fields=["zum_status", "updated_at"])
             return
 
-        funding = FundedPayment.objects.select_for_update().select_related("loan").filter(
-            processor_transaction_id=processor_transaction_id
-        ).first()
+        funding = None
+        if processor_transaction_id:
+            funding = FundedPayment.objects.select_for_update().select_related("loan").filter(
+                processor_transaction_id=processor_transaction_id
+            ).first()
         if not funding:
             client_transaction_id = _client_transaction_uuid(event_data)
             if client_transaction_id:

@@ -18,19 +18,22 @@ from accounts.models import Customer, User
 from banking.models import BankAccount, BankConnection
 from communications.models import Communication, CommunicationTemplate
 
-from .models import CollectionPayment, CollectionsAccountChangeAudit, FundedPayment, FundingMethodRecommendation, Loan, LoanFormula, LoanStateEvent, Payment
+from .models import CollectionPayment, CollectionsAccountChangeAudit, FundedPayment, FundingMethodRecommendation, Loan, LoanFormula, LoanStateEvent, Payment, WebhookEvent
 from .services import LoanService
 from .business_calendar import previous_business_day
 from .webhooks import _reopen_loan_after_funding_failure
 from .zumrails import (
     CollectionService,
     FundingService,
+    SettlementService,
     ZumRailsConfigurationError,
     ZumRailsRequestError,
     ZumRailsService,
     add_business_days,
+    extract_zum_transaction_fields,
     funding_configuration_ready,
     normalize_zum_status,
+    payload_hash,
 )
 
 
@@ -2470,6 +2473,163 @@ class ZumRailsWorkflowTests(APITestCase):
             ).count(),
             1,
         )
+
+    def test_extract_prefers_nsf_history_over_completed_status(self):
+        fields = extract_zum_transaction_fields({
+            "Id": "0737cdbf-6c4c-4990-be61-c48b3fce78f7",
+            "TransactionStatus": "Completed",
+            "TransactionHistory": [
+                {"Event": "Succeeded"},
+                {"Event": "EftFailedInsufficientFunds"},
+            ],
+        })
+        self.assertEqual(fields["status"], "Failed")
+        self.assertEqual(fields["reason"], "EftFailedInsufficientFunds")
+
+    def _settled_collection(self, processor_transaction_id, amount="147.18"):
+        amount = Decimal(amount)
+        self.loan.status = "active"
+        self.loan.balance = Decimal("500.00")
+        self.loan.save(update_fields=["status", "balance", "updated_at"])
+        payment = Payment.objects.create(
+            loan=self.loan,
+            amount=amount,
+            scheduled_date=timezone.localdate(),
+            status="completed",
+            processed_at=timezone.now(),
+            reference=processor_transaction_id,
+        )
+        return CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=payment,
+            amount=amount,
+            status="completed",
+            processor_transaction_id=processor_transaction_id,
+            settled_at=timezone.now(),
+            account_snapshot={"id": str(self.account.id)},
+        )
+
+    def test_failed_transaction_webhook_reverses_false_settlement(self):
+        collection = self._settled_collection("0737cdbf-6c4c-4990-be61-c48b3fce78f7")
+        payload = {
+            "Type": "Transaction",
+            "Data": {
+                "Id": collection.processor_transaction_id,
+                "TransactionStatus": "Failed",
+                "FailedTransactionEvent": "EftFailedInsufficientFunds",
+                "FailedAt": timezone.now().isoformat(),
+                "TransactionHistory": [
+                    {"Event": "Succeeded"},
+                    {"Event": "EftFailedInsufficientFunds"},
+                ],
+            },
+        }
+
+        first = self.post_webhook(payload)
+        duplicate = self.post_webhook(payload)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(duplicate.status_code, 200)
+        collection.refresh_from_db()
+        collection.payment.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(collection.status, "failed")
+        self.assertEqual(collection.zum_status, "Failed")
+        self.assertEqual(collection.payment.status, "nsf")
+        self.assertEqual(self.loan.balance, Decimal("697.18"))
+        self.assertEqual(
+            self.loan.payments.filter(
+                notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+                notes__contains=f"Collection failure id: {collection.id}",
+            ).count(),
+            1,
+        )
+
+    def test_completed_status_does_not_hide_failed_transaction_status(self):
+        collection = self._settled_collection("68d39785-2067-43b5-b119-c7d42bc3abe2", "175.00")
+        response = self.post_webhook({
+            "Type": "Transaction",
+            "Data": {
+                "Id": collection.processor_transaction_id,
+                "Status": "Completed",
+                "TransactionStatus": "Failed",
+                "FailedTransactionEvent": "EftFailedInsufficientFunds",
+            },
+        })
+
+        self.assertEqual(response.status_code, 200)
+        collection.refresh_from_db()
+        self.assertEqual(collection.status, "failed")
+        self.assertEqual(collection.zum_status, "Failed")
+
+    def test_duplicate_failed_webhook_heals_if_collection_still_completed(self):
+        collection = self._settled_collection("306ff1db-3bb0-4cb9-8b1f-5eabd2c3aa5e", "176.61")
+        payload = {
+            "Type": "Transaction",
+            "Data": {
+                "Id": collection.processor_transaction_id,
+                "TransactionStatus": "Failed",
+                "FailedTransactionEvent": "EftFailedInsufficientFunds",
+            },
+        }
+        raw, _signature = self.sign(payload)
+        WebhookEvent.objects.create(
+            payload_hash=payload_hash(raw),
+            processor_transaction_id=collection.processor_transaction_id,
+            webhook_type="Transaction",
+            event_name="Failed",
+            payload=payload,
+            processed_at=timezone.now(),
+        )
+
+        response = self.post_webhook(payload)
+
+        self.assertEqual(response.status_code, 200)
+        collection.refresh_from_db()
+        collection.payment.refresh_from_db()
+        self.assertEqual(collection.status, "failed")
+        self.assertEqual(collection.payment.status, "nsf")
+
+    @patch("loans.zumrails.ZumRailsService.get_transaction")
+    def test_sync_from_zum_heals_completed_collection_when_history_has_nsf(self, mock_get_tx):
+        mock_get_tx.return_value = {
+            "Id": "a7b7193a-1831-4aaa-bbbb-cccccccccccc",
+            "TransactionStatus": "Completed",
+            "TransactionHistory": [
+                {"Event": "Succeeded"},
+                {"Event": "EftFailedInsufficientFunds"},
+            ],
+        }
+        collection = self._settled_collection("a7b7193a-1831-4aaa-bbbb-cccccccccccc")
+
+        synced = SettlementService.sync_from_zum(collection)
+
+        self.assertEqual(synced.status, "failed")
+        self.assertEqual(synced.failure_reason, "EftFailedInsufficientFunds")
+        mock_get_tx.assert_called_once_with(collection.processor_transaction_id)
+
+    @patch("loans.zumrails.ZumRailsService.get_transaction")
+    def test_heal_missed_collection_failures_command_reverses_false_settlement(self, mock_get_tx):
+        from django.core.management import call_command
+
+        mock_get_tx.return_value = {
+            "Id": "486482c4-d017-4aaa-bbbb-cccccccccccc",
+            "TransactionStatus": "Failed",
+            "FailedTransactionEvent": "EftFailedInsufficientFunds",
+        }
+        collection = self._settled_collection("486482c4-d017-4aaa-bbbb-cccccccccccc")
+
+        call_command(
+            "heal_missed_collection_failures",
+            collection.processor_transaction_id,
+        )
+
+        collection.refresh_from_db()
+        collection.payment.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(collection.status, "failed")
+        self.assertEqual(collection.payment.status, "nsf")
+        self.assertEqual(self.loan.balance, Decimal("697.18"))
 
 
 @override_settings(
