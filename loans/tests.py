@@ -284,6 +284,80 @@ class CollectionExportTests(APITestCase):
         self.assertEqual(collection.status, "returned")
         self.assertIsNotNone(collection.returned_at)
 
+    def test_returned_collections_includes_processing_with_zum_failed_status(self):
+        missed_at = timezone.now() - timedelta(days=11)
+        hidden_processing = CollectionPayment.objects.create(
+            loan=self.loan,
+            amount=Decimal("175.00"),
+            status="processing",
+            zum_status="Failed",
+            failure_reason="EftFailedInsufficientFunds",
+            processor_transaction_id="zum-failed-processing-1",
+            initiated_at=missed_at,
+        )
+        CollectionPayment.objects.create(
+            loan=self.loan,
+            amount=Decimal("50.00"),
+            status="processing",
+            initiated_at=missed_at,
+        )
+
+        response = self.client.get(
+            "/api/loans/returned-collections/",
+            {"export": "1"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        ids = {row["id"] for row in response.data}
+        self.assertIn(str(hidden_processing.id), ids)
+        hidden_processing.refresh_from_db()
+        self.assertEqual(hidden_processing.status, "failed")
+        self.assertIsNotNone(hidden_processing.returned_at)
+
+    @patch("loans.zumrails.ZumRailsService.get_transaction")
+    def test_returned_collections_includes_locally_completed_zum_failures(self, mock_get_tx):
+        mock_get_tx.return_value = {
+            "Id": "zum-missed-completed-1",
+            "TransactionStatus": "Failed",
+            "FailedTransactionEvent": "EftFailedStopPayment",
+        }
+        inside = timezone.make_aware(datetime(2026, 8, 18, 12, 0))
+        visible = self._add_returned_collection(
+            amount="147.18",
+            reason="EftFailedInsufficientFunds",
+            returned_at=inside,
+        )
+        missed = CollectionPayment.objects.create(
+            loan=self.loan,
+            amount=Decimal("147.18"),
+            status="completed",
+            processor_transaction_id="zum-missed-completed-1",
+            initiated_at=timezone.now() - timedelta(days=11),
+            settled_at=timezone.now() - timedelta(days=6),
+        )
+
+        response = self.client.get(
+            "/api/loans/returned-collections/",
+            {"export": "1"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        ids = {row["id"] for row in response.data}
+        self.assertEqual(ids, {str(visible.id), str(missed.id)})
+        missed.refresh_from_db()
+        self.assertEqual(missed.status, "failed")
+        self.assertEqual(missed.failure_reason, "EftFailedStopPayment")
+        mock_get_tx.assert_called()
+
+    def test_loan_status_display_for_defaulted_is_in_collections(self):
+        from loans.models import Loan
+
+        self.assertEqual(dict(Loan.STATUS_CHOICES)["defaulted"], "In Collections")
+        response = self.client.get(f"/api/loans/{self.loan.id}/")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["status"], "defaulted")
+        self.assertEqual(response.data["status_display"], "In Collections")
+
 
 @override_settings(
     ZUMRAILS_DRY_RUN=True,
@@ -2225,6 +2299,38 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(result["completed"], 1)
         self.assertEqual(collection.status, "completed")
         self.assertEqual(self.loan.balance, Decimal("550.00"))
+
+    @patch("loans.zumrails.ZumRailsService.get_transaction")
+    def test_process_collection_settlements_applies_zum_failure_instead_of_completing(
+        self, mock_get_tx
+    ):
+        from loans.tasks import process_collection_settlements
+
+        mock_get_tx.return_value = {
+            "Id": "settlement-failed-1",
+            "TransactionStatus": "Failed",
+            "FailedTransactionEvent": "EftFailedInsufficientFunds",
+        }
+        self.loan.status = "active"
+        self.loan.save(update_fields=["status", "updated_at"])
+        collection = CollectionPayment.objects.create(
+            loan=self.loan,
+            amount=Decimal("50.00"),
+            status="processing",
+            processor_transaction_id="settlement-failed-1",
+            settlement_due_at=timezone.now() - timedelta(minutes=1),
+            account_snapshot={"id": str(self.account.id)},
+        )
+
+        result = process_collection_settlements()
+
+        collection.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(result["completed"], 0)
+        self.assertEqual(collection.status, "failed")
+        self.assertEqual(collection.failure_reason, "EftFailedInsufficientFunds")
+        self.assertEqual(self.loan.status, "defaulted")
+        self.assertEqual(self.loan.balance, Decimal("650.00"))
 
     def test_process_collection_settlements_backfills_missing_due_date(self):
         from loans.tasks import process_collection_settlements

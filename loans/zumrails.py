@@ -14,6 +14,7 @@ import requests
 from django.conf import settings
 from django.core.cache import cache
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from banking.constants import (
@@ -320,6 +321,33 @@ def extract_zum_transaction_fields(payload) -> dict:
 
 def is_zum_failed_status(status_value) -> bool:
     return isinstance(status_value, str) and "Failed" in status_value
+
+
+def collection_failure_status_from_zum(status_value: str | None) -> str:
+    normalized = normalize_zum_status(status_value)
+    if normalized == "Returned":
+        return "returned"
+    if normalized == "Rejected":
+        return "rejected"
+    return "failed"
+
+
+def is_terminal_zum_collection_failure(status_value=None, reason=None) -> bool:
+    """True when Zūm has already failed/returned/rejected an AR collection."""
+    if is_zum_failed_status(status_value):
+        return True
+    if normalize_zum_status(status_value) in TERMINAL_FAILURE_STATUSES:
+        return True
+    reason_text = reason.strip() if isinstance(reason, str) else ""
+    if not reason_text:
+        return False
+    if reason_text in ALL_FAILURE_EVENTS:
+        return True
+    compact = re.sub(r"[\s_\-]+", "", reason_text)
+    return (
+        reason_text.startswith(("EftFailed", "InteracFailed"))
+        or compact.startswith(("EftFailed", "InteracFailed"))
+    )
 
 
 def normalize_zum_status(status_value: str | None) -> str | None:
@@ -1968,6 +1996,107 @@ class FundingConfigurationService:
 class SettlementService:
     @staticmethod
     @transaction.atomic
+    def sync_from_zum(collection: CollectionPayment) -> CollectionPayment:
+        """Apply a Zūm collection failure that webhooks missed. Never auto-completes."""
+        collection = CollectionPayment.objects.select_for_update().select_related(
+            "loan",
+            "payment",
+        ).get(pk=collection.pk)
+        if collection.status in ("failed", "returned", "rejected", "cancelled"):
+            return collection
+
+        local_status = collection.zum_status
+        local_reason = collection.failure_reason if collection.status == "processing" else None
+        if is_terminal_zum_collection_failure(local_status, local_reason):
+            apply_collection_failure(
+                collection,
+                reason=(local_reason or local_status or "Failed"),
+                status=collection_failure_status_from_zum(local_status),
+            )
+            if local_status:
+                collection.zum_status = local_status
+                collection.save(update_fields=["zum_status", "updated_at"])
+            return collection
+
+        tx_id = (collection.processor_transaction_id or "").strip()
+        if not tx_id:
+            return collection
+        try:
+            payload = ZumRailsService.get_transaction(tx_id)
+        except ZumRailsError:
+            logger.exception(
+                "Unable to sync collection status from Zūm collection=%s tx=%s",
+                collection.id,
+                tx_id,
+            )
+            return collection
+
+        fields = extract_zum_transaction_fields(payload)
+        status_value = fields.get("status")
+        reason = fields.get("reason") or status_value
+        if not is_terminal_zum_collection_failure(status_value, reason):
+            if status_value and collection.status == "processing":
+                collection.zum_status = status_value
+                collection.save(update_fields=["zum_status", "updated_at"])
+            return collection
+
+        apply_collection_failure(
+            collection,
+            reason=reason or status_value or "Failed",
+            status=collection_failure_status_from_zum(status_value),
+        )
+        if status_value:
+            collection.zum_status = status_value
+            collection.save(update_fields=["zum_status", "updated_at"])
+        return collection
+
+    @staticmethod
+    def reconcile_missed_failures(*, limit: int = 25) -> int:
+        """Heal collections Zūm already failed but local status never flipped."""
+        now = timezone.now()
+        seen = set()
+        healed = 0
+        candidate_lists = [
+            CollectionPayment.objects.filter(status="processing").filter(
+                Q(zum_status__icontains="Failed")
+                | Q(zum_status__iexact="Returned")
+                | Q(zum_status__iexact="Rejected")
+            ),
+            CollectionPayment.objects.filter(
+                status="completed",
+                processor_transaction_id__isnull=False,
+                initiated_at__gte=now - timedelta(days=60),
+                initiated_at__lte=now - timedelta(days=4),
+            ).filter(
+                Q(zum_status__isnull=True)
+                | ~Q(zum_status__iexact="Completed")
+            ).order_by("initiated_at"),
+            CollectionPayment.objects.filter(
+                status="processing",
+                processor_transaction_id__isnull=False,
+                settlement_due_at__lte=now,
+            ).order_by("initiated_at"),
+        ]
+        remaining = limit
+        for qs in candidate_lists:
+            for collection in qs:
+                if collection.pk in seen:
+                    continue
+                if remaining <= 0:
+                    return healed
+                seen.add(collection.pk)
+                remaining -= 1
+                previous_status = collection.status
+                synced = SettlementService.sync_from_zum(collection)
+                if (
+                    synced.status in ("failed", "returned", "rejected")
+                    and synced.status != previous_status
+                ):
+                    healed += 1
+        return healed
+
+    @staticmethod
+    @transaction.atomic
     def complete_if_eligible(collection: CollectionPayment):
         collection = CollectionPayment.objects.select_for_update().select_related("loan").get(pk=collection.pk)
         if collection.status != "processing":
@@ -1977,6 +2106,10 @@ class SettlementService:
         if collection.settlement_due_at > timezone.now():
             return False
         if any((event.get("event") in ALL_FAILURE_EVENTS) for event in (collection.event_history or [])):
+            return False
+
+        collection = SettlementService.sync_from_zum(collection)
+        if collection.status != "processing":
             return False
 
         collection.status = "completed"
@@ -2010,6 +2143,8 @@ class SettlementService:
         for collection in missing_due:
             collection.settlement_due_at = add_business_days(collection.initiated_at, 4)
             collection.save(update_fields=["settlement_due_at", "updated_at"])
+
+        SettlementService.reconcile_missed_failures()
 
         due = CollectionPayment.objects.filter(
             status="processing",

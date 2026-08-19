@@ -171,11 +171,20 @@ class LoanViewSet(viewsets.ModelViewSet):
     RETURNED_COLLECTION_STATUSES = ('failed', 'returned', 'rejected')
 
     @classmethod
+    def _returned_collection_q(cls):
+        return (
+            Q(status__in=cls.RETURNED_COLLECTION_STATUSES)
+            | Q(zum_status__icontains='Failed')
+            | Q(zum_status__iexact='Returned')
+            | Q(zum_status__iexact='Rejected')
+        ) & ~Q(status='cancelled')
+
+    @classmethod
     def _returned_collections_queryset(cls, request):
         qs = CollectionPayment.objects.filter(
-            status__in=cls.RETURNED_COLLECTION_STATUSES,
+            cls._returned_collection_q(),
         ).select_related('loan', 'loan__customer', 'payment').annotate(
-            effective_returned_at=Coalesce('returned_at', 'updated_at'),
+            effective_returned_at=Coalesce('returned_at', 'updated_at', 'initiated_at'),
         )
         date_from = request.query_params.get('date_from')
         if date_from:
@@ -205,7 +214,7 @@ class LoanViewSet(viewsets.ModelViewSet):
             'reason': collection.failure_reason or '',
             'missed_amount': collection.amount,
             'balance': collection.loan.balance,
-            'returned_at': collection.returned_at or collection.updated_at,
+            'returned_at': collection.returned_at or collection.updated_at or collection.initiated_at,
             'status': collection.status,
         }
 
@@ -788,6 +797,7 @@ class LoanViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='returned-collections')
     def returned_collections(self, request):
         """Returned/failed collection attempts, filterable by returned date."""
+        SettlementService.reconcile_missed_failures()
         qs = self._returned_collections_queryset(request)
         export = (request.query_params.get('export') or '').strip().lower() in (
             '1',
@@ -811,7 +821,8 @@ class LoanViewSet(viewsets.ModelViewSet):
         """Current defaulted loans with the latest missed collection details."""
         latest = CollectionPayment.objects.filter(
             loan_id=OuterRef('pk'),
-            status__in=self.RETURNED_COLLECTION_STATUSES,
+        ).filter(
+            self._returned_collection_q(),
         ).order_by('-returned_at', '-updated_at', '-created_at')
         loans = (
             self._filtered_queryset(ignore_status=True, ignore_dates=True)
