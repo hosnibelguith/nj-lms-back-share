@@ -20,10 +20,11 @@ app.autodiscover_tasks()
 
 # Celery Beat Schedule (periodic tasks)
 app.conf.beat_schedule = {
-    # Process scheduled payments daily at 6 AM
+    # Process scheduled payments daily after 7:00 PM America/Toronto
+    # (7:01 PM). Instructions go out the calendar day before the adjusted date.
     'process-scheduled-payments': {
         'task': 'loans.tasks.process_scheduled_payments',
-        'schedule': crontab(hour=6, minute=0),
+        'schedule': crontab(hour=19, minute=1),
     },
     
     # Send payment reminders daily at 9 AM

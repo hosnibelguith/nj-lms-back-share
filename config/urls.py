@@ -16,7 +16,7 @@ from banking.views import (
     CustomerPortalBankingStatusView, CustomerPortalBankAccountsView
 )
 from banking.webhooks import MohawkBankingAnalysisWebhookView
-from loans.views import FundingMethodRecommendationViewSet, LoanViewSet, PaymentViewSet
+from loans.views import FundingMethodRecommendationViewSet, LoanViewSet, PaymentViewSet, BankHolidayViewSet
 from loans.webhooks import ZumRailsWebhookView
 from contracts.views import ContractViewSet, ContractTemplateViewSet
 from communications.views import (
@@ -40,6 +40,7 @@ router.register(r'financial-reports', FinancialAnalysisReportViewSet, basename='
 # Loan routes
 router.register(r'loans', LoanViewSet, basename='loan')
 router.register(r'payments', PaymentViewSet, basename='payment')
+router.register(r'bank-holidays', BankHolidayViewSet, basename='bank-holiday')
 router.register(r'funding-method-recommendations', FundingMethodRecommendationViewSet, basename='funding-method-recommendation')
 
 # Contract routes

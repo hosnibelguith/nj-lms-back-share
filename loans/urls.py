@@ -7,6 +7,7 @@ router = DefaultRouter()
 router.register(r'loans', views.LoanViewSet, basename='loan')
 router.register(r'payments', views.PaymentViewSet, basename='payment')
 router.register(r'loan-formulas', views.LoanFormulaViewSet, basename='loan-formula')
+router.register(r'bank-holidays', views.BankHolidayViewSet, basename='bank-holiday')
 
 urlpatterns = [
     path('', include(router.urls)),

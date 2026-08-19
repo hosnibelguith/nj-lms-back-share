@@ -14,6 +14,7 @@ from .models import (
     Payment,
     WebhookEvent,
     FundingMethodRecommendation,
+    BankHoliday,
 )
 from accounts.serializers import CustomerSerializer
 from banking.serializers import BankAccountSerializer
@@ -52,6 +53,17 @@ def _payment_balance_after(obj, context):
     if mapped is not None:
         return mapped
     return max(LoanService.money(loan.balance or Decimal('0.00')), Decimal('0.00'))
+
+
+def _loan_holiday_warnings(obj):
+    from .business_calendar import missing_holiday_warning, years_missing_holidays
+
+    dates = [
+        payment.original_date or payment.scheduled_date
+        for payment in obj.payments.all()
+    ]
+    message = missing_holiday_warning(years_missing_holidays(dates))
+    return [message] if message else []
 
 
 def _loan_collected_amount(obj):
@@ -130,16 +142,25 @@ class PaymentSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     type_display = serializers.CharField(source='get_type_display', read_only=True)
     balance_after = serializers.SerializerMethodField()
+    instruction_send_at = serializers.SerializerMethodField()
 
     class Meta:
         model = Payment
         fields = [
             'id', 'loan', 'amount', 'type', 'type_display',
-            'status', 'status_display', 'scheduled_date',
+            'status', 'status_display', 'scheduled_date', 'original_date',
+            'instruction_send_at',
             'processed_at', 'failure_reason', 'reference', 'notes',
             'balance_after', 'created_at', 'created_by'
         ]
-        read_only_fields = ['id', 'created_at', 'processed_at']
+        read_only_fields = ['id', 'created_at', 'processed_at', 'instruction_send_at']
+
+    def get_instruction_send_at(self, obj):
+        from .business_calendar import instruction_send_at as send_at
+
+        if not obj.scheduled_date:
+            return None
+        return send_at(obj.scheduled_date).isoformat()
 
     def get_balance_after(self, obj):
         return _payment_balance_after(obj, self.context)
@@ -158,6 +179,7 @@ class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
     balance_after = serializers.SerializerMethodField()
     original_amount = serializers.SerializerMethodField()
     is_deferral_fee = serializers.SerializerMethodField()
+    instruction_send_at = serializers.SerializerMethodField()
 
     class Meta:
         model = Payment
@@ -168,6 +190,8 @@ class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
             'status',
             'status_display',
             'scheduled_date',
+            'original_date',
+            'instruction_send_at',
             'processed_at',
             'failure_reason',
             'reference',
@@ -184,6 +208,13 @@ class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
     def get_is_deferral_fee(self, obj):
         from .services import LoanService
         return LoanService.is_deferral_fee_payment(obj)
+
+    def get_instruction_send_at(self, obj):
+        from .business_calendar import instruction_send_at as send_at
+
+        if not obj.scheduled_date:
+            return None
+        return send_at(obj.scheduled_date).isoformat()
 
     def get_balance_after(self, obj):
         return _payment_balance_after(obj, self.context)
@@ -255,6 +286,24 @@ class CollectionPaymentSerializer(serializers.ModelSerializer):
             'updated_at',
         ]
         read_only_fields = fields
+
+
+class CollectionExportRowSerializer(serializers.Serializer):
+    id = serializers.UUIDField(allow_null=True)
+    loan_id = serializers.UUIDField()
+    customer_id = serializers.UUIDField()
+    customer_name = serializers.CharField()
+    customer_email = serializers.CharField(allow_blank=True)
+    customer_phone = serializers.CharField(allow_blank=True)
+    reason = serializers.CharField(allow_blank=True, allow_null=True)
+    missed_amount = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        allow_null=True,
+    )
+    balance = serializers.DecimalField(max_digits=10, decimal_places=2)
+    returned_at = serializers.DateTimeField(allow_null=True)
+    status = serializers.CharField()
 
 
 class CollectionsAccountChangeAuditSerializer(serializers.ModelSerializer):
@@ -342,6 +391,7 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     ai_decision_display = serializers.CharField(source='get_ai_decision_display', read_only=True)
     contract_signed = serializers.BooleanField(read_only=True)
+    holiday_warnings = serializers.SerializerMethodField()
 
     class Meta:
         model = Loan
@@ -367,6 +417,7 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
             'contract_signed_at',
             'contract_sent_at',
             'paymentSchedule',
+            'holiday_warnings',
             'created_at',
             'updated_at',
         ]
@@ -382,6 +433,9 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
 
         return LoanService.schedule_frequency_key(obj)
 
+    def get_holiday_warnings(self, obj):
+        return _loan_holiday_warnings(obj)
+
 
 class LoanSerializer(serializers.ModelSerializer):
     """Full loan serializer with nested data."""
@@ -395,6 +449,7 @@ class LoanSerializer(serializers.ModelSerializer):
     ai_decision_display = serializers.CharField(source='get_ai_decision_display', read_only=True)
     type_display = serializers.CharField(source='get_type_display', read_only=True)
     contract_signed = serializers.BooleanField(read_only=True)
+    holiday_warnings = serializers.SerializerMethodField()
 
     class Meta:
         model = Loan
@@ -412,7 +467,7 @@ class LoanSerializer(serializers.ModelSerializer):
             'collections_account_locked_at',
             'contract_id', 'contract_sent_at', 'contract_signed', 'contract_signed_at',
             'approved_at', 'approved_by', 'declined_at', 'decline_reason',
-            'notes', 'payments',
+            'notes', 'payments', 'holiday_warnings',
             'created_at', 'updated_at'
         ]
         read_only_fields = [
@@ -423,6 +478,9 @@ class LoanSerializer(serializers.ModelSerializer):
             'approved_at', 'approved_by', 'declined_at',
             'created_at', 'updated_at'
         ]
+
+    def get_holiday_warnings(self, obj):
+        return _loan_holiday_warnings(obj)
 
 
 class LoanListSerializer(serializers.ModelSerializer):
@@ -734,3 +792,16 @@ class CollectionInitiateSerializer(serializers.Serializer):
 class CollectionsAccountUpdateSerializer(serializers.Serializer):
     bank_account_id = serializers.UUIDField(required=True)
     failed_payment_id = serializers.UUIDField(required=True)
+
+
+class BankHolidaySerializer(serializers.ModelSerializer):
+    year = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = BankHoliday
+        fields = ['id', 'date', 'name', 'year', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'year', 'created_at', 'updated_at']
+
+
+class BankHolidayUploadSerializer(serializers.Serializer):
+    holidays = BankHolidaySerializer(many=True)

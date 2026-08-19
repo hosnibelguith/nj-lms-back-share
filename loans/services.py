@@ -9,6 +9,7 @@ from datetime import timedelta
 from django.db import models, transaction
 from django.utils import timezone
 from accounts.models import Customer
+from . import business_calendar
 from .models import CollectionPayment, FundedPayment, Loan, LoanFormula, Payment
 
 
@@ -1219,7 +1220,13 @@ class LoanService:
 
         proposed = []
         remaining = schedule_total
-        current_date = start_date
+        unadjusted_dates = [
+            business_calendar.unadjusted_date_at(start_date, index, frequency_days)
+            for index in range(num_payments)
+        ]
+        holidays = business_calendar.holiday_dates_for_years(
+            {value.year for value in unadjusted_dates} or {start_date.year}
+        )
         for index in range(num_payments):
             if remaining <= 0:
                 break
@@ -1228,15 +1235,18 @@ class LoanService:
             amount = money(amount)
             if amount <= 0:
                 break
+            date_fields = business_calendar.payment_date_fields(
+                unadjusted_dates[index], holidays=holidays
+            )
             proposed.append(
                 {
-                    'scheduled_date': current_date,
+                    'original_date': date_fields['original_date'],
+                    'scheduled_date': date_fields['scheduled_date'],
                     'amount': amount,
                     'status': 'scheduled',
                 }
             )
             remaining = money(remaining - amount)
-            current_date = current_date + timedelta(days=frequency_days)
 
         def _row(payment):
             return {
@@ -1343,6 +1353,7 @@ class LoanService:
                     loan=loan,
                     amount=row['amount'],
                     scheduled_date=row['scheduled_date'],
+                    original_date=row.get('original_date') or row['scheduled_date'],
                     type='scheduled',
                     status='scheduled',
                 )
@@ -1386,24 +1397,32 @@ class LoanService:
                                   schedule_total: Decimal = None) -> list:
         """Generate a payment schedule for a loan."""
         payments = []
-        current_date = start_date
         remaining = LoanService.money(schedule_total or loan.total_amount)
-        
-        for i in range(num_payments):
+        unadjusted_dates = list(
+            business_calendar.iter_unadjusted_dates(
+                start_date, num_payments, frequency_days
+            )
+        )
+        holidays = business_calendar.holiday_dates_for_years(
+            {value.year for value in unadjusted_dates} or {start_date.year}
+        )
+
+        for i, original_date in enumerate(unadjusted_dates):
             is_last = (i == num_payments - 1)
             amt = remaining if is_last else min(payment_amount, remaining)
             remaining -= amt
-            
+            date_fields = business_calendar.payment_date_fields(
+                original_date, holidays=holidays
+            )
             payment = Payment.objects.create(
                 loan=loan,
                 amount=amt,
-                scheduled_date=current_date,
                 type='scheduled',
-                status='scheduled'
+                status='scheduled',
+                **date_fields,
             )
             payments.append(payment)
-            current_date += timedelta(days=frequency_days)
-        
+
         return payments
 
     @staticmethod
@@ -1500,8 +1519,10 @@ class LoanService:
         amount_changed = False
 
         if scheduled_date is not None and scheduled_date != payment.scheduled_date:
-            payment.scheduled_date = scheduled_date
-            update_fields.append('scheduled_date')
+            date_fields = business_calendar.payment_date_fields(scheduled_date)
+            payment.original_date = date_fields['original_date']
+            payment.scheduled_date = date_fields['scheduled_date']
+            update_fields.extend(['original_date', 'scheduled_date'])
 
         if amount is not None:
             amount = LoanService.money(amount)
@@ -1607,6 +1628,56 @@ class LoanService:
         return Decimal('0.00')
 
     @staticmethod
+    def _collection_failure_original_fill_plan(payments, *, amount: Decimal, cap: Decimal):
+        """Top up original remainder installments to the regular cap.
+
+        Returns leftover extra and ``(payment, new_amount, addition)`` updates.
+        Only scheduled original rows are changed so failed history, pending
+        collections, and generated recovery/fee rows stay intact.
+        """
+        money = LoanService.money
+        remaining = money(amount)
+        cap = money(cap or Decimal('0.00'))
+        updates = []
+        if remaining <= 0 or cap <= 0:
+            return remaining, updates
+
+        originals = [
+            payment
+            for payment in payments
+            if payment.status == 'scheduled'
+            and not LoanService.is_non_installment_fee_payment(payment)
+        ]
+        for payment in reversed(originals):
+            current = money(payment.amount or Decimal('0.00'))
+            space = money(max(cap - current, Decimal('0.00')))
+            if space <= 0:
+                continue
+            addition = min(remaining, space)
+            updates.append((payment, money(current + addition), addition))
+            remaining = money(remaining - addition)
+            if remaining <= 0:
+                break
+        return remaining, updates
+
+    @staticmethod
+    def _collection_failure_original_cap_space(payments, cap: Decimal) -> Decimal:
+        money = LoanService.money
+        cap = money(cap or Decimal('0.00'))
+        if cap <= 0:
+            return Decimal('0.00')
+        space = Decimal('0.00')
+        for payment in payments:
+            if payment.status != 'scheduled':
+                continue
+            if LoanService.is_non_installment_fee_payment(payment):
+                continue
+            current = money(payment.amount or Decimal('0.00'))
+            if current < cap:
+                space += cap - current
+        return money(space)
+
+    @staticmethod
     def _collection_failure_payment_cap(
         loan: Loan,
         failed_payment: Payment | None,
@@ -1642,6 +1713,21 @@ class LoanService:
         if remaining <= 0:
             return None
 
+        originals = list(
+            loan.payments.exclude(status__in=['completed', 'cancelled', 'failed', 'nsf'])
+            .order_by('scheduled_date', 'created_at', 'id')
+        )
+        remaining, original_updates = LoanService._collection_failure_original_fill_plan(
+            originals,
+            amount=remaining,
+            cap=cap,
+        )
+        for payment, new_amount, _addition in original_updates:
+            payment.amount = new_amount
+            payment.save(update_fields=['amount'])
+        if remaining <= 0:
+            return original_updates[-1][0] if original_updates else None
+
         buckets = list(
             loan.payments.filter(
                 notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
@@ -1673,19 +1759,21 @@ class LoanService:
 
         while remaining > 0:
             bucket_amount = min(remaining, cap)
+            unadjusted_date = next_date
+            date_fields = business_calendar.payment_date_fields(unadjusted_date)
             touched_bucket = Payment.objects.create(
                 loan=loan,
                 amount=bucket_amount,
                 type='scheduled',
                 status='scheduled',
-                scheduled_date=next_date,
                 notes=(
                     f'{LoanService.COLLECTION_FAILURE_FEE_NOTE}\n'
                     f'{failure_note}'
                 ),
+                **date_fields,
             )
             remaining = money(remaining - bucket_amount)
-            next_date = next_date + timedelta(days=frequency_days)
+            next_date = unadjusted_date + timedelta(days=frequency_days)
 
         return touched_bucket
 
@@ -1734,6 +1822,11 @@ class LoanService:
                         interest_by_collection_id.get(collection_id, Decimal('0.00'))
                         + interest_amount
                     )
+            elif LoanService.is_collection_failure_fee_payment(payment):
+                interest_amount = LoanService.collection_failure_interest_amount(payment)
+                for collection_id in ids:
+                    if collection_id not in interest_by_collection_id:
+                        interest_by_collection_id[collection_id] = interest_amount
 
         collections = list(
             loan.collection_payments.select_related('payment')
@@ -1773,10 +1866,19 @@ class LoanService:
             for payment in generated_payments
         )
         has_missing_generated_rows = bool(collections) and not generated_payments
+        has_underfilled_original = (
+            bool(collections)
+            and LoanService._collection_failure_original_cap_space(
+                non_generated_payments,
+                cap,
+            )
+            > 0
+        )
         if (
             not legacy_interest_payments
             and not has_over_cap_fee_bucket
             and not has_missing_generated_rows
+            and not has_underfilled_original
         ):
             return {
                 'loan_id': str(loan.id),
@@ -1807,12 +1909,15 @@ class LoanService:
             }
 
         proposed = []
-        recovery_total = Decimal('0.00')
-        extra_total = Decimal('0.00')
         bucket_amount = Decimal('0.00')
         current_bucket_date = bucket_date
         bucket_notes: list[str] = []
         simulated_balance = money(loan.balance or Decimal('0.00'))
+        original_amounts_before = {
+            payment.id: payment.amount
+            for payment in non_generated_payments
+        }
+        original_amount_updates = {}
 
         def flush_bucket():
             nonlocal bucket_amount, current_bucket_date, bucket_notes
@@ -1844,7 +1949,6 @@ class LoanService:
                 collection.payment.amount if collection.payment else collection.amount
             )
             if missed_amount > 0:
-                recovery_total = money(recovery_total + missed_amount)
                 proposed.append({
                     'amount': missed_amount,
                     'status': 'scheduled',
@@ -1868,9 +1972,15 @@ class LoanService:
                     days=frequency_days * 2,
                 )
             extra = money(LoanService.COLLECTION_FAILURE_FEE_AMOUNT + interest)
-            extra_total = money(extra_total + extra)
             simulated_balance = money(simulated_balance + extra)
-            remaining = extra
+            remaining, fill_updates = LoanService._collection_failure_original_fill_plan(
+                non_generated_payments,
+                amount=extra,
+                cap=cap,
+            )
+            for payment, new_amount, _addition in fill_updates:
+                payment.amount = new_amount
+                original_amount_updates[payment.id] = payment
             note = (
                 f'Collection failure id: {collection_id}\n'
                 f'Reason: {reason}\n'
@@ -1898,7 +2008,9 @@ class LoanService:
             (money(payment.amount or Decimal('0.00')) for payment in generated_payments),
             Decimal('0.00'),
         )
-        new_generated_total = money(recovery_total + extra_total)
+        new_generated_total = money(
+            sum((row['amount'] for row in proposed), Decimal('0.00'))
+        )
         completed_sum = sum(
             (
                 money(payment.amount or Decimal('0.00'))
@@ -1948,18 +2060,23 @@ class LoanService:
         }
 
         if dry_run or not collections:
+            for payment in non_generated_payments:
+                payment.amount = original_amounts_before[payment.id]
             return plan
 
+        for payment in original_amount_updates.values():
+            payment.save(update_fields=['amount'])
         for payment in generated_payments:
             payment.delete()
         for row in proposed:
+            date_fields = business_calendar.payment_date_fields(row['scheduled_date'])
             Payment.objects.create(
                 loan=loan,
                 amount=row['amount'],
                 type=row['type'],
                 status=row['status'],
-                scheduled_date=row['scheduled_date'],
                 notes=row['notes'],
+                **date_fields,
             )
 
         loan.balance = balance_after
@@ -2133,10 +2250,12 @@ class LoanService:
             .values_list('scheduled_date', flat=True)
             .first()
         )
-        end_date = (last_other_date or previous_date) + timedelta(days=frequency_days)
-
+        end_unadjusted = (last_other_date or previous_date) + timedelta(days=frequency_days)
+        date_fields = business_calendar.payment_date_fields(end_unadjusted)
+        end_date = date_fields['scheduled_date']
+        payment.original_date = date_fields['original_date']
         payment.scheduled_date = end_date
-        update_fields = ['scheduled_date']
+        update_fields = ['scheduled_date', 'original_date']
         if extra_interest > 0:
             payment.amount = LoanService.money(previous_amount + extra_interest)
             update_fields.append('amount')
@@ -2226,9 +2345,10 @@ class LoanService:
         """Apply the schedule changes for a failed Zūm collection.
 
         The failed installment stays as history and does not pay down the
-        balance. Recovery rows are added before collection-failure fee/interest
-        rows. The $50 fee plus extension interest fills capped extra rows at
-        the normal installment amount before spilling into a new row.
+        balance.         Recovery rows are added before collection-failure fee/interest
+        rows. The $50 fee plus extension interest first tops up any
+        original remainder installment to the normal installment amount,
+        then fills capped extra rows before spilling into a new row.
         """
         collection = CollectionPayment.objects.select_for_update().select_related(
             'loan',
@@ -2291,17 +2411,18 @@ class LoanService:
 
         recovery_payment = None
         if missed_amount > 0:
+            date_fields = business_calendar.payment_date_fields(missed_date)
             recovery_payment = Payment.objects.create(
                 loan=loan,
                 amount=missed_amount,
                 type='scheduled',
                 status='scheduled',
-                scheduled_date=missed_date,
                 notes=(
                     f'{LoanService.COLLECTION_FAILURE_RECOVERY_NOTE} ${missed_amount}\n'
                     f'Collection failure id: {collection_id}\n'
                     f'Reason: {(reason or collection.failure_reason or "Unknown").strip()}'
                 ),
+                **date_fields,
             )
         failure_note = (
             f'Collection failure id: {collection_id}\n'

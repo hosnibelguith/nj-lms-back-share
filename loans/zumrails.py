@@ -692,7 +692,11 @@ def apply_collection_failure(collection: CollectionPayment, *, reason: str, stat
     was_settled = collection.status == "completed"
     collection.status = status
     collection.failure_reason = reason
-    collection.save(update_fields=["status", "failure_reason", "updated_at"])
+    update_fields = ["status", "failure_reason", "updated_at"]
+    if collection.returned_at is None:
+        collection.returned_at = timezone.now()
+        update_fields.append("returned_at")
+    collection.save(update_fields=update_fields)
 
     payment = collection.payment
     if payment and payment.status not in ("failed", "nsf", "cancelled"):

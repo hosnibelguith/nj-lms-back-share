@@ -4,7 +4,7 @@ Simplified Loan Tasks - Only Loan and Payment models.
 """
 from celery import shared_task
 from django.utils import timezone
-from datetime import date, timedelta
+from datetime import timedelta
 import logging
 import uuid
 
@@ -42,16 +42,20 @@ def send_contract_task(loan_id: str):
 @shared_task
 def process_scheduled_payments():
     """
-    Initiate Zūm EFT collections for scheduled payments due today or earlier.
-    Completion is settlement-driven via webhook + process_collection_settlements.
+    Initiate Zūm EFT collections for payments whose send window has opened.
+
+    Instructions are sent after 7:00 PM America/Toronto on the calendar day
+    before the adjusted payment date. Overdue rows remain eligible as catch-up.
     """
+    from .business_calendar import is_instruction_send_ready, local_today
     from .models import Payment
     from .zumrails import CollectionService
 
-    today = date.today()
+    today = local_today()
+    latest_due = today + timedelta(days=1)
 
     payments = Payment.objects.filter(
-        scheduled_date__lte=today,
+        scheduled_date__lte=latest_due,
         status='scheduled',
         loan__status='active',
     ).select_related(
@@ -68,6 +72,9 @@ def process_scheduled_payments():
     errors = 0
 
     for payment in payments:
+        if not is_instruction_send_ready(payment.scheduled_date):
+            skipped += 1
+            continue
         if payment.collection_attempts.filter(status__in=['processing', 'completed']).exists():
             skipped += 1
             continue
@@ -127,7 +134,7 @@ def send_payment_reminders():
     """
     from .models import Payment
     
-    tomorrow = date.today() + timedelta(days=1)
+    tomorrow = timezone.localdate() + timedelta(days=1)
     
     payments = Payment.objects.filter(
         scheduled_date=tomorrow,

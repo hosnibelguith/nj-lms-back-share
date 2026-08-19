@@ -1,6 +1,7 @@
 from django.contrib import admin
 
 from .models import (
+    BankHoliday,
     CollectionPayment,
     CollectionsAccountChangeAudit,
     FundedPayment,
@@ -15,7 +16,7 @@ class PaymentInline(admin.TabularInline):
     model = Payment
     extra = 0
     readonly_fields = ("id", "created_at", "processed_at")
-    fields = ("scheduled_date", "amount", "type", "status", "reference", "processed_at")
+    fields = ("scheduled_date", "original_date", "amount", "type", "status", "reference", "processed_at")
 
 
 class FundedPaymentInline(admin.TabularInline):
@@ -99,3 +100,12 @@ class WebhookEventAdmin(admin.ModelAdmin):
     search_fields = ("processor_transaction_id", "payload_hash")
     readonly_fields = ("id", "received_at", "processed_at")
     date_hierarchy = "received_at"
+
+
+@admin.register(BankHoliday)
+class BankHolidayAdmin(admin.ModelAdmin):
+    list_display = ("date", "name", "created_at")
+    list_filter = ("date",)
+    search_fields = ("name",)
+    ordering = ("date",)
+    date_hierarchy = "date"

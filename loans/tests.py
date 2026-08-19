@@ -20,6 +20,7 @@ from communications.models import Communication, CommunicationTemplate
 
 from .models import CollectionPayment, CollectionsAccountChangeAudit, FundedPayment, FundingMethodRecommendation, Loan, LoanFormula, LoanStateEvent, Payment
 from .services import LoanService
+from .business_calendar import previous_business_day
 from .webhooks import _reopen_loan_after_funding_failure
 from .zumrails import (
     CollectionService,
@@ -140,6 +141,148 @@ class DashboardAnalyticsTests(APITestCase):
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data["totals"]["defaulted_loans_count"], 1)
         self.assertEqual(response.data["totals"]["current_defaulted_loans_count"], 1)
+
+
+@override_settings(ZUMRAILS_DRY_RUN=True)
+class CollectionExportTests(APITestCase):
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            email="collections-agent@example.com",
+            password="password123",
+            full_name="Collections Agent",
+            user_type="staff",
+            is_staff=True,
+            permission_level=4,
+        )
+        self.customer = Customer.objects.create(
+            first_name="Riley",
+            last_name="Cole",
+            email="riley.cole@example.com",
+            phone="4165552222",
+            phone_normalized="4165552222",
+            province="ON",
+            status="active",
+        )
+        self.loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("100.00"),
+            total_amount=Decimal("600.00"),
+            balance=Decimal("423.39"),
+            status="defaulted",
+            is_active=False,
+            funded_at=timezone.now() - timedelta(days=40),
+        )
+        self.client.force_authenticate(self.staff)
+
+    def _add_returned_collection(self, *, amount, reason, returned_at, status="returned"):
+        return CollectionPayment.objects.create(
+            loan=self.loan,
+            amount=Decimal(str(amount)),
+            status=status,
+            failure_reason=reason,
+            initiated_at=returned_at,
+            returned_at=returned_at,
+        )
+
+    def test_returned_collections_filters_by_returned_date(self):
+        inside = timezone.make_aware(datetime(2026, 8, 10, 12, 0))
+        outside = timezone.make_aware(datetime(2026, 7, 1, 12, 0))
+        matching = self._add_returned_collection(
+            amount="176.61",
+            reason="EftFailedInsufficientFunds",
+            returned_at=inside,
+        )
+        self._add_returned_collection(
+            amount="50.00",
+            reason="EftFailedAccountClosed",
+            returned_at=outside,
+        )
+        CollectionPayment.objects.create(
+            loan=self.loan,
+            amount=Decimal("176.61"),
+            status="processing",
+            initiated_at=inside,
+        )
+
+        response = self.client.get(
+            "/api/loans/returned-collections/",
+            {"date_from": "2026-08-01", "date_to": "2026-08-31", "export": "1"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(len(response.data), 1)
+        row = response.data[0]
+        self.assertEqual(row["id"], str(matching.id))
+        self.assertEqual(row["customer_name"], "Riley Cole")
+        self.assertEqual(row["customer_email"], "riley.cole@example.com")
+        self.assertEqual(row["customer_phone"], "4165552222")
+        self.assertEqual(row["reason"], "EftFailedInsufficientFunds")
+        self.assertEqual(Decimal(str(row["missed_amount"])), Decimal("176.61"))
+        self.assertEqual(Decimal(str(row["balance"])), Decimal("423.39"))
+        self.assertTrue(row["returned_at"].startswith("2026-08-10"))
+
+    def test_status_summary_defaulted_ignores_loan_date_filter(self):
+        summary = self.client.get(
+            "/api/loans/status-summary/",
+            {"date_from": "2026-08-01", "date_to": "2026-08-31"},
+        )
+        self.assertEqual(summary.status_code, 200, summary.data)
+        self.assertEqual(summary.data["defaulted"], 1)
+        self.assertEqual(summary.data["active"], 0)
+
+        listed = self.client.get(
+            "/api/loans/",
+            {
+                "status": "defaulted",
+                "date_from": "2026-08-01",
+                "date_to": "2026-08-31",
+            },
+        )
+        self.assertEqual(listed.status_code, 200, listed.data)
+        self.assertEqual(listed.data["count"], 0)
+
+    def test_defaulted_collections_export_uses_latest_missed_payment(self):
+        older = timezone.make_aware(datetime(2026, 7, 20, 12, 0))
+        newer = timezone.make_aware(datetime(2026, 8, 12, 9, 0))
+        self._add_returned_collection(
+            amount="100.00",
+            reason="EftFailedAccountClosed",
+            returned_at=older,
+        )
+        self._add_returned_collection(
+            amount="176.61",
+            reason="EftFailedStopPayment",
+            returned_at=newer,
+        )
+
+        response = self.client.get("/api/loans/defaulted-collections/")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(len(response.data), 1)
+        row = response.data[0]
+        self.assertEqual(row["customer_name"], "Riley Cole")
+        self.assertEqual(row["customer_email"], "riley.cole@example.com")
+        self.assertEqual(row["customer_phone"], "4165552222")
+        self.assertEqual(row["reason"], "EftFailedStopPayment")
+        self.assertEqual(Decimal(str(row["missed_amount"])), Decimal("176.61"))
+        self.assertEqual(Decimal(str(row["balance"])), Decimal("423.39"))
+
+    def test_apply_collection_failure_sets_returned_at(self):
+        from loans.zumrails import apply_collection_failure
+
+        collection = CollectionPayment.objects.create(
+            loan=self.loan,
+            amount=Decimal("176.61"),
+            status="processing",
+        )
+        apply_collection_failure(
+            collection,
+            reason="EftFailedInsufficientFunds",
+            status="returned",
+        )
+        collection.refresh_from_db()
+        self.assertEqual(collection.status, "returned")
+        self.assertIsNotNone(collection.returned_at)
 
 
 @override_settings(
@@ -749,7 +892,7 @@ class ZumRailsWorkflowTests(APITestCase):
         self.loan.refresh_from_db()
         payments = list(self.loan.payments.filter(status="scheduled").order_by("scheduled_date"))
 
-        self.assertEqual(payments[0].scheduled_date, start_date)
+        self.assertEqual(payments[0].scheduled_date, previous_business_day(start_date))
         self.assertTrue(all(payment.amount <= Decimal("180.00") for payment in payments))
         self.assertEqual(sum((payment.amount for payment in payments), Decimal("0.00")), self.loan.total_amount)
         self.assertGreater(self.loan.fee, Decimal("350.00"))
@@ -846,7 +989,7 @@ class ZumRailsWorkflowTests(APITestCase):
         scheduled = list(self.loan.payments.filter(status="scheduled").order_by("scheduled_date"))
 
         self.assertEqual(len(scheduled), 6)
-        self.assertEqual(scheduled[0].scheduled_date, start_date)
+        self.assertEqual(scheduled[0].scheduled_date, previous_business_day(start_date))
         self.assertEqual(sum((payment.amount for payment in scheduled), Decimal("0.00")), self.loan.balance)
         self.assertEqual(scheduled[-1].amount, self.loan.balance - sum((payment.amount for payment in scheduled[:-1]), Decimal("0.00")))
         self.assertTrue(
@@ -876,7 +1019,8 @@ class ZumRailsWorkflowTests(APITestCase):
 
         self.assertEqual(response.status_code, 200, response.data)
         payment.refresh_from_db()
-        self.assertEqual(payment.scheduled_date, new_date)
+        self.assertEqual(payment.original_date, new_date)
+        self.assertEqual(payment.scheduled_date, previous_business_day(new_date))
         self.assertEqual(payment.amount, Decimal("125.50"))
 
     def test_update_scheduled_payment_rebalances_later_installments(self):
@@ -2691,7 +2835,8 @@ class PaymentScheduleIntegrityTests(APITestCase):
         self.assertEqual(response.status_code, 200, response.data)
         first.refresh_from_db()
         second.refresh_from_db()
-        self.assertEqual(first.scheduled_date, new_date)
+        self.assertEqual(first.original_date, new_date)
+        self.assertEqual(first.scheduled_date, previous_business_day(new_date))
         self.assertEqual(first.amount, Decimal("200.00"))
         self.assertEqual(second.amount, Decimal("683.09"))
 
@@ -3036,12 +3181,24 @@ class PaymentScheduleIntegrityTests(APITestCase):
         fee = self.loan.payments.get(
             notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
         )
+        last.refresh_from_db()
+        extra_interest = LoanService._period_interest_for_balance(
+            self.loan,
+            outstanding=Decimal("687.57"),
+            days=14,
+        )
+        extra = LoanService.money(
+            LoanService.COLLECTION_FAILURE_FEE_AMOUNT + extra_interest
+        )
+        leftover = extra - (Decimal("176.61") - Decimal("157.74"))
+        self.assertEqual(leftover, Decimal("40.36"))
         self.assertEqual(plan["collections_count"], 1)
         self.assertEqual(plan["delete_count"], 0)
         self.assertEqual(plan["create_count"], 2)
+        self.assertEqual(last.amount, Decimal("176.61"))
         self.assertEqual(recovery.amount, Decimal("176.61"))
         self.assertEqual(recovery.scheduled_date, last.scheduled_date + timedelta(days=7))
-        self.assertEqual(fee.amount, Decimal("59.23"))
+        self.assertEqual(fee.amount, leftover)
         self.assertEqual(fee.scheduled_date, last.scheduled_date + timedelta(days=14))
         self.assertIn(f"Collection failure id: {collection.id}", fee.notes)
         self.assertEqual(self.loan.balance, Decimal("746.80"))
@@ -3052,9 +3209,136 @@ class PaymentScheduleIntegrityTests(APITestCase):
         self.assertEqual(balances[str(failed.id)], Decimal("746.80"))
         self.assertEqual(balances[str(third.id)], Decimal("570.19"))
         self.assertEqual(balances[str(fourth.id)], Decimal("393.58"))
-        self.assertEqual(balances[str(last.id)], Decimal("235.84"))
-        self.assertEqual(balances[str(recovery.id)], Decimal("59.23"))
+        self.assertEqual(balances[str(last.id)], Decimal("216.97"))
+        self.assertEqual(balances[str(recovery.id)], leftover)
         self.assertEqual(balances[str(fee.id)], Decimal("0.00"))
+
+    def test_collection_failure_fills_remainder_installment_up_to_cap(self):
+        """NSF extra tops up the last original remainder before a leftover fee row."""
+        first = self._add_payment("176.61", status="completed")
+        failed = self._add_payment("176.61", days=7, status="failed")
+        third = self._add_payment("176.61", days=14)
+        fourth = self._add_payment("176.61", days=21)
+        last = self._add_payment("157.74", days=28)
+        collection = CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=failed,
+            amount=failed.amount,
+            status="failed",
+            failure_reason="EftFailedStopPayment",
+        )
+        self.formula.default_frequency_days = 7
+        self.formula.save(update_fields=["default_frequency_days", "updated_at"])
+        self.loan.balance = Decimal("687.57")
+        self.loan.total_amount = Decimal("864.18")
+        self.loan.fee = Decimal("364.18")
+        self.loan.save(update_fields=["balance", "total_amount", "fee"])
+        extra_interest = LoanService._deferral_extra_interest(self.loan, 14)
+        extra = LoanService.money(
+            LoanService.COLLECTION_FAILURE_FEE_AMOUNT + extra_interest
+        )
+        leftover = extra - (Decimal("176.61") - Decimal("157.74"))
+        self.assertEqual(leftover, Decimal("40.36"))
+
+        fee = LoanService.apply_collection_failure_fee(
+            collection,
+            reason="EftFailedStopPayment",
+        )
+
+        last.refresh_from_db()
+        self.loan.refresh_from_db()
+        recovery = self.loan.payments.get(
+            notes__startswith=LoanService.COLLECTION_FAILURE_RECOVERY_NOTE
+        )
+        self.assertEqual(last.amount, Decimal("176.61"))
+        self.assertEqual(recovery.amount, Decimal("176.61"))
+        self.assertEqual(fee.amount, leftover)
+        self.assertEqual(self.loan.balance, Decimal("687.57") + extra)
+        self.assertEqual(
+            [p.amount for p in self.loan.payments.exclude(status="cancelled").order_by(
+                "scheduled_date", "created_at", "id"
+            )],
+            [
+                Decimal("176.61"),
+                Decimal("176.61"),
+                Decimal("176.61"),
+                Decimal("176.61"),
+                Decimal("176.61"),
+                Decimal("176.61"),
+                leftover,
+            ],
+        )
+        balances = self._balance_after_map()
+        self.assertEqual(balances[str(first.id)], self.loan.balance)
+        self.assertEqual(balances[str(failed.id)], self.loan.balance)
+        self.assertEqual(balances[str(last.id)], leftover + recovery.amount)
+        self.assertEqual(balances[str(recovery.id)], leftover)
+        self.assertEqual(balances[str(fee.id)], Decimal("0.00"))
+
+    def test_rebuild_collection_failure_schedule_fills_existing_remainder_row(self):
+        """Already-generated NSF rows still top up an under-cap original remainder."""
+        self._add_payment("176.61", status="completed")
+        failed = self._add_payment("176.61", days=7, status="failed")
+        self._add_payment("176.61", days=14)
+        self._add_payment("176.61", days=21)
+        last = self._add_payment("157.74", days=28)
+        collection = CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=failed,
+            amount=failed.amount,
+            status="failed",
+            failure_reason="EftFailedStopPayment",
+        )
+        self.formula.default_frequency_days = 7
+        self.formula.save(update_fields=["default_frequency_days", "updated_at"])
+        extra_interest = Decimal("9.23")
+        extra = Decimal("59.23")
+        leftover = extra - (Decimal("176.61") - Decimal("157.74"))
+        self.assertEqual(leftover, Decimal("40.36"))
+        self._add_payment(
+            "176.61",
+            days=35,
+            notes=(
+                f"{LoanService.COLLECTION_FAILURE_RECOVERY_NOTE} $176.61\n"
+                f"Collection failure id: {collection.id}\n"
+                "Reason: EftFailedStopPayment"
+            ),
+        )
+        self._add_payment(
+            "59.23",
+            days=42,
+            notes=(
+                f"{LoanService.COLLECTION_FAILURE_FEE_NOTE}\n"
+                f"Collection failure id: {collection.id}\n"
+                "Reason: EftFailedStopPayment\n"
+                "NSF fee: $50.00\n"
+                f"Extension interest: ${extra_interest}"
+            ),
+        )
+        self.loan.balance = Decimal("746.80")
+        self.loan.total_amount = Decimal("923.41")
+        self.loan.fee = Decimal("423.41")
+        self.loan.save(update_fields=["balance", "total_amount", "fee"])
+
+        plan = LoanService.rebuild_collection_failure_schedule(
+            self.loan,
+            dry_run=False,
+        )
+
+        last.refresh_from_db()
+        self.loan.refresh_from_db()
+        recovery = self.loan.payments.get(
+            notes__startswith=LoanService.COLLECTION_FAILURE_RECOVERY_NOTE
+        )
+        fee = self.loan.payments.get(
+            notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE
+        )
+        self.assertEqual(plan["collections_count"], 1)
+        self.assertEqual(last.amount, Decimal("176.61"))
+        self.assertEqual(recovery.amount, Decimal("176.61"))
+        self.assertEqual(fee.amount, leftover)
+        self.assertEqual(self.loan.balance, Decimal("746.80"))
+        self.assertEqual(self.loan.total_amount, Decimal("923.41"))
 
     def test_edit_rejects_payment_with_processing_collection(self):
         payment = self._add_payment("147.18")
@@ -3130,7 +3414,10 @@ class PaymentScheduleIntegrityTests(APITestCase):
             self.loan.payments.filter(status="scheduled").order_by("scheduled_date")
         )
         self.assertGreaterEqual(len(after_first), 1)
-        self.assertEqual(after_first[0].scheduled_date, start_a)
+        self.assertEqual(
+            after_first[0].scheduled_date,
+            previous_business_day(start_a),
+        )
 
         second = self.client.patch(
             f"/api/loans/{self.loan.id}/adjust-schedule/",
@@ -3148,7 +3435,10 @@ class PaymentScheduleIntegrityTests(APITestCase):
             self.loan.payments.filter(status="scheduled").order_by("scheduled_date")
         )
         self.assertEqual(len(after_second), 4)
-        self.assertEqual(after_second[0].scheduled_date, start_b)
+        self.assertEqual(
+            after_second[0].scheduled_date,
+            previous_business_day(start_b),
+        )
         self.assertEqual(
             sum((p.amount for p in after_second), Decimal("0.00")),
             self.loan.balance,

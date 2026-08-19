@@ -496,6 +496,11 @@ class Payment(models.Model):
     type = models.CharField(max_length=20, choices=TYPE_CHOICES, default='scheduled')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='scheduled')
     scheduled_date = models.DateField(help_text="Date payment is scheduled for")
+    original_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Unadjusted scheduled date before weekend/holiday shift",
+    )
     
     # Processing
     processed_at = models.DateTimeField(null=True, blank=True)
@@ -681,6 +686,7 @@ class CollectionPayment(models.Model):
     )
     settlement_due_at = models.DateTimeField(null=True, blank=True, db_index=True)
     settled_at = models.DateTimeField(null=True, blank=True)
+    returned_at = models.DateTimeField(null=True, blank=True, db_index=True)
     failure_reason = models.TextField(blank=True, null=True)
     event_history = models.JSONField(default=list, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -807,3 +813,31 @@ class LoanStateEvent(models.Model):
 
     def __str__(self):
         return f"{self.loan_id} - {self.event_type} - {self.created_at}"
+
+
+class BankHoliday(models.Model):
+    """Year-based Canadian bank holiday used for payment-date adjustment."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    date = models.DateField(unique=True)
+    name = models.CharField(max_length=255)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        'accounts.User',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='created_bank_holidays',
+    )
+
+    class Meta:
+        db_table = 'loans_bank_holiday'
+        ordering = ['date']
+
+    def __str__(self):
+        return f"{self.date} {self.name}"
+
+    @property
+    def year(self):
+        return self.date.year

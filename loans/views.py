@@ -20,6 +20,7 @@ from .models import (
     LoanStateEvent,
     FundedPayment,
     LoanFormula,
+    BankHoliday,
 )
 from .services import LoanService
 from .zumrails import (
@@ -31,6 +32,7 @@ from .zumrails import (
     funding_configuration_ready,
 )
 from .serializers import (
+    CollectionExportRowSerializer,
     CollectionInitiateSerializer,
     CollectionPaymentSerializer,
     CollectionsAccountChangeAuditSerializer,
@@ -55,6 +57,7 @@ from .serializers import (
     LoanStateEventSerializer,
     LoanReactivateSerializer,
     FundedPaymentSerializer,
+    BankHolidaySerializer,
 )
 
 
@@ -165,7 +168,48 @@ class LoanViewSet(viewsets.ModelViewSet):
             funding_failure_status=Subquery(latest_failed.values('status')[:1]),
         )
 
-    def _filtered_queryset(self, *, ignore_status=False):
+    RETURNED_COLLECTION_STATUSES = ('failed', 'returned', 'rejected')
+
+    @classmethod
+    def _returned_collections_queryset(cls, request):
+        qs = CollectionPayment.objects.filter(
+            status__in=cls.RETURNED_COLLECTION_STATUSES,
+        ).select_related('loan', 'loan__customer', 'payment').annotate(
+            effective_returned_at=Coalesce('returned_at', 'updated_at'),
+        )
+        date_from = request.query_params.get('date_from')
+        if date_from:
+            parsed_from = parse_date(date_from)
+            if parsed_from:
+                qs = qs.filter(effective_returned_at__date__gte=parsed_from)
+        date_to = request.query_params.get('date_to')
+        if date_to:
+            parsed_to = parse_date(date_to)
+            if parsed_to:
+                qs = qs.filter(effective_returned_at__date__lte=parsed_to)
+        return qs.order_by('-effective_returned_at', '-created_at')
+
+    @staticmethod
+    def _collection_export_row(collection):
+        customer = collection.loan.customer
+        name = (
+            f'{(customer.first_name or "").strip()} {(customer.last_name or "").strip()}'
+        ).strip()
+        return {
+            'id': collection.id,
+            'loan_id': collection.loan_id,
+            'customer_id': customer.id,
+            'customer_name': name or (customer.email or ''),
+            'customer_email': customer.email or '',
+            'customer_phone': customer.phone or '',
+            'reason': collection.failure_reason or '',
+            'missed_amount': collection.amount,
+            'balance': collection.loan.balance,
+            'returned_at': collection.returned_at or collection.updated_at,
+            'status': collection.status,
+        }
+
+    def _filtered_queryset(self, *, ignore_status=False, ignore_dates=False):
         qs = super().get_queryset()
 
         status_param = None if ignore_status else self.request.query_params.get('status')
@@ -281,23 +325,24 @@ class LoanViewSet(viewsets.ModelViewSet):
 
                 qs = qs.filter(filters)
 
-        date_from = self.request.query_params.get('date_from')
-        if date_from:
-            parsed_from = parse_date(date_from)
-            if parsed_from:
-                qs = qs.filter(
-                    Q(funded_at__date__gte=parsed_from) |
-                    Q(funded_at__isnull=True, created_at__date__gte=parsed_from)
-                )
+        if not ignore_dates:
+            date_from = self.request.query_params.get('date_from')
+            if date_from:
+                parsed_from = parse_date(date_from)
+                if parsed_from:
+                    qs = qs.filter(
+                        Q(funded_at__date__gte=parsed_from) |
+                        Q(funded_at__isnull=True, created_at__date__gte=parsed_from)
+                    )
 
-        date_to = self.request.query_params.get('date_to')
-        if date_to:
-            parsed_to = parse_date(date_to)
-            if parsed_to:
-                qs = qs.filter(
-                    Q(funded_at__date__lte=parsed_to) |
-                    Q(funded_at__isnull=True, created_at__date__lte=parsed_to)
-                )
+            date_to = self.request.query_params.get('date_to')
+            if date_to:
+                parsed_to = parse_date(date_to)
+                if parsed_to:
+                    qs = qs.filter(
+                        Q(funded_at__date__lte=parsed_to) |
+                        Q(funded_at__isnull=True, created_at__date__lte=parsed_to)
+                    )
 
         ordering = self.request.query_params.get('ordering')
         allowed_ordering = {
@@ -332,6 +377,10 @@ class LoanViewSet(viewsets.ModelViewSet):
         filters (search, province, AI, IBV, dates) still apply.
         """
         qs = self._filtered_queryset(ignore_status=True)
+        defaulted_count = self._filtered_queryset(
+            ignore_status=True,
+            ignore_dates=True,
+        ).filter(status='defaulted').count()
         by_status = {
             row['status']: row['count']
             for row in qs.values('status').annotate(count=Count('id'))
@@ -361,7 +410,7 @@ class LoanViewSet(viewsets.ModelViewSet):
             'declined': by_status.get('human_declined', 0),
             'expired': by_status.get('expired', 0),
             'paid_off': by_status.get('paid_off', 0),
-            'defaulted': by_status.get('defaulted', 0),
+            'defaulted': defaulted_count,
         })
 
     # =====================================================
@@ -736,6 +785,70 @@ class LoanViewSet(viewsets.ModelViewSet):
         payments = loan.collection_payments.all().order_by('-initiated_at', '-created_at')
         return Response(CollectionPaymentSerializer(payments, many=True).data)
 
+    @action(detail=False, methods=['get'], url_path='returned-collections')
+    def returned_collections(self, request):
+        """Returned/failed collection attempts, filterable by returned date."""
+        qs = self._returned_collections_queryset(request)
+        export = (request.query_params.get('export') or '').strip().lower() in (
+            '1',
+            'true',
+            'yes',
+            'csv',
+        )
+        rows = [self._collection_export_row(item) for item in qs]
+        if export:
+            return Response(CollectionExportRowSerializer(rows, many=True).data)
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            page_rows = [self._collection_export_row(item) for item in page]
+            return self.get_paginated_response(
+                CollectionExportRowSerializer(page_rows, many=True).data
+            )
+        return Response(CollectionExportRowSerializer(rows, many=True).data)
+
+    @action(detail=False, methods=['get'], url_path='defaulted-collections')
+    def defaulted_collections(self, request):
+        """Current defaulted loans with the latest missed collection details."""
+        latest = CollectionPayment.objects.filter(
+            loan_id=OuterRef('pk'),
+            status__in=self.RETURNED_COLLECTION_STATUSES,
+        ).order_by('-returned_at', '-updated_at', '-created_at')
+        loans = (
+            self._filtered_queryset(ignore_status=True, ignore_dates=True)
+            .filter(status='defaulted')
+            .select_related('customer')
+            .annotate(
+                missed_amount=Subquery(latest.values('amount')[:1]),
+                missed_reason=Subquery(latest.values('failure_reason')[:1]),
+                missed_returned_at=Subquery(
+                    latest.values('returned_at')[:1]
+                ),
+                missed_status=Subquery(latest.values('status')[:1]),
+                missed_id=Subquery(latest.values('id')[:1]),
+            )
+            .order_by('-updated_at', '-created_at')
+        )
+        rows = []
+        for loan in loans:
+            customer = loan.customer
+            name = (
+                f'{(customer.first_name or "").strip()} {(customer.last_name or "").strip()}'
+            ).strip()
+            rows.append({
+                'id': loan.missed_id,
+                'loan_id': loan.id,
+                'customer_id': customer.id,
+                'customer_name': name or (customer.email or ''),
+                'customer_email': customer.email or '',
+                'customer_phone': customer.phone or '',
+                'reason': loan.missed_reason or '',
+                'missed_amount': loan.missed_amount,
+                'balance': loan.balance,
+                'returned_at': loan.missed_returned_at,
+                'status': loan.missed_status or loan.status,
+            })
+        return Response(CollectionExportRowSerializer(rows, many=True).data)
+
     @action(detail=True, methods=['post'])
     def record_payment(self, request, pk=None):
         loan = self.get_object()
@@ -1062,3 +1175,167 @@ class PaymentViewSet(viewsets.ModelViewSet):
         payment = self.get_object()
         payment.mark_nsf()
         return Response(PaymentSerializer(payment).data)
+
+
+def _parse_holiday_csv(uploaded_file):
+    import csv
+    import io
+
+    text = uploaded_file.read()
+    if isinstance(text, bytes):
+        text = text.decode('utf-8-sig')
+    reader = csv.DictReader(io.StringIO(text))
+    rows = []
+    for row in reader:
+        date_value = (row.get('date') or row.get('Date') or '').strip()
+        name_value = (row.get('name') or row.get('Name') or '').strip()
+        if date_value and name_value:
+            rows.append({'date': date_value, 'name': name_value})
+    return rows
+
+
+class BankHolidayViewSet(viewsets.ModelViewSet):
+    """Year-based bank holiday calendar for 2026–2031."""
+
+    queryset = BankHoliday.objects.all()
+    serializer_class = BankHolidaySerializer
+    permission_classes = [StaffOnlyPermission]
+    http_method_names = ['get', 'post', 'delete', 'head', 'options']
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        year = self.request.query_params.get('year')
+        if year:
+            try:
+                qs = qs.filter(date__year=int(year))
+            except (TypeError, ValueError):
+                qs = qs.none()
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        from .business_calendar import (
+            MANAGED_HOLIDAY_YEARS,
+            holiday_write_block_message,
+            holiday_writes_blocked,
+        )
+
+        if holiday_writes_blocked():
+            return Response({'error': holiday_write_block_message()}, status=400)
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        holiday_date = serializer.validated_data['date']
+        if holiday_date.year not in MANAGED_HOLIDAY_YEARS:
+            return Response(
+                {
+                    'error': (
+                        f'Holiday date must fall in {MANAGED_HOLIDAY_YEARS[0]}–'
+                        f'{MANAGED_HOLIDAY_YEARS[-1]}.'
+                    )
+                },
+                status=400,
+            )
+        serializer.save(created_by=request.user)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['get'])
+    def calendar(self, request):
+        from django.conf import settings as django_settings
+
+        from .business_calendar import (
+            BUSINESS_TIMEZONE_NAME,
+            INSTRUCTION_SEND_TIME,
+            MANAGED_HOLIDAY_YEARS,
+            MIN_UPLOAD_YEARS,
+            holiday_writes_blocked,
+        )
+
+        holidays = list(BankHoliday.objects.order_by('date'))
+        by_year = {year: [] for year in MANAGED_HOLIDAY_YEARS}
+        for holiday in holidays:
+            if holiday.date.year in by_year:
+                by_year[holiday.date.year].append(BankHolidaySerializer(holiday).data)
+        years = [
+            {
+                'year': year,
+                'count': len(by_year[year]),
+                'holidays': by_year[year],
+            }
+            for year in MANAGED_HOLIDAY_YEARS
+        ]
+        blocked = holiday_writes_blocked()
+        return Response({
+            'timezone': getattr(django_settings, 'TIME_ZONE', BUSINESS_TIMEZONE_NAME),
+            'instruction_send_time': INSTRUCTION_SEND_TIME.strftime('%H:%M'),
+            'managed_years': list(MANAGED_HOLIDAY_YEARS),
+            'min_upload_years': MIN_UPLOAD_YEARS,
+            'uploads_blocked': blocked,
+            'uploads_blocked_reason': (
+                'Bank holiday calendars cannot be uploaded on January 1.'
+                if blocked else None
+            ),
+            'years': years,
+        })
+
+    @action(detail=False, methods=['post'])
+    def upload(self, request):
+        from .business_calendar import (
+            MANAGED_HOLIDAY_YEARS,
+            MIN_UPLOAD_YEARS,
+            holiday_write_block_message,
+            holiday_writes_blocked,
+        )
+
+        if holiday_writes_blocked():
+            return Response({'error': holiday_write_block_message()}, status=400)
+
+        raw_holidays = request.data.get('holidays')
+        if raw_holidays is None and request.FILES.get('file'):
+            raw_holidays = _parse_holiday_csv(request.FILES['file'])
+        if not isinstance(raw_holidays, list) or not raw_holidays:
+            return Response(
+                {'error': 'Upload a list of holidays with date and name.'},
+                status=400,
+            )
+
+        serializer = BankHolidaySerializer(data=raw_holidays, many=True)
+        serializer.is_valid(raise_exception=True)
+        rows = serializer.validated_data
+        years = {row['date'].year for row in rows}
+        if any(year not in MANAGED_HOLIDAY_YEARS for year in years):
+            return Response(
+                {
+                    'error': (
+                        f'Holiday dates must fall in {MANAGED_HOLIDAY_YEARS[0]}–'
+                        f'{MANAGED_HOLIDAY_YEARS[-1]}.'
+                    )
+                },
+                status=400,
+            )
+        if len(years) < MIN_UPLOAD_YEARS:
+            return Response(
+                {
+                    'error': (
+                        f'Uploading a holiday calendar must cover at least '
+                        f'{MIN_UPLOAD_YEARS} years.'
+                    )
+                },
+                status=400,
+            )
+
+        created = 0
+        updated = 0
+        for row in rows:
+            _, was_created = BankHoliday.objects.update_or_create(
+                date=row['date'],
+                defaults={'name': row['name'], 'created_by': request.user},
+            )
+            if was_created:
+                created += 1
+            else:
+                updated += 1
+        return Response({
+            'created': created,
+            'updated': updated,
+            'years': sorted(years),
+        })
