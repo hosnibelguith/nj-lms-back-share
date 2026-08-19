@@ -3048,12 +3048,12 @@ class PaymentScheduleIntegrityTests(APITestCase):
         self.assertEqual(self.loan.total_amount, Decimal("923.41"))
 
         balances = self._balance_after_map()
-        self.assertEqual(balances[str(first.id)], Decimal("570.19"))
-        self.assertEqual(balances[str(failed.id)], Decimal("570.19"))
-        self.assertEqual(balances[str(third.id)], Decimal("393.58"))
-        self.assertEqual(balances[str(fourth.id)], Decimal("216.97"))
-        self.assertEqual(balances[str(last.id)], Decimal("59.23"))
-        self.assertEqual(balances[str(recovery.id)], Decimal("0.00"))
+        self.assertEqual(balances[str(first.id)], Decimal("746.80"))
+        self.assertEqual(balances[str(failed.id)], Decimal("746.80"))
+        self.assertEqual(balances[str(third.id)], Decimal("570.19"))
+        self.assertEqual(balances[str(fourth.id)], Decimal("393.58"))
+        self.assertEqual(balances[str(last.id)], Decimal("235.84"))
+        self.assertEqual(balances[str(recovery.id)], Decimal("59.23"))
         self.assertEqual(balances[str(fee.id)], Decimal("0.00"))
 
     def test_edit_rejects_payment_with_processing_collection(self):

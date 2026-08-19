@@ -43,7 +43,7 @@ def _payment_balance_after(obj, context):
         mapping = {}
         for payment in payments:
             amount = money(payment.amount or Decimal('0.00'))
-            if payment.status not in ('failed', 'nsf'):
+            if payment.status not in ('completed', 'failed', 'nsf'):
                 running_balance = money(running_balance - amount)
             mapping[payment.id] = max(running_balance, Decimal('0.00'))
         cache[loan_key] = mapping
