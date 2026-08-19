@@ -316,6 +316,8 @@ class CollectionExportTests(APITestCase):
 
     @patch("loans.zumrails.ZumRailsService.get_transaction")
     def test_returned_collections_includes_locally_completed_zum_failures(self, mock_get_tx):
+        from loans.zumrails import SettlementService
+
         mock_get_tx.return_value = {
             "Id": "zum-missed-completed-1",
             "TransactionStatus": "Failed",
@@ -336,6 +338,12 @@ class CollectionExportTests(APITestCase):
             settled_at=timezone.now() - timedelta(days=6),
         )
 
+        SettlementService.reconcile_missed_failures()
+        missed.refresh_from_db()
+        self.assertEqual(missed.status, "failed")
+        self.assertEqual(missed.failure_reason, "EftFailedStopPayment")
+        mock_get_tx.assert_called()
+
         response = self.client.get(
             "/api/loans/returned-collections/",
             {"export": "1"},
@@ -344,10 +352,53 @@ class CollectionExportTests(APITestCase):
         self.assertEqual(response.status_code, 200, response.data)
         ids = {row["id"] for row in response.data}
         self.assertEqual(ids, {str(visible.id), str(missed.id)})
-        missed.refresh_from_db()
-        self.assertEqual(missed.status, "failed")
-        self.assertEqual(missed.failure_reason, "EftFailedStopPayment")
-        mock_get_tx.assert_called()
+
+    @patch("loans.zumrails.ZumRailsService.get_transaction")
+    def test_returned_collections_list_does_not_call_zum(self, mock_get_tx):
+        mock_get_tx.side_effect = RuntimeError("Zūm must not be called from the list endpoint")
+        visible = self._add_returned_collection(
+            amount="147.18",
+            reason="EftFailedInsufficientFunds",
+            returned_at=timezone.now(),
+        )
+        CollectionPayment.objects.create(
+            loan=self.loan,
+            amount=Decimal("147.18"),
+            status="completed",
+            processor_transaction_id="stale-completed-1",
+            initiated_at=timezone.now() - timedelta(days=11),
+            settled_at=timezone.now() - timedelta(days=6),
+        )
+
+        response = self.client.get(
+            "/api/loans/returned-collections/",
+            {"export": "1"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["id"], str(visible.id))
+        mock_get_tx.assert_not_called()
+
+    @patch(
+        "loans.views.SettlementService.reconcile_missed_failures",
+        side_effect=RuntimeError("heal failed"),
+    )
+    def test_returned_collections_lists_when_reconcile_raises(self, _mock_reconcile):
+        matching = self._add_returned_collection(
+            amount="176.61",
+            reason="EftFailedInsufficientFunds",
+            returned_at=timezone.now(),
+        )
+
+        response = self.client.get(
+            "/api/loans/returned-collections/",
+            {"export": "1"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["id"], str(matching.id))
 
     def test_loan_status_display_for_defaulted_is_in_collections(self):
         from loans.models import Loan
@@ -927,7 +978,7 @@ class ZumRailsWorkflowTests(APITestCase):
 
         self.assertIn(response.status_code, [400, 403])
         if response.status_code == 400:
-        self.assertIn("schedule_confirmed", response.data)
+            self.assertIn("schedule_confirmed", response.data)
 
     def test_adjust_schedule_reprices_daily_interest_from_selected_terms(self):
         formula = LoanFormula.objects.create(

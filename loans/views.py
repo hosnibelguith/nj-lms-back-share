@@ -1,4 +1,5 @@
 from decimal import Decimal
+import logging
 import re
 
 from rest_framework import viewsets, status, permissions
@@ -59,6 +60,8 @@ from .serializers import (
     FundedPaymentSerializer,
     BankHolidaySerializer,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class StaffOnlyPermission(permissions.BasePermission):
@@ -797,7 +800,10 @@ class LoanViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='returned-collections')
     def returned_collections(self, request):
         """Returned/failed collection attempts, filterable by returned date."""
-        SettlementService.reconcile_missed_failures()
+        try:
+            SettlementService.reconcile_missed_failures(local_only=True)
+        except Exception:
+            logger.exception("Unable to heal local collection failures before listing")
         qs = self._returned_collections_queryset(request)
         export = (request.query_params.get('export') or '').strip().lower() in (
             '1',

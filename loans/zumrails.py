@@ -2051,8 +2051,12 @@ class SettlementService:
         return collection
 
     @staticmethod
-    def reconcile_missed_failures(*, limit: int = 25) -> int:
-        """Heal collections Zūm already failed but local status never flipped."""
+    def reconcile_missed_failures(*, limit: int = 25, local_only: bool = False) -> int:
+        """Heal collections Zūm already failed but local status never flipped.
+
+        ``local_only`` skips Zūm HTTP lookups so staff list endpoints cannot
+        500/timeout when the processor is slow or unreachable.
+        """
         now = timezone.now()
         seen = set()
         healed = 0
@@ -2062,21 +2066,24 @@ class SettlementService:
                 | Q(zum_status__iexact="Returned")
                 | Q(zum_status__iexact="Rejected")
             ),
-            CollectionPayment.objects.filter(
-                status="completed",
-                processor_transaction_id__isnull=False,
-                initiated_at__gte=now - timedelta(days=60),
-                initiated_at__lte=now - timedelta(days=4),
-            ).filter(
-                Q(zum_status__isnull=True)
-                | ~Q(zum_status__iexact="Completed")
-            ).order_by("initiated_at"),
-            CollectionPayment.objects.filter(
-                status="processing",
-                processor_transaction_id__isnull=False,
-                settlement_due_at__lte=now,
-            ).order_by("initiated_at"),
         ]
+        if not local_only:
+            candidate_lists.extend([
+                CollectionPayment.objects.filter(
+                    status="completed",
+                    processor_transaction_id__isnull=False,
+                    initiated_at__gte=now - timedelta(days=60),
+                    initiated_at__lte=now - timedelta(days=4),
+                ).filter(
+                    Q(zum_status__isnull=True)
+                    | ~Q(zum_status__iexact="Completed")
+                ).order_by("initiated_at"),
+                CollectionPayment.objects.filter(
+                    status="processing",
+                    processor_transaction_id__isnull=False,
+                    settlement_due_at__lte=now,
+                ).order_by("initiated_at"),
+            ])
         remaining = limit
         for qs in candidate_lists:
             for collection in qs:
@@ -2087,7 +2094,14 @@ class SettlementService:
                 seen.add(collection.pk)
                 remaining -= 1
                 previous_status = collection.status
-                synced = SettlementService.sync_from_zum(collection)
+                try:
+                    synced = SettlementService.sync_from_zum(collection)
+                except Exception:
+                    logger.exception(
+                        "Unable to reconcile collection failure collection=%s",
+                        collection.id,
+                    )
+                    continue
                 if (
                     synced.status in ("failed", "returned", "rejected")
                     and synced.status != previous_status
