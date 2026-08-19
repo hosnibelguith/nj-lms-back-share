@@ -222,13 +222,32 @@ class CollectionExportTests(APITestCase):
         self.assertEqual(Decimal(str(row["balance"])), Decimal("423.39"))
         self.assertTrue(row["returned_at"].startswith("2026-08-10"))
 
-    def test_status_summary_defaulted_ignores_loan_date_filter(self):
+    def test_status_summary_defaulted_counts_failed_collection_payments(self):
+        inside = timezone.make_aware(datetime(2026, 8, 10, 12, 0))
+        self._add_returned_collection(
+            amount="176.61",
+            reason="EftFailedInsufficientFunds",
+            returned_at=inside,
+        )
+        self._add_returned_collection(
+            amount="147.18",
+            reason="EftFailedStopPayment",
+            returned_at=inside,
+            status="failed",
+        )
+        CollectionPayment.objects.create(
+            loan=self.loan,
+            amount=Decimal("50.00"),
+            status="processing",
+            initiated_at=inside,
+        )
+
         summary = self.client.get(
             "/api/loans/status-summary/",
             {"date_from": "2026-08-01", "date_to": "2026-08-31"},
         )
         self.assertEqual(summary.status_code, 200, summary.data)
-        self.assertEqual(summary.data["defaulted"], 1)
+        self.assertEqual(summary.data["defaulted"], 2)
         self.assertEqual(summary.data["active"], 0)
 
         listed = self.client.get(

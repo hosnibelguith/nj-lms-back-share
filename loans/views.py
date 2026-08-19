@@ -389,10 +389,9 @@ class LoanViewSet(viewsets.ModelViewSet):
         filters (search, province, AI, IBV, dates) still apply.
         """
         qs = self._filtered_queryset(ignore_status=True)
-        defaulted_count = self._filtered_queryset(
-            ignore_status=True,
-            ignore_dates=True,
-        ).filter(status='defaulted').count()
+        defaulted_count = CollectionPayment.objects.filter(
+            self._returned_collection_q(),
+        ).count()
         by_status = {
             row['status']: row['count']
             for row in qs.values('status').annotate(count=Count('id'))
