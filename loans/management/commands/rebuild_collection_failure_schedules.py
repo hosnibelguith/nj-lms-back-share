@@ -4,6 +4,7 @@ Default is dry-run. Pass --apply to persist changes.
 """
 
 from django.core.management.base import BaseCommand, CommandError
+from django.db import models
 
 from loans.models import Loan
 from loans.services import LoanService
@@ -38,7 +39,13 @@ class Command(BaseCommand):
         else:
             loans = list(
                 Loan.objects.filter(
-                    payments__notes__startswith=LoanService.COLLECTION_FAILURE_RECOVERY_NOTE
+                    models.Q(
+                        payments__notes__startswith=LoanService.COLLECTION_FAILURE_RECOVERY_NOTE
+                    )
+                    | models.Q(
+                        collection_payments__status__in=["failed", "returned"],
+                        collection_payments__payment__status__in=["failed", "nsf"],
+                    )
                 )
                 .distinct()
                 .order_by("created_at", "id")

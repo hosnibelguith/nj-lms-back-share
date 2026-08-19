@@ -1770,7 +1770,12 @@ class LoanService:
             and money(payment.amount or Decimal('0.00')) > cap
             for payment in generated_payments
         )
-        if not legacy_interest_payments and not has_over_cap_fee_bucket:
+        has_missing_generated_rows = bool(collections) and not generated_payments
+        if (
+            not legacy_interest_payments
+            and not has_over_cap_fee_bucket
+            and not has_missing_generated_rows
+        ):
             return {
                 'loan_id': str(loan.id),
                 'dry_run': dry_run,
@@ -1805,6 +1810,7 @@ class LoanService:
         bucket_amount = Decimal('0.00')
         current_bucket_date = bucket_date
         bucket_notes: list[str] = []
+        simulated_balance = money(loan.balance or Decimal('0.00'))
 
         def flush_bucket():
             nonlocal bucket_amount, current_bucket_date, bucket_notes
@@ -1850,11 +1856,18 @@ class LoanService:
                     'kind': 'recovery',
                 })
 
-            interest = money(
-                interest_by_collection_id.get(collection_id, Decimal('0.00'))
-            )
+            stored_interest = collection_id in interest_by_collection_id
+            if stored_interest:
+                interest = money(interest_by_collection_id[collection_id])
+            else:
+                interest = LoanService._period_interest_for_balance(
+                    loan,
+                    outstanding=simulated_balance,
+                    days=frequency_days * 2,
+                )
             extra = money(LoanService.COLLECTION_FAILURE_FEE_AMOUNT + interest)
             extra_total = money(extra_total + extra)
+            simulated_balance = money(simulated_balance + extra)
             remaining = extra
             note = (
                 f'Collection failure id: {collection_id}\n'
@@ -2047,6 +2060,27 @@ class LoanService:
             return Decimal('0.00')
         daily_interest = planned_interest / Decimal(planned_days)
         return money(daily_interest * Decimal(frequency_days))
+
+    @staticmethod
+    def _period_interest_for_balance(
+        loan: Loan,
+        *,
+        outstanding: Decimal,
+        days: int,
+    ) -> Decimal:
+        if days <= 0:
+            return Decimal('0.00')
+        money = LoanService.money
+        formula = getattr(loan, 'formula', None)
+        annual_rate = (
+            formula.annual_interest_rate
+            if formula is not None
+            else Decimal('0.00')
+        )
+        if annual_rate <= 0 or outstanding <= 0:
+            return Decimal('0.00')
+        daily_rate = annual_rate / Decimal('100') / Decimal('365')
+        return money(money(outstanding) * daily_rate * Decimal(days))
 
     @staticmethod
     @transaction.atomic
