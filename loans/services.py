@@ -3,6 +3,7 @@
 Business logic services for loan operations.
 Called by views and celery tasks.
 """
+import re
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import timedelta
 from django.db import models, transaction
@@ -1569,6 +1570,7 @@ class LoanService:
     COLLECTION_FAILURE_FEE_NOTE = 'Collection failure fee $50'
     COLLECTION_FAILURE_RECOVERY_NOTE = 'Failed collection recovery'
     COLLECTION_FAILURE_INTEREST_NOTE = 'Collection failure daily interest'
+    COLLECTION_FAILURE_ID_RE = re.compile(r'Collection failure id:\s*([0-9a-fA-F-]{36})')
 
     @staticmethod
     def is_deferral_fee_payment(payment: Payment) -> bool:
@@ -1686,6 +1688,270 @@ class LoanService:
             next_date = next_date + timedelta(days=frequency_days)
 
         return touched_bucket
+
+    @staticmethod
+    def _collection_failure_ids_from_payment(payment: Payment) -> set[str]:
+        return set(
+            LoanService.COLLECTION_FAILURE_ID_RE.findall((payment.notes or '').strip())
+        )
+
+    @staticmethod
+    @transaction.atomic
+    def rebuild_collection_failure_schedule(
+        loan: Loan,
+        *,
+        dry_run: bool = True,
+    ) -> dict:
+        """Rebuild old generated collection-failure rows into capped fee buckets."""
+        loan = Loan.objects.select_for_update().select_related('formula').get(pk=loan.pk)
+        money = LoanService.money
+        frequency_days = LoanService._schedule_frequency_days(loan)
+
+        generated_payments = list(
+            loan.payments.filter(
+                models.Q(notes__startswith=LoanService.COLLECTION_FAILURE_RECOVERY_NOTE)
+                | models.Q(notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE)
+                | models.Q(notes__startswith=LoanService.COLLECTION_FAILURE_INTEREST_NOTE)
+            ).order_by('scheduled_date', 'created_at', 'id')
+        )
+        legacy_interest_payments = [
+            payment
+            for payment in generated_payments
+            if LoanService.is_collection_failure_interest_payment(payment)
+        ]
+
+        collection_ids = set()
+        interest_by_collection_id: dict[str, Decimal] = {}
+        for payment in generated_payments:
+            ids = LoanService._collection_failure_ids_from_payment(payment)
+            collection_ids.update(ids)
+            if LoanService.is_collection_failure_interest_payment(payment):
+                interest_amount = LoanService.collection_failure_interest_amount(payment)
+                for collection_id in ids:
+                    interest_by_collection_id[collection_id] = money(
+                        interest_by_collection_id.get(collection_id, Decimal('0.00'))
+                        + interest_amount
+                    )
+
+        collections = list(
+            loan.collection_payments.select_related('payment')
+            .filter(
+                models.Q(id__in=collection_ids)
+                | models.Q(status__in=['failed', 'returned'], payment__status__in=['failed', 'nsf'])
+            )
+            .order_by('payment__scheduled_date', 'initiated_at', 'created_at', 'id')
+        )
+
+        non_generated_payments = list(
+            loan.payments.exclude(pk__in=[payment.pk for payment in generated_payments])
+            .exclude(status='cancelled')
+            .order_by('scheduled_date', 'created_at', 'id')
+        )
+        last_original_date = None
+        for payment in non_generated_payments:
+            if payment.scheduled_date and (
+                last_original_date is None or payment.scheduled_date > last_original_date
+            ):
+                last_original_date = payment.scheduled_date
+        if last_original_date is None:
+            last_original_date = timezone.localdate()
+
+        recovery_date = last_original_date + timedelta(days=frequency_days)
+        bucket_date = recovery_date + timedelta(days=frequency_days)
+        cap = Decimal('0.00')
+        for collection in collections:
+            amount = money(collection.payment.amount if collection.payment else collection.amount)
+            cap = max(cap, amount)
+        if cap <= 0:
+            cap = Decimal('0.00')
+        has_over_cap_fee_bucket = any(
+            LoanService.is_collection_failure_fee_payment(payment)
+            and cap > 0
+            and money(payment.amount or Decimal('0.00')) > cap
+            for payment in generated_payments
+        )
+        if not legacy_interest_payments and not has_over_cap_fee_bucket:
+            return {
+                'loan_id': str(loan.id),
+                'dry_run': dry_run,
+                'frequency_days': frequency_days,
+                'collections_count': 0,
+                'delete_count': 0,
+                'create_count': 0,
+                'existing_generated_total': money(
+                    sum(
+                        (
+                            money(payment.amount or Decimal('0.00'))
+                            for payment in generated_payments
+                        ),
+                        Decimal('0.00'),
+                    )
+                ),
+                'new_generated_total': Decimal('0.00'),
+                'balance_before': money(loan.balance or Decimal('0.00')),
+                'balance_after': money(loan.balance or Decimal('0.00')),
+                'total_amount_before': money(loan.total_amount or Decimal('0.00')),
+                'total_amount_after': money(loan.total_amount or Decimal('0.00')),
+                'fee_before': money(loan.fee or Decimal('0.00')),
+                'fee_after': money(loan.fee or Decimal('0.00')),
+                'will_delete': [],
+                'proposed': [],
+                'skipped_reason': 'already_current_shape',
+            }
+
+        proposed = []
+        recovery_total = Decimal('0.00')
+        extra_total = Decimal('0.00')
+        bucket_amount = Decimal('0.00')
+        current_bucket_date = bucket_date
+        bucket_notes: list[str] = []
+
+        def flush_bucket():
+            nonlocal bucket_amount, current_bucket_date, bucket_notes
+            if bucket_amount <= 0:
+                return
+            proposed.append({
+                'amount': money(bucket_amount),
+                'status': 'scheduled',
+                'type': 'scheduled',
+                'scheduled_date': current_bucket_date,
+                'notes': (
+                    f'{LoanService.COLLECTION_FAILURE_FEE_NOTE}\n'
+                    + '\n'.join(bucket_notes)
+                ),
+                'kind': 'fee_interest',
+            })
+            bucket_amount = Decimal('0.00')
+            bucket_notes = []
+            current_bucket_date = current_bucket_date + timedelta(days=frequency_days)
+
+        for collection in collections:
+            collection_id = str(collection.id)
+            reason = (
+                collection.failure_reason
+                or (collection.payment.failure_reason if collection.payment else '')
+                or 'Unknown'
+            ).strip()
+            missed_amount = money(
+                collection.payment.amount if collection.payment else collection.amount
+            )
+            if missed_amount > 0:
+                recovery_total = money(recovery_total + missed_amount)
+                proposed.append({
+                    'amount': missed_amount,
+                    'status': 'scheduled',
+                    'type': 'scheduled',
+                    'scheduled_date': recovery_date,
+                    'notes': (
+                        f'{LoanService.COLLECTION_FAILURE_RECOVERY_NOTE} ${missed_amount}\n'
+                        f'Collection failure id: {collection_id}\n'
+                        f'Reason: {reason}'
+                    ),
+                    'kind': 'recovery',
+                })
+
+            interest = money(
+                interest_by_collection_id.get(collection_id, Decimal('0.00'))
+            )
+            extra = money(LoanService.COLLECTION_FAILURE_FEE_AMOUNT + interest)
+            extra_total = money(extra_total + extra)
+            remaining = extra
+            note = (
+                f'Collection failure id: {collection_id}\n'
+                f'Reason: {reason}\n'
+                f'NSF fee: ${LoanService.COLLECTION_FAILURE_FEE_AMOUNT}\n'
+                f'Extension interest: ${interest}'
+            )
+            while remaining > 0:
+                if cap <= 0:
+                    addition = remaining
+                else:
+                    space = money(cap - bucket_amount)
+                    if space <= 0:
+                        flush_bucket()
+                        space = cap
+                    addition = min(remaining, space)
+
+                bucket_amount = money(bucket_amount + addition)
+                if note not in bucket_notes:
+                    bucket_notes.append(note)
+                remaining = money(remaining - addition)
+
+        flush_bucket()
+
+        existing_generated_total = sum(
+            (money(payment.amount or Decimal('0.00')) for payment in generated_payments),
+            Decimal('0.00'),
+        )
+        new_generated_total = money(recovery_total + extra_total)
+        completed_sum = sum(
+            (
+                money(payment.amount or Decimal('0.00'))
+                for payment in non_generated_payments
+                if payment.status == 'completed'
+            ),
+            Decimal('0.00'),
+        )
+        open_original_sum = sum(
+            (
+                money(payment.amount or Decimal('0.00'))
+                for payment in non_generated_payments
+                if payment.status not in ('completed', 'cancelled', 'failed', 'nsf')
+            ),
+            Decimal('0.00'),
+        )
+        balance_after = money(open_original_sum + new_generated_total)
+        total_after = money(completed_sum + balance_after)
+        fee_after = money(total_after - money(loan.principal or Decimal('0.00')))
+
+        plan = {
+            'loan_id': str(loan.id),
+            'dry_run': dry_run,
+            'frequency_days': frequency_days,
+            'collections_count': len(collections),
+            'delete_count': len(generated_payments),
+            'create_count': len(proposed),
+            'existing_generated_total': money(existing_generated_total),
+            'new_generated_total': new_generated_total,
+            'balance_before': money(loan.balance or Decimal('0.00')),
+            'balance_after': balance_after,
+            'total_amount_before': money(loan.total_amount or Decimal('0.00')),
+            'total_amount_after': total_after,
+            'fee_before': money(loan.fee or Decimal('0.00')),
+            'fee_after': fee_after,
+            'will_delete': [
+                {
+                    'id': str(payment.id),
+                    'scheduled_date': payment.scheduled_date,
+                    'amount': money(payment.amount or Decimal('0.00')),
+                    'status': payment.status,
+                    'notes': (payment.notes or '').splitlines()[0] if payment.notes else '',
+                }
+                for payment in generated_payments
+            ],
+            'proposed': proposed,
+        }
+
+        if dry_run or not collections:
+            return plan
+
+        for payment in generated_payments:
+            payment.delete()
+        for row in proposed:
+            Payment.objects.create(
+                loan=loan,
+                amount=row['amount'],
+                type=row['type'],
+                status=row['status'],
+                scheduled_date=row['scheduled_date'],
+                notes=row['notes'],
+            )
+
+        loan.balance = balance_after
+        loan.total_amount = total_after
+        loan.fee = fee_after
+        loan.save(update_fields=['balance', 'total_amount', 'fee', 'updated_at'])
+        return plan
 
     @staticmethod
     def is_non_installment_fee_payment(payment: Payment) -> bool:

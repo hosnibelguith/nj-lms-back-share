@@ -2923,6 +2923,87 @@ class PaymentScheduleIntegrityTests(APITestCase):
         self.assertEqual(balances[str(second_fee.id)], Decimal("2.22"))
         self.assertEqual(balances[str(second_fees[1].id)], Decimal("0.00"))
 
+    def test_rebuild_collection_failure_schedule_converts_old_interest_rows(self):
+        failed = self._add_payment("147.18", status="failed")
+        second = self._add_payment("147.18", days=14)
+        third = self._add_payment("147.18", days=28)
+        fourth = self._add_payment("147.18", days=42)
+        fifth = self._add_payment("147.18", days=56)
+        last = self._add_payment("147.19", days=70)
+        collection = CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=failed,
+            amount=failed.amount,
+            status="failed",
+            failure_reason="EftFailedAccountClosed",
+        )
+        recovery = self._add_payment(
+            "147.18",
+            days=84,
+            notes=(
+                f"{LoanService.COLLECTION_FAILURE_RECOVERY_NOTE} $147.18\n"
+                f"Collection failure id: {collection.id}\n"
+                "Reason: EftFailedAccountClosed"
+            ),
+        )
+        fee = self._add_payment(
+            "50.00",
+            days=98,
+            notes=(
+                f"{LoanService.COLLECTION_FAILURE_FEE_NOTE}\n"
+                f"Collection failure id: {collection.id}\n"
+                "Reason: EftFailedAccountClosed"
+            ),
+        )
+        interest = self._add_payment(
+            "23.71",
+            days=112,
+            notes=(
+                f"{LoanService.COLLECTION_FAILURE_INTEREST_NOTE}\n"
+                f"Collection failure id: {collection.id}\n"
+                "Reason: EftFailedAccountClosed\n"
+                "Extension interest: $23.71"
+            ),
+        )
+        self.loan.status = "defaulted"
+        self.loan.is_active = False
+        self.loan.balance = Decimal("956.80")
+        self.loan.total_amount = Decimal("956.80")
+        self.loan.fee = Decimal("456.80")
+        self.loan.save(update_fields=["status", "is_active", "balance", "total_amount", "fee"])
+
+        plan = LoanService.rebuild_collection_failure_schedule(
+            self.loan,
+            dry_run=False,
+        )
+
+        self.loan.refresh_from_db()
+        self.assertEqual(plan["delete_count"], 3)
+        self.assertEqual(plan["create_count"], 2)
+        self.assertFalse(Payment.objects.filter(pk__in=[recovery.pk, fee.pk, interest.pk]).exists())
+        new_recovery = self.loan.payments.get(
+            notes__startswith=LoanService.COLLECTION_FAILURE_RECOVERY_NOTE,
+        )
+        new_fee = self.loan.payments.get(
+            notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+        )
+        self.assertEqual(new_recovery.amount, Decimal("147.18"))
+        self.assertEqual(new_recovery.scheduled_date, last.scheduled_date + timedelta(days=14))
+        self.assertEqual(new_fee.amount, Decimal("73.71"))
+        self.assertEqual(new_fee.scheduled_date, last.scheduled_date + timedelta(days=28))
+        self.assertEqual(self.loan.balance, Decimal("956.80"))
+        self.assertEqual(self.loan.total_amount, Decimal("956.80"))
+
+        balances = self._balance_after_map()
+        self.assertEqual(balances[str(failed.id)], Decimal("956.80"))
+        self.assertEqual(balances[str(second.id)], Decimal("809.62"))
+        self.assertEqual(balances[str(third.id)], Decimal("662.44"))
+        self.assertEqual(balances[str(fourth.id)], Decimal("515.26"))
+        self.assertEqual(balances[str(fifth.id)], Decimal("368.08"))
+        self.assertEqual(balances[str(last.id)], Decimal("220.89"))
+        self.assertEqual(balances[str(new_recovery.id)], Decimal("73.71"))
+        self.assertEqual(balances[str(new_fee.id)], Decimal("0.00"))
+
     def test_edit_rejects_payment_with_processing_collection(self):
         payment = self._add_payment("147.18")
         CollectionPayment.objects.create(
