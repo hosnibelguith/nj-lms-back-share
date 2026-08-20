@@ -2443,7 +2443,7 @@ class LoanService:
         """Apply the schedule changes for a failed Zūm collection.
 
         The failed installment stays as history and does not pay down the
-        balance.         Recovery rows are added before collection-failure fee/interest
+        balance. Recovery rows are added before collection-failure fee/interest
         rows. The $50 fee plus extension interest first tops up any
         original remainder installment to the normal installment amount,
         then fills capped extra rows before spilling into a new row.

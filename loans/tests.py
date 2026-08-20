@@ -3747,7 +3747,69 @@ class PaymentScheduleIntegrityTests(APITestCase):
         balances = self._balance_after_map()
         self.assertEqual(balances[str(first.id)], self.loan.balance)
         self.assertEqual(balances[str(failed.id)], self.loan.balance)
+        self.assertEqual(balances[str(third.id)], self.loan.balance - Decimal("176.61"))
+        self.assertEqual(balances[str(fourth.id)], self.loan.balance - Decimal("353.22"))
         self.assertEqual(balances[str(last.id)], leftover + recovery.amount)
+        self.assertEqual(balances[str(recovery.id)], leftover)
+        self.assertEqual(balances[str(fee.id)], Decimal("0.00"))
+
+    def test_collection_failure_nsf_fee_leftover_is_31_13_after_remainder_fill(self):
+        """$157.74 remainder fills to $176.61; leftover $50 NSF is $31.13 on the last row."""
+        first = self._add_payment("176.61", status="completed")
+        failed = self._add_payment("176.61", days=7, status="failed")
+        third = self._add_payment("176.61", days=14)
+        fourth = self._add_payment("176.61", days=21)
+        last = self._add_payment("157.74", days=28)
+        collection = CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=failed,
+            amount=failed.amount,
+            status="failed",
+            failure_reason="EftFailedStopPayment",
+        )
+        self.formula.default_frequency_days = 7
+        self.formula.save(update_fields=["default_frequency_days", "updated_at"])
+        self.loan.balance = Decimal("687.57")
+        self.loan.total_amount = Decimal("864.18")
+        self.loan.fee = Decimal("364.18")
+        self.loan.save(update_fields=["balance", "total_amount", "fee"])
+        leftover = Decimal("31.13")
+
+        with patch.object(LoanService, "_deferral_extra_interest", return_value=Decimal("0.00")):
+            fee = LoanService.apply_collection_failure_fee(
+                collection,
+                reason="EftFailedStopPayment",
+            )
+
+        last.refresh_from_db()
+        self.loan.refresh_from_db()
+        recovery = self.loan.payments.get(
+            notes__startswith=LoanService.COLLECTION_FAILURE_RECOVERY_NOTE
+        )
+        self.assertEqual(last.amount, Decimal("176.61"))
+        self.assertEqual(recovery.amount, Decimal("176.61"))
+        self.assertEqual(fee.amount, leftover)
+        self.assertEqual(self.loan.balance, Decimal("737.57"))
+        self.assertEqual(
+            [p.amount for p in self.loan.payments.exclude(status="cancelled").order_by(
+                "scheduled_date", "created_at", "id"
+            )],
+            [
+                Decimal("176.61"),
+                Decimal("176.61"),
+                Decimal("176.61"),
+                Decimal("176.61"),
+                Decimal("176.61"),
+                Decimal("176.61"),
+                leftover,
+            ],
+        )
+        balances = self._balance_after_map()
+        self.assertEqual(balances[str(first.id)], Decimal("737.57"))
+        self.assertEqual(balances[str(failed.id)], Decimal("737.57"))
+        self.assertEqual(balances[str(third.id)], Decimal("560.96"))
+        self.assertEqual(balances[str(fourth.id)], Decimal("384.35"))
+        self.assertEqual(balances[str(last.id)], Decimal("207.74"))
         self.assertEqual(balances[str(recovery.id)], leftover)
         self.assertEqual(balances[str(fee.id)], Decimal("0.00"))
 
