@@ -751,6 +751,146 @@ class ZumRailsWorkflowTests(APITestCase):
             ).exists()
         )
 
+    def _arrive_unsigned_loan(self, *, status="pending_funding"):
+        arrive_user = User.objects.create_user(
+            email="arrive-unsigned@example.com",
+            password="password123",
+            full_name="Arrive Unsigned",
+            user_type="customer",
+        )
+        arrive_customer = Customer.objects.create(
+            portal_user=arrive_user,
+            first_name="Arrive",
+            last_name="Unsigned",
+            email="arrive-unsigned@example.com",
+            phone="4165552222",
+            phone_normalized="4165552222",
+            province="ON",
+            status="pending",
+            source=Customer.SOURCE_ARRIVE,
+            arrive_application_id="arrive-app-unsigned",
+            arrive_zum_user_id="zum-unsigned",
+        )
+        return Loan.objects.create(
+            customer=arrive_customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("100.00"),
+            total_amount=Decimal("600.00"),
+            balance=Decimal("600.00"),
+            status=status,
+            approved_at=timezone.now() if status == "pending_funding" else None,
+            is_active=True,
+        )
+
+    @patch("accounts.arrive_integration.queue_decision_webhook")
+    def test_arrive_unsigned_contract_can_be_cancelled_as_expired(
+        self,
+        queue_decision_webhook,
+    ):
+        from accounts.arrive_integration import build_decision_payload
+        from activity.models import ActivityHistory
+
+        loan = self._arrive_unsigned_loan()
+        response = self.client.post(
+            f"/api/loans/{loan.id}/expire-unsigned-contract/",
+            {"comment": "No signature after follow-up"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        loan.refresh_from_db()
+        self.assertEqual(loan.status, "expired")
+        self.assertFalse(loan.is_active)
+        self.assertEqual(loan.decline_reason, "expired")
+        queue_decision_webhook.assert_called_once_with(loan, "declined")
+        self.assertEqual(
+            build_decision_payload(loan, decision="declined")["decline_reasons"],
+            ["expired"],
+        )
+        self.assertTrue(
+            ActivityHistory.objects.filter(
+                loan=loan,
+                title="Loan Expired",
+                description__contains="expired",
+            ).exists()
+        )
+        self.assertTrue(
+            loan.state_events.filter(
+                event_type="expired",
+                previous_status="pending_funding",
+            ).exists()
+        )
+
+    def test_landing_unsigned_contract_cannot_be_cancelled_as_expired(self):
+        landing = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("400.00"),
+            fee=Decimal("80.00"),
+            total_amount=Decimal("480.00"),
+            balance=Decimal("480.00"),
+            status="pending_funding",
+            approved_at=timezone.now(),
+            is_active=True,
+        )
+        response = self.client.post(
+            f"/api/loans/{landing.id}/expire-unsigned-contract/",
+            {},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        landing.refresh_from_db()
+        self.assertEqual(landing.status, "pending_funding")
+        self.assertIn("Arrive", response.data["error"])
+
+    def test_signed_arrive_contract_cannot_be_cancelled_as_expired(self):
+        loan = self._arrive_unsigned_loan()
+        loan.contract_signed_at = timezone.now()
+        loan.save(update_fields=["contract_signed_at", "updated_at"])
+        response = self.client.post(
+            f"/api/loans/{loan.id}/expire-unsigned-contract/",
+            {},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        loan.refresh_from_db()
+        self.assertEqual(loan.status, "pending_funding")
+
+    def test_arrive_ibv_pending_cannot_use_unsigned_contract_expire(self):
+        loan = self._arrive_unsigned_loan(status="ibv_pending")
+        response = self.client.post(
+            f"/api/loans/{loan.id}/expire-unsigned-contract/",
+            {},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        loan.refresh_from_db()
+        self.assertEqual(loan.status, "ibv_pending")
+
+    @patch("accounts.arrive_integration.queue_decision_webhook")
+    def test_landing_unsigned_contract_still_declines_with_existing_reasons(
+        self,
+        _queue_decision_webhook,
+    ):
+        landing = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("400.00"),
+            fee=Decimal("80.00"),
+            total_amount=Decimal("480.00"),
+            balance=Decimal("480.00"),
+            status="pending_funding",
+            approved_at=timezone.now(),
+            is_active=True,
+        )
+        response = self.client.post(
+            f"/api/loans/{landing.id}/decline/",
+            {"reason": "see comments", "comment": "Did not sign"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        landing.refresh_from_db()
+        self.assertEqual(landing.status, "human_declined")
+        self.assertIn("see comments", landing.decline_reason)
+
     @patch("accounts.arrive_integration.queue_decision_webhook")
     @patch("communications.tasks.send_template_message.delay")
     @patch("loans.services.transaction.on_commit")

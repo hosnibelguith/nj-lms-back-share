@@ -591,11 +591,18 @@ class BackendApiWorkflowTests(APITestCase):
         self.loan.refresh_from_db()
         self.assertEqual(self.loan.status, "expired")
 
+    @patch("communications.tasks.send_email.delay")
+    @patch("communications.tasks.send_template_message.delay")
     @patch("accounts.arrive_integration.queue_decision_webhook")
     def test_loan_workflow_reminders_expire_ibv_after_three_reminders_and_email(
         self,
         queue_decision_webhook,
+        send_template_delay,
+        _send_email_delay,
     ):
+        from communications.tasks import send_template_message
+
+        send_template_delay.side_effect = send_template_message
         CommunicationTemplate.objects.create(
             name="Application Expired Template",
             type="email",
@@ -633,10 +640,52 @@ class BackendApiWorkflowTests(APITestCase):
         self.assertEqual(self.loan.status, "expired")
         self.assertFalse(self.loan.is_active)
         queue_decision_webhook.assert_called_once_with(self.loan, "declined")
+        send_template_delay.assert_called_once()
         self.assertEqual(
             self.loan.communications.filter(template_name="Application Expired Template").count(),
             1,
         )
+
+    def test_signature_reminders_do_not_auto_expire_missing_contract(self):
+        CommunicationTemplate.objects.create(
+            name="Contract Signature Reminder Template",
+            type="email",
+            subject="Signature reminder",
+            content="Sign at {{portal_url}}",
+            is_active=True,
+        )
+        GlobalSetting.objects.update_or_create(
+            key="LOAN_WORKFLOW_REMINDERS_ENABLED",
+            defaults={"value": "True"},
+        )
+        GlobalSetting.objects.update_or_create(
+            key="LOAN_WORKFLOW_REMINDER_MAX_DAYS",
+            defaults={"value": "3"},
+        )
+        self.loan.status = "pending_funding"
+        self.loan.approved_at = timezone.now()
+        self.loan.contract_signed_at = None
+        self.loan.save(update_fields=["status", "approved_at", "contract_signed_at", "updated_at"])
+        for index in range(3):
+            Communication.objects.create(
+                customer=self.customer,
+                loan=self.loan,
+                type="email",
+                direction="outbound",
+                to_address=self.customer.email,
+                subject=f"Signature reminder {index + 1}",
+                content="Existing reminder",
+                status="sent",
+                template_name="Contract Signature Reminder Template",
+            )
+
+        result = send_loan_workflow_reminders()
+
+        self.loan.refresh_from_db()
+        self.assertEqual(result["signature_sent"], 0)
+        self.assertEqual(result["ibv_expired"], 0)
+        self.assertEqual(self.loan.status, "pending_funding")
+        self.assertTrue(self.loan.is_active)
 
 
 class StartNewApplicationTests(APITestCase):

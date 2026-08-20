@@ -459,6 +459,104 @@ class LoanService:
         return loan
 
     @staticmethod
+    def _customer_is_arrive(customer: Customer) -> bool:
+        return bool(
+            getattr(customer, 'source', None) == Customer.SOURCE_ARRIVE
+            or getattr(customer, 'arrive_application_id', None)
+        )
+
+    @staticmethod
+    @transaction.atomic
+    def expire_unsigned_contract(loan: Loan, expired_by=None, comment: str = '') -> Loan:
+        """Cancel an Arrive application whose contract was never signed.
+
+        Landing unsigned contracts stay on reminders + staff decline. Missing IBV
+        still auto-expires after the reminder window.
+        """
+        loan = Loan.objects.select_for_update().select_related('customer').get(pk=loan.pk)
+        if not LoanService._customer_is_arrive(loan.customer):
+            raise ValueError(
+                'Only Arrive applications can be cancelled as expired for a missing contract.'
+            )
+        if loan.status not in ('pending_signature', 'pending_funding'):
+            raise ValueError('Only unsigned Arrive contracts can be cancelled as expired.')
+        if loan.contract_signed:
+            raise ValueError('This contract is already signed.')
+        if loan.funded_payments.filter(status__in=['processing', 'completed']).exists():
+            raise ValueError('Cannot expire a loan after funding has started.')
+
+        from django.conf import settings
+        from activity.services import actor_label, log_staff_action
+        from accounts.arrive_integration import queue_decision_webhook
+        from communications.models import CommunicationTemplate
+        from communications.tasks import send_template_message
+
+        previous_status = loan.status
+        previous_display = loan.get_status_display()
+        loan.status = 'expired'
+        loan.is_active = False
+        loan.decline_reason = 'expired'
+        loan._suppress_status_activity = True
+        loan.save(update_fields=['status', 'is_active', 'decline_reason', 'updated_at'])
+        loan.log_state_event(
+            event_type='expired',
+            previous_status=previous_status,
+            new_status=loan.status,
+            user=expired_by,
+            notes='Unsigned contract cancelled as expired.',
+        )
+
+        actor = actor_label(expired_by)
+        description = (
+            f'Unsigned contract cancelled as expired by {actor}. '
+            f'Status changed from {previous_display} to {loan.get_status_display()}.'
+        )
+        if comment:
+            description = f'{description} Comment: {comment.strip()}'
+        log_staff_action(
+            customer=loan.customer,
+            loan=loan,
+            user=expired_by,
+            type_value='system',
+            title='Loan Expired',
+            description=description,
+            metadata={
+                'decline_reason': 'expired',
+                'comment': (comment or '').strip(),
+                'previous_status': previous_status,
+                'new_status': loan.status,
+                'action': 'expire_unsigned_contract',
+            },
+        )
+        queue_decision_webhook(loan, 'declined')
+
+        template = CommunicationTemplate.objects.filter(
+            name='Application Expired Template',
+            type='email',
+            is_active=True,
+        ).first()
+        if template and not loan.communications.filter(
+            direction='outbound',
+            type='email',
+            template_name='Application Expired Template',
+        ).exists():
+            frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:3000').rstrip('/')
+            customer_id = str(loan.customer_id)
+            loan_id = str(loan.id)
+            template_id = str(template.id)
+            extra_context = {'portal_url': f'{frontend_url}/customer/login'}
+            transaction.on_commit(
+                lambda: send_template_message.delay(
+                    customer_id,
+                    template_id,
+                    loan_id,
+                    extra_context=extra_context,
+                )
+            )
+
+        return loan
+
+    @staticmethod
     @transaction.atomic
     def revert_decline_to_approve(loan: Loan, approved_by=None, notes: str = None) -> Loan:
         """Undo a human decline and move the loan back to approved (pending funding)."""

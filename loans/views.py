@@ -527,6 +527,22 @@ class LoanViewSet(viewsets.ModelViewSet):
 
         return Response(LoanSerializer(loan).data)
 
+    @action(detail=True, methods=['post'], url_path='expire-unsigned-contract')
+    def expire_unsigned_contract(self, request, pk=None):
+        loan = self.get_object()
+        comment = ''
+        if isinstance(request.data, dict):
+            comment = (request.data.get('comment') or '').strip()
+        try:
+            loan = LoanService.expire_unsigned_contract(
+                loan=loan,
+                expired_by=request.user,
+                comment=comment,
+            )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
+        return Response(LoanSerializer(loan).data)
+
     @action(
         detail=True,
         methods=['post'],
