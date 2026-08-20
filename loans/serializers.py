@@ -304,6 +304,8 @@ class CollectionExportRowSerializer(serializers.Serializer):
     balance = serializers.DecimalField(max_digits=10, decimal_places=2)
     returned_at = serializers.DateTimeField(allow_null=True)
     status = serializers.CharField()
+    is_problematic = serializers.BooleanField(required=False, default=False)
+    risk_label = serializers.CharField(required=False, allow_blank=True)
 
 
 class CollectionsAccountChangeAuditSerializer(serializers.ModelSerializer):
@@ -386,6 +388,7 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
     funded_at = serializers.SerializerMethodField()
     fundedAt = serializers.SerializerMethodField(method_name='get_funded_at')
     frequency = serializers.SerializerMethodField()
+    twice_monthly_days = serializers.SerializerMethodField()
     paymentSchedule = CustomerLoanPaymentSerializer(source='payments', many=True, read_only=True)
     type_display = serializers.CharField(source='get_type_display', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
@@ -413,6 +416,7 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
             'funded_at',
             'fundedAt',
             'frequency',
+            'twice_monthly_days',
             'contract_signed',
             'contract_signed_at',
             'contract_sent_at',
@@ -432,6 +436,11 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
         from loans.services import LoanService
 
         return LoanService.schedule_frequency_key(obj)
+
+    def get_twice_monthly_days(self, obj):
+        if obj.twice_monthly_day_1 and obj.twice_monthly_day_2:
+            return [obj.twice_monthly_day_1, obj.twice_monthly_day_2]
+        return []
 
     def get_holiday_warnings(self, obj):
         return _loan_holiday_warnings(obj)
@@ -468,6 +477,7 @@ class LoanSerializer(serializers.ModelSerializer):
             'contract_id', 'contract_sent_at', 'contract_signed', 'contract_signed_at',
             'approved_at', 'approved_by', 'declined_at', 'decline_reason',
             'notes', 'payments', 'holiday_warnings',
+            'schedule_frequency', 'twice_monthly_day_1', 'twice_monthly_day_2',
             'created_at', 'updated_at'
         ]
         read_only_fields = [
@@ -701,8 +711,15 @@ class LoanScheduleAdjustSerializer(serializers.Serializer):
         max_value=260,
         required=False,
     )
-    frequency = serializers.ChoiceField(choices=['weekly', 'bi-weekly', 'monthly'])
+    frequency = serializers.ChoiceField(
+        choices=['weekly', 'bi-weekly', 'monthly', 'twice-monthly']
+    )
     start_date = serializers.DateField()
+    month_days = serializers.ListField(
+        child=serializers.IntegerField(min_value=1, max_value=31),
+        required=False,
+        allow_empty=True,
+    )
     notes = serializers.CharField(required=False, allow_blank=True)
 
     def validate(self, attrs):
@@ -715,6 +732,19 @@ class LoanScheduleAdjustSerializer(serializers.Serializer):
             raise serializers.ValidationError({
                 'number_of_payments': 'Number of payments is required when adjusting by payment count.'
             })
+        if attrs.get('frequency') == 'twice-monthly':
+            days = attrs.get('month_days') or []
+            unique = []
+            for day in days:
+                if day not in unique:
+                    unique.append(day)
+            if len(unique) != 2:
+                raise serializers.ValidationError({
+                    'month_days': 'Twice a month requires two different days of the current month (1–31).'
+                })
+            attrs['month_days'] = sorted(unique)
+        else:
+            attrs['month_days'] = None
         return attrs
 
 
@@ -805,3 +835,8 @@ class BankHolidaySerializer(serializers.ModelSerializer):
 
 class BankHolidayUploadSerializer(serializers.Serializer):
     holidays = BankHolidaySerializer(many=True)
+
+
+class CollectionSettingsSerializer(serializers.Serializer):
+    mode = serializers.ChoiceField(choices=['manual', 'after_missed'])
+    missed_count = serializers.IntegerField(min_value=1, max_value=20, required=False)

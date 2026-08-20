@@ -227,6 +227,14 @@ class Loan(models.Model):
     
     # Notes
     notes = models.TextField(blank=True, null=True, help_text="Internal notes")
+    schedule_frequency = models.CharField(
+        max_length=20,
+        blank=True,
+        default='',
+        help_text='Staff-selected cadence: weekly, bi-weekly, monthly, twice-monthly',
+    )
+    twice_monthly_day_1 = models.PositiveSmallIntegerField(null=True, blank=True)
+    twice_monthly_day_2 = models.PositiveSmallIntegerField(null=True, blank=True)
     
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)

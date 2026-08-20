@@ -904,6 +904,7 @@ class LoanService:
         start_date,
         user=None,
         notes: str = '',
+        month_days=None,
     ) -> list:
         """
         Reprice the loan using the staff-selected installment amount or
@@ -928,14 +929,11 @@ class LoanService:
         if calculation_mode not in ['payment_amount', 'number_of_payments']:
             raise ValueError('Invalid schedule calculation mode.')
 
-        frequency_days_by_key = {
-            'weekly': 7,
-            'bi-weekly': 14,
-            'monthly': 30,
-        }
-        frequency_days = frequency_days_by_key.get(frequency)
-        if not frequency_days:
-            raise ValueError('Invalid payment frequency.')
+        frequency_days = LoanService._frequency_days(frequency)
+        month_days = LoanService._normalized_month_days(
+            frequency,
+            month_days,
+        )
 
         principal = LoanService.money(loan.principal or Decimal('0.00'))
         if principal <= 0:
@@ -1055,12 +1053,22 @@ class LoanService:
         loan.fee = LoanService.money(total_amount - principal)
         loan.total_amount = total_amount
         loan.balance = balance_due
+        loan.schedule_frequency = frequency
+        if month_days:
+            loan.twice_monthly_day_1 = month_days[0]
+            loan.twice_monthly_day_2 = month_days[1]
+        else:
+            loan.twice_monthly_day_1 = None
+            loan.twice_monthly_day_2 = None
         loan.save(
             update_fields=[
                 'formula',
                 'fee',
                 'total_amount',
                 'balance',
+                'schedule_frequency',
+                'twice_monthly_day_1',
+                'twice_monthly_day_2',
                 'updated_at',
             ]
         )
@@ -1072,6 +1080,7 @@ class LoanService:
             start_date=start_date,
             frequency_days=frequency_days,
             schedule_total=balance_due,
+            month_days=month_days,
         )
 
         if notes:
@@ -1100,6 +1109,7 @@ class LoanService:
                 'frequency': frequency,
                 'payment_amount': str(payment_amount),
                 'start_date': str(start_date),
+                'month_days': month_days or [],
             },
         )
 
@@ -1110,12 +1120,44 @@ class LoanService:
         frequency_days_by_key = {
             'weekly': 7,
             'bi-weekly': 14,
+            'twice-monthly': 15,
             'monthly': 30,
         }
         days = frequency_days_by_key.get(frequency)
         if not days:
             raise ValueError('Invalid payment frequency.')
         return days
+
+    @staticmethod
+    def _normalized_month_days(frequency: str, month_days=None):
+        if frequency != 'twice-monthly':
+            return None
+        days = [int(value) for value in (month_days or [])]
+        unique = []
+        for day in days:
+            if day < 1 or day > 31:
+                raise ValueError('Twice-a-month days must be between 1 and 31.')
+            if day not in unique:
+                unique.append(day)
+        if len(unique) != 2:
+            raise ValueError(
+                'Twice a month requires two different days of the month.'
+            )
+        return sorted(unique)
+
+    @staticmethod
+    def _stored_month_days(loan: Loan):
+        day_1 = getattr(loan, 'twice_monthly_day_1', None)
+        day_2 = getattr(loan, 'twice_monthly_day_2', None)
+        if not day_1 or not day_2:
+            return None
+        try:
+            return LoanService._normalized_month_days(
+                'twice-monthly',
+                [day_1, day_2],
+            )
+        except ValueError:
+            return None
 
     @staticmethod
     def _frequency_key_from_days(days: int) -> str:
@@ -1128,7 +1170,10 @@ class LoanService:
 
     @staticmethod
     def schedule_frequency_key(loan: Loan) -> str:
-        """Selected/active payment cadence for UI (weekly / bi-weekly / monthly)."""
+        """Selected/active payment cadence for UI."""
+        stored = (getattr(loan, 'schedule_frequency', None) or '').strip()
+        if stored in ('weekly', 'bi-weekly', 'monthly', 'twice-monthly'):
+            return stored
         return LoanService._frequency_key_from_days(
             LoanService._schedule_frequency_days(loan)
         )
@@ -1155,6 +1200,7 @@ class LoanService:
         frequency: str = 'bi-weekly',
         start_date=None,
         reprice: bool = False,
+        month_days=None,
     ) -> dict:
         """Simulate rebuilding Scheduled/failed/nsf rows while keeping Pending.
 
@@ -1178,6 +1224,13 @@ class LoanService:
 
         money = LoanService.money
         frequency_days = LoanService._frequency_days(frequency)
+        if frequency == 'twice-monthly':
+            month_days = LoanService._normalized_month_days(
+                frequency,
+                month_days or LoanService._stored_month_days(loan),
+            )
+        else:
+            month_days = None
         principal = money(loan.principal or Decimal('0.00'))
         if principal <= 0:
             raise ValueError('Loan principal must be greater than zero.')
@@ -1318,10 +1371,14 @@ class LoanService:
 
         proposed = []
         remaining = schedule_total
-        unadjusted_dates = [
-            business_calendar.unadjusted_date_at(start_date, index, frequency_days)
-            for index in range(num_payments)
-        ]
+        unadjusted_dates = list(
+            business_calendar.iter_unadjusted_dates(
+                start_date,
+                num_payments,
+                frequency_days,
+                month_days=month_days,
+            )
+        )
         holidays = business_calendar.holiday_dates_for_years(
             {value.year for value in unadjusted_dates} or {start_date.year}
         )
@@ -1393,6 +1450,7 @@ class LoanService:
         dry_run: bool = True,
         user=None,
         notes: str = '',
+        month_days=None,
     ) -> dict:
         """Rebuild upcoming schedule rows; never modify Pending / in-flight payments.
 
@@ -1406,6 +1464,7 @@ class LoanService:
             frequency=frequency,
             start_date=start_date,
             reprice=reprice,
+            month_days=month_days,
         )
         plan['dry_run'] = dry_run
         if dry_run:
@@ -1421,6 +1480,7 @@ class LoanService:
             frequency=frequency,
             start_date=start_date,
             reprice=reprice,
+            month_days=month_days,
         )
         plan['dry_run'] = False
 
@@ -1492,13 +1552,14 @@ class LoanService:
                                   payment_amount: Decimal,
                                   start_date,
                                   frequency_days: int = 14,
-                                  schedule_total: Decimal = None) -> list:
+                                  schedule_total: Decimal = None,
+                                  month_days=None) -> list:
         """Generate a payment schedule for a loan."""
         payments = []
         remaining = LoanService.money(schedule_total or loan.total_amount)
         unadjusted_dates = list(
             business_calendar.iter_unadjusted_dates(
-                start_date, num_payments, frequency_days
+                start_date, num_payments, frequency_days, month_days=month_days
             )
         )
         holidays = business_calendar.holiday_dates_for_years(
@@ -2196,9 +2257,15 @@ class LoanService:
     def _schedule_frequency_days(loan: Loan) -> int:
         """Cadence for deferral placement and frequency badge (selected schedule).
 
-        Prefer gaps between real installments (reflects Adjust Schedule choice),
-        then formula default, then bi-weekly.
+        Prefer the staff-selected cadence stored on the loan, then gaps between
+        real installments, then formula default, then bi-weekly.
         """
+        stored = (getattr(loan, 'schedule_frequency', None) or '').strip()
+        if stored:
+            try:
+                return LoanService._frequency_days(stored)
+            except ValueError:
+                pass
         dates = []
         for payment in loan.payments.order_by('scheduled_date', 'created_at', 'id'):
             if LoanService.is_non_installment_fee_payment(payment):
@@ -2548,7 +2615,12 @@ class LoanService:
         )
         loan.balance = LoanService.money((loan.balance or Decimal('0.00')) + total_delta)
         update_fields = ['fee', 'total_amount', 'balance', 'updated_at']
-        if loan.status != 'defaulted':
+        from .collection_policy import should_auto_stop_loan
+
+        if loan.status != 'defaulted' and should_auto_stop_loan(
+            loan,
+            reason or collection.failure_reason,
+        ):
             loan.status = 'defaulted'
             loan.is_active = False
             update_fields.extend(['status', 'is_active'])

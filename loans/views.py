@@ -36,6 +36,7 @@ from .serializers import (
     CollectionExportRowSerializer,
     CollectionInitiateSerializer,
     CollectionPaymentSerializer,
+    CollectionSettingsSerializer,
     CollectionsAccountChangeAuditSerializer,
     CollectionsAccountUpdateSerializer,
     FundingMethodRecommendationSerializer,
@@ -219,7 +220,21 @@ class LoanViewSet(viewsets.ModelViewSet):
             'balance': collection.loan.balance,
             'returned_at': collection.returned_at or collection.updated_at or collection.initiated_at,
             'status': collection.status,
+            'is_problematic': False,
+            'risk_label': '',
         }
+
+    @staticmethod
+    def _with_collection_risk(rows):
+        from .collection_policy import annotate_problematic_loans
+
+        loan_ids = [row['loan_id'] for row in rows if row.get('loan_id')]
+        risk = annotate_problematic_loans(loan_ids)
+        for row in rows:
+            payload = risk.get(str(row['loan_id']), {})
+            row['is_problematic'] = bool(payload.get('is_problematic'))
+            row['risk_label'] = payload.get('risk_label') or ''
+        return rows
 
     def _filtered_queryset(self, *, ignore_status=False, ignore_dates=False):
         qs = super().get_queryset()
@@ -495,6 +510,7 @@ class LoanViewSet(viewsets.ModelViewSet):
                 start_date=serializer.validated_data['start_date'],
                 user=request.user,
                 notes=serializer.validated_data.get('notes') or '',
+                month_days=serializer.validated_data.get('month_days'),
             )
         except ValueError as exc:
             return Response({'error': str(exc)}, status=400)
@@ -826,16 +842,78 @@ class LoanViewSet(viewsets.ModelViewSet):
             'yes',
             'csv',
         )
-        rows = [self._collection_export_row(item) for item in qs]
+        rows = self._with_collection_risk(
+            [self._collection_export_row(item) for item in qs]
+        )
         if export:
             return Response(CollectionExportRowSerializer(rows, many=True).data)
         page = self.paginate_queryset(qs)
         if page is not None:
-            page_rows = [self._collection_export_row(item) for item in page]
+            page_rows = self._with_collection_risk(
+                [self._collection_export_row(item) for item in page]
+            )
             return self.get_paginated_response(
                 CollectionExportRowSerializer(page_rows, many=True).data
             )
         return Response(CollectionExportRowSerializer(rows, many=True).data)
+
+    @action(detail=False, methods=['get', 'patch'], url_path='collection-settings')
+    def collection_settings(self, request):
+        from .collection_policy import save_settings, settings_payload
+
+        if request.method == 'GET':
+            return Response(settings_payload())
+        if not request.user.has_permission(4):
+            return Response(
+                {'error': 'Only managers can change collection stop settings.'},
+                status=403,
+            )
+        serializer = CollectionSettingsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return Response(
+            save_settings(
+                mode=serializer.validated_data['mode'],
+                missed_count=serializer.validated_data.get('missed_count'),
+            )
+        )
+
+    @action(detail=False, methods=['get'], url_path='problematic-collections')
+    def problematic_collections(self, request):
+        """Active loans that need a manual collections review."""
+        from .collection_policy import collection_risk_payload
+
+        loans = (
+            self._filtered_queryset(ignore_status=True, ignore_dates=True)
+            .filter(status='active')
+            .filter(
+                collection_payments__status__in=['failed', 'returned'],
+            )
+            .select_related('customer')
+            .prefetch_related('collection_payments')
+            .distinct()
+            .order_by('-updated_at', '-created_at')
+        )
+        rows = []
+        for loan in loans:
+            risk = collection_risk_payload(loan)
+            if not risk['is_problematic']:
+                continue
+            customer = loan.customer
+            name = (
+                f'{(customer.first_name or "").strip()} {(customer.last_name or "").strip()}'
+            ).strip()
+            rows.append({
+                'loan_id': loan.id,
+                'customer_id': customer.id,
+                'customer_name': name or (customer.email or ''),
+                'risk_label': risk['risk_label'],
+                'balance': loan.balance,
+                'returned_count': risk['returned_count'],
+                'nsf_count': risk['nsf_count'],
+                'stop_payment_count': risk['stop_payment_count'],
+                'account_closed_count': risk['account_closed_count'],
+            })
+        return Response({'count': len(rows), 'results': rows})
 
     @action(detail=False, methods=['get'], url_path='defaulted-collections')
     def defaulted_collections(self, request):
@@ -879,7 +957,9 @@ class LoanViewSet(viewsets.ModelViewSet):
                 'returned_at': loan.missed_returned_at,
                 'status': loan.missed_status or loan.status,
             })
-        return Response(CollectionExportRowSerializer(rows, many=True).data)
+        return Response(
+            CollectionExportRowSerializer(self._with_collection_risk(rows), many=True).data
+        )
 
     @action(detail=True, methods=['post'])
     def record_payment(self, request, pk=None):

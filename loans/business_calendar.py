@@ -56,13 +56,67 @@ def add_calendar_months(start: date, months: int) -> date:
     return date(year, month, day)
 
 
+def normalized_month_day(year: int, month: int, selected_day: int) -> date:
+    """actual day = min(selected day, number of days in that month)."""
+    day = min(int(selected_day), monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def iter_twice_monthly_unadjusted_dates(start_date: date, count: int, day_a: int, day_b: int):
+    """Yield unique twice-monthly dates on or after start_date.
+
+    Each selected day is normalized independently. If both land on the same
+    calendar date in a short month, only one payment is created that month.
+    """
+    selected_days = sorted({int(day_a), int(day_b)})
+    year = start_date.year
+    month = start_date.month
+    produced = 0
+    last_date = None
+    guard = 0
+    while produced < int(count) and guard < 720:
+        guard += 1
+        month_dates = []
+        for selected in selected_days:
+            value = normalized_month_day(year, month, selected)
+            if not month_dates or month_dates[-1] != value:
+                month_dates.append(value)
+        for value in month_dates:
+            if value < start_date:
+                continue
+            if last_date is not None and value <= last_date:
+                continue
+            yield value
+            last_date = value
+            produced += 1
+            if produced >= int(count):
+                return
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+
+
 def unadjusted_date_at(start_date: date, index: int, frequency_days: int) -> date:
     if int(frequency_days) >= 28:
         return add_calendar_months(start_date, index)
     return start_date + timedelta(days=int(frequency_days) * index)
 
 
-def iter_unadjusted_dates(start_date: date, count: int, frequency_days: int):
+def iter_unadjusted_dates(
+    start_date: date,
+    count: int,
+    frequency_days: int,
+    month_days=None,
+):
+    if month_days:
+        yield from iter_twice_monthly_unadjusted_dates(
+            start_date,
+            count,
+            month_days[0],
+            month_days[1],
+        )
+        return
     for index in range(count):
         yield unadjusted_date_at(start_date, index, frequency_days)
 

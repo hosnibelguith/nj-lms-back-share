@@ -114,10 +114,16 @@ def check_defaulted_loans():
     active_loans = Loan.objects.filter(status='active')
     
     defaulted_count = 0
+    from .collection_policy import AUTO_STOP_MODE_AFTER_MISSED, auto_stop_missed_count, auto_stop_mode, should_auto_stop_loan
+
+    if auto_stop_mode() != AUTO_STOP_MODE_AFTER_MISSED:
+        logger.info("Defaulted 0 loans (collection stop mode is manual)")
+        return 0
+
+    threshold = auto_stop_missed_count()
     for loan in active_loans:
         nsf_count = loan.payments.filter(status='nsf').count()
-        
-        if nsf_count >= 3:
+        if nsf_count >= threshold or should_auto_stop_loan(loan, ''):
             loan.mark_defaulted()
             defaulted_count += 1
             logger.warning(f"Loan {loan.id} defaulted ({nsf_count} NSFs)")

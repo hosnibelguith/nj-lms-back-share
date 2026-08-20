@@ -117,6 +117,88 @@ class PaymentScheduleDateLogicTests(APITestCase):
         self.assertEqual(payments[1].original_date, date(2026, 5, 23))
         self.assertEqual(payments[1].scheduled_date, date(2026, 5, 22))
 
+    def test_twice_monthly_uses_two_selected_days_independently(self):
+        payments = LoanService.generate_payment_schedule(
+            self.loan,
+            num_payments=4,
+            payment_amount=Decimal("150.00"),
+            start_date=date(2026, 8, 1),
+            frequency_days=15,
+            schedule_total=Decimal("600.00"),
+            month_days=[15, 31],
+        )
+        self.assertEqual(
+            [payment.original_date for payment in payments],
+            [
+                date(2026, 8, 15),
+                date(2026, 8, 31),
+                date(2026, 9, 15),
+                date(2026, 9, 30),
+            ],
+        )
+        self.assertEqual(payments[1].scheduled_date, date(2026, 8, 31))
+        self.assertEqual(payments[3].original_date, date(2026, 9, 30))
+
+    def test_twice_monthly_short_month_does_not_skip_february(self):
+        payments = LoanService.generate_payment_schedule(
+            self.loan,
+            num_payments=4,
+            payment_amount=Decimal("150.00"),
+            start_date=date(2026, 1, 31),
+            frequency_days=15,
+            schedule_total=Decimal("600.00"),
+            month_days=[15, 31],
+        )
+        originals = [payment.original_date for payment in payments]
+        self.assertEqual(originals[0], date(2026, 1, 31))
+        self.assertEqual(originals[1], date(2026, 2, 15))
+        self.assertEqual(originals[2], date(2026, 2, 28))
+        self.assertEqual(originals[3], date(2026, 3, 15))
+
+    def test_twice_monthly_does_not_create_duplicate_when_days_collapse(self):
+        from loans.business_calendar import iter_twice_monthly_unadjusted_dates
+
+        dates = list(
+            iter_twice_monthly_unadjusted_dates(date(2026, 2, 1), 3, 30, 31)
+        )
+        self.assertEqual(dates[0], date(2026, 2, 28))
+        self.assertEqual(dates.count(date(2026, 2, 28)), 1)
+        self.assertEqual(dates[1], date(2026, 3, 30))
+        self.assertEqual(dates[2], date(2026, 3, 31))
+
+    def test_adjust_schedule_twice_monthly_requires_two_days(self):
+        start_date = date(2026, 8, 7)
+        rejected = self.client.patch(
+            f"/api/loans/{self.loan.id}/adjust-schedule/",
+            {
+                "payment_amount": "180.00",
+                "frequency": "twice-monthly",
+                "start_date": start_date.isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(rejected.status_code, 400)
+
+        accepted = self.client.patch(
+            f"/api/loans/{self.loan.id}/adjust-schedule/",
+            {
+                "payment_amount": "180.00",
+                "frequency": "twice-monthly",
+                "start_date": start_date.isoformat(),
+                "month_days": [15, 31],
+            },
+            format="json",
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.schedule_frequency, "twice-monthly")
+        self.assertEqual(self.loan.twice_monthly_day_1, 15)
+        self.assertEqual(self.loan.twice_monthly_day_2, 31)
+        customer = self.client.get(f"/api/customers/{self.customer.id}/loans/")
+        self.assertEqual(customer.status_code, 200, customer.data)
+        self.assertEqual(customer.data[0]["frequency"], "twice-monthly")
+        self.assertEqual(customer.data[0]["twice_monthly_days"], [15, 31])
+
     def test_instruction_send_is_day_before_after_7pm(self):
         send_at = instruction_send_at(date(2026, 6, 12))
         self.assertEqual(send_at.date(), date(2026, 6, 11))
