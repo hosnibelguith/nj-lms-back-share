@@ -145,6 +145,33 @@ class DashboardAnalyticsTests(APITestCase):
         self.assertEqual(response.data["totals"]["defaulted_loans_count"], 1)
         self.assertEqual(response.data["totals"]["current_defaulted_loans_count"], 1)
 
+    def test_dashboard_quick_summary_uses_live_customer_and_pending_counts(self):
+        Customer.objects.create(
+            first_name="Idle",
+            last_name="Lead",
+            email="idle-lead@example.com",
+            phone="4165550102",
+            province="ON",
+            status="collections",
+        )
+        pending = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("400.00"),
+            fee=Decimal("80.00"),
+            total_amount=Decimal("480.00"),
+            balance=Decimal("480.00"),
+            status="pending",
+            is_active=True,
+        )
+        self.assertEqual(pending.status, "pending")
+
+        response = self.client.get("/api/loans/dashboard/analytics/")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["totals"]["current_customers_count"], 2)
+        self.assertEqual(response.data["totals"]["current_active_customers_count"], 1)
+        self.assertEqual(response.data["totals"]["current_pending_loans_count"], 1)
+
 
 @override_settings(ZUMRAILS_DRY_RUN=True)
 class CollectionExportTests(APITestCase):

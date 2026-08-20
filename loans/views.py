@@ -11,6 +11,7 @@ from django.utils.dateparse import parse_date
 from django.db.models import Q, Sum, Count, Value, CharField, Exists, OuterRef, Subquery
 from django.db.models.functions import Coalesce, TruncDate, Concat
 
+from accounts.models import Customer
 from banking.models import BankAccount
 
 from .models import (
@@ -1167,6 +1168,11 @@ class LoanViewSet(viewsets.ModelViewSet):
             "reactivated_loans_count": events.filter(event_type='reactivated').count(),
             "current_active_loans_count": Loan.objects.filter(is_active=True).count(),
             "current_defaulted_loans_count": Loan.objects.filter(status='defaulted').count(),
+            "current_pending_loans_count": Loan.objects.filter(
+                status__in=('ibv_pending', 'pending', 'pending_signature'),
+            ).count(),
+            "current_customers_count": Customer.objects.count(),
+            "current_active_customers_count": Customer.objects.filter(status='active').count(),
             "nsf_payments_count": nsf_payments_count,
             "sent_payments_count": sent_payments_count,
             "nsf_ratio": nsf_ratio,
@@ -1196,6 +1202,40 @@ class LoanViewSet(viewsets.ModelViewSet):
                 "nsf_ratio": [],
             },
         })
+
+    @action(detail=False, methods=['get'], url_path='report-types')
+    def report_types(self, request):
+        from .reports import list_report_types
+
+        return Response({'results': list_report_types()})
+
+    @action(detail=False, methods=['get'], url_path='reports')
+    def reports(self, request):
+        from .reports import REPORT_TYPE_IDS, run_report
+
+        report_type = (request.query_params.get('report_type') or '').strip()
+        if report_type not in REPORT_TYPE_IDS:
+            return Response({'error': 'Unknown report type.'}, status=400)
+
+        date_from = (
+            parse_date(request.query_params.get('date_from'))
+            if request.query_params.get('date_from')
+            else None
+        )
+        date_to = (
+            parse_date(request.query_params.get('date_to'))
+            if request.query_params.get('date_to')
+            else None
+        )
+        source = (request.query_params.get('source') or '').strip().lower()
+        return Response(
+            run_report(
+                report_type,
+                date_from=date_from,
+                date_to=date_to,
+                source=source,
+            )
+        )
 
 
 # =====================================================
