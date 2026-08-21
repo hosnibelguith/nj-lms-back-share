@@ -142,6 +142,7 @@ class Loan(models.Model):
         ('active', 'Active'),
         ('paid_off', 'Paid Off'),
         ('defaulted', 'In Collections'),
+        ('stopped', 'Stopped'),
     ]
 
     AI_DECISION_CHOICES = [
@@ -445,7 +446,7 @@ class Loan(models.Model):
             )
     
     def mark_defaulted(self, user=None, notes=''):
-        """Mark loan as defaulted."""
+        """Mark loan as in collections. Scheduled payments still go to Zum."""
         previous_status = self.status
         self.status = 'defaulted'
         self.is_active = False
@@ -459,8 +460,29 @@ class Loan(models.Model):
             notes=notes,
         )
 
+    def unschedule_remaining_payments(self):
+        """Keep dates/amounts but do not send remaining scheduled rows to Zum."""
+        self.payments.filter(status='scheduled').update(status='unscheduled')
+
+    def mark_stopped(self, user=None, notes=''):
+        """Stop Zum collections until staff reactivate with a new agreement."""
+        previous_status = self.status
+        self.status = 'stopped'
+        self.is_active = False
+        self.save()
+        self.unschedule_remaining_payments()
+
+        if previous_status != 'stopped':
+            self.log_state_event(
+                event_type='stopped',
+                previous_status=previous_status,
+                new_status=self.status,
+                user=user,
+                notes=notes,
+            )
+
     def reactivate(self, user=None, notes=''):
-        """Reactivate a defaulted/inactive loan."""
+        """Reactivate a stopped loan so a new payment agreement can be scheduled."""
         previous_status = self.status
         self.status = 'active'
         self.is_active = True
@@ -494,6 +516,7 @@ class Payment(models.Model):
         ('failed', 'Failed'),          # Failed to collect
         ('nsf', 'NSF'),                # Non-sufficient funds
         ('cancelled', 'Cancelled'),    # Cancelled by agent
+        ('unscheduled', 'Unscheduled'),  # Stopped loan — do not send to Zum
     ]
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -792,6 +815,7 @@ class LoanStateEvent(models.Model):
         ('funded', 'Funded'),
         ('paid_off', 'Paid Off'),
         ('defaulted', 'Defaulted'),
+        ('stopped', 'Stopped'),
         ('reactivated', 'Reactivated'),
     ]
 

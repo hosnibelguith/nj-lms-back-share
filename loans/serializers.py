@@ -654,6 +654,35 @@ class LoanStateEventSerializer(serializers.ModelSerializer):
 
 class LoanReactivateSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True)
+    start_date = serializers.DateField()
+    frequency = serializers.ChoiceField(
+        choices=['weekly', 'bi-weekly', 'monthly', 'twice-monthly']
+    )
+    payment_amount = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=Decimal('0.01'),
+    )
+    month_days = serializers.ListField(
+        child=serializers.IntegerField(min_value=1, max_value=31),
+        required=False,
+        allow_empty=True,
+    )
+
+    def validate(self, attrs):
+        if attrs.get('frequency') != 'twice-monthly':
+            return attrs
+        days = attrs.get('month_days') or []
+        unique = []
+        for day in days:
+            if day not in unique:
+                unique.append(day)
+        if len(unique) != 2:
+            raise serializers.ValidationError({
+                'month_days': 'Twice a month requires two different days of the current month (1–31).'
+            })
+        attrs['month_days'] = sorted(unique)
+        return attrs
 
 
 # ----- Action Serializers -----

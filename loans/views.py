@@ -8,6 +8,7 @@ from rest_framework.response import Response
 
 from django.utils import timezone
 from django.utils.dateparse import parse_date
+from django.db import transaction
 from django.db.models import Q, Sum, Count, Value, CharField, Exists, OuterRef, Subquery
 from django.db.models.functions import Coalesce, TruncDate, Concat
 
@@ -438,6 +439,7 @@ class LoanViewSet(viewsets.ModelViewSet):
             'expired': by_status.get('expired', 0),
             'paid_off': by_status.get('paid_off', 0),
             'defaulted': defaulted_count,
+            'stopped': by_status.get('stopped', 0),
         })
 
     # =====================================================
@@ -885,7 +887,7 @@ class LoanViewSet(viewsets.ModelViewSet):
 
         loans = (
             self._filtered_queryset(ignore_status=True, ignore_dates=True)
-            .filter(status='active')
+            .filter(status__in=['active', 'defaulted'])
             .filter(
                 collection_payments__status__in=['failed', 'returned'],
             )
@@ -994,10 +996,13 @@ class LoanViewSet(viewsets.ModelViewSet):
     def mark_defaulted(self, request, pk=None):
         loan = self.get_object()
 
-        if loan.status != 'active':
-            return Response({'error': 'Only active loans can default'}, status=400)
+        if loan.status not in ('active', 'defaulted'):
+            return Response(
+                {'error': 'Only collecting loans can be stopped'},
+                status=400,
+            )
 
-        loan.mark_defaulted(user=request.user)
+        loan.mark_stopped(user=request.user, notes='Staff stopped collections')
 
         return Response(LoanSerializer(loan).data)
 
@@ -1005,17 +1010,32 @@ class LoanViewSet(viewsets.ModelViewSet):
     def reactivate(self, request, pk=None):
         loan = self.get_object()
 
-        if loan.status != 'defaulted':
+        if loan.status != 'stopped':
             return Response({'error': 'Only stopped loans can be reactivated'}, status=400)
 
         serializer = LoanReactivateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        loan.reactivate(
-            user=request.user,
-            notes=serializer.validated_data.get('notes', '')
-        )
+        try:
+            with transaction.atomic():
+                loan.reactivate(
+                    user=request.user,
+                    notes=serializer.validated_data.get('notes', '')
+                )
+                LoanService.adjust_payment_schedule(
+                    loan=loan,
+                    calculation_mode='payment_amount',
+                    payment_amount=serializer.validated_data['payment_amount'],
+                    frequency=serializer.validated_data['frequency'],
+                    start_date=serializer.validated_data['start_date'],
+                    user=request.user,
+                    notes=serializer.validated_data.get('notes') or '',
+                    month_days=serializer.validated_data.get('month_days'),
+                )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
 
+        loan.refresh_from_db()
         return Response(LoanSerializer(loan).data)
 
     @action(detail=True, methods=['get'], url_path='interest-breakdown')

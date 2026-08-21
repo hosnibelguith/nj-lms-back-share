@@ -1745,11 +1745,15 @@ class CollectionService:
         try:
             with transaction.atomic():
                 loan = Loan.objects.select_for_update().select_related("customer").get(pk=loan.pk)
+                if loan.status == "stopped":
+                    raise ValueError("Collections are stopped on this loan.")
                 if payment:
                     payment = Payment.objects.select_for_update().get(
                         pk=payment.pk,
                         loan=loan,
                     )
+                    if payment.status == "unscheduled":
+                        raise ValueError("Unscheduled payments are not sent to Zum.")
                     if payment.collection_attempts.filter(
                         status__in=["processing", "completed"]
                     ).exists():

@@ -1,3 +1,4 @@
+from datetime import timedelta
 from decimal import Decimal
 
 from django.utils import timezone
@@ -73,6 +74,8 @@ class CollectionPolicyTests(APITestCase):
         self.assertEqual(classify_failure_reason("EftFailedStopPayment"), "stop_payment")
         self.assertEqual(classify_failure_reason("EftFailedInsufficientFunds"), "nsf")
         self.assertEqual(classify_failure_reason("EftFailedAccountClosed"), "account_closed")
+        self.assertEqual(classify_failure_reason("EftFailedNoDebitAllowed"), "account_closed")
+        self.assertEqual(classify_failure_reason("EftFailedFrozenAccount"), "account_closed")
 
     def test_account_closed_always_auto_stops(self):
         save_settings(mode=AUTO_STOP_MODE_MANUAL, missed_count=5)
@@ -81,17 +84,54 @@ class CollectionPolicyTests(APITestCase):
 
     def test_nsf_does_not_stop_on_first_failure_when_threshold_is_three(self):
         save_settings(mode=AUTO_STOP_MODE_AFTER_MISSED, missed_count=3)
+        upcoming = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("147.18"),
+            status="scheduled",
+            scheduled_date=timezone.localdate() + timedelta(days=14),
+        )
         collection = self._failed_collection("EftFailedInsufficientFunds")
         LoanService.apply_collection_failure_fee(
             collection,
             reason="EftFailedInsufficientFunds",
         )
         self.loan.refresh_from_db()
-        self.assertEqual(self.loan.status, "active")
-        self.assertTrue(self.loan.is_active)
+        upcoming.refresh_from_db()
+        self.assertEqual(self.loan.status, "defaulted")
+        self.assertFalse(self.loan.is_active)
+        self.assertEqual(upcoming.status, "scheduled")
+
+    def test_two_nsfs_stay_in_collections_and_keep_future_payments_scheduled(self):
+        save_settings(mode=AUTO_STOP_MODE_AFTER_MISSED, missed_count=3)
+        upcoming = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("147.18"),
+            status="scheduled",
+            scheduled_date=timezone.localdate() + timedelta(days=14),
+        )
+        first_collection = self._failed_collection("EftFailedInsufficientFunds")
+        LoanService.apply_collection_failure_fee(
+            first_collection,
+            reason="EftFailedInsufficientFunds",
+        )
+        collection = self._failed_collection("EftFailedInsufficientFunds")
+        LoanService.apply_collection_failure_fee(
+            collection,
+            reason="EftFailedInsufficientFunds",
+        )
+        self.loan.refresh_from_db()
+        upcoming.refresh_from_db()
+        self.assertEqual(self.loan.status, "defaulted")
+        self.assertEqual(upcoming.status, "scheduled")
 
     def test_third_nsf_auto_stops_when_mode_is_after_missed(self):
         save_settings(mode=AUTO_STOP_MODE_AFTER_MISSED, missed_count=3)
+        upcoming = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("147.18"),
+            status="scheduled",
+            scheduled_date=timezone.localdate() + timedelta(days=14),
+        )
         self._failed_collection("EftFailedInsufficientFunds")
         self._failed_collection("EftFailedInsufficientFunds")
         collection = self._failed_collection("EftFailedInsufficientFunds")
@@ -100,10 +140,48 @@ class CollectionPolicyTests(APITestCase):
             reason="EftFailedInsufficientFunds",
         )
         self.loan.refresh_from_db()
-        self.assertEqual(self.loan.status, "defaulted")
+        upcoming.refresh_from_db()
+        self.assertEqual(self.loan.status, "stopped")
         self.assertFalse(self.loan.is_active)
+        self.assertEqual(upcoming.status, "unscheduled")
 
-    def test_manual_mode_leaves_stop_payment_active_for_staff(self):
+    def test_account_closed_stops_and_unschedules_immediately(self):
+        save_settings(mode=AUTO_STOP_MODE_AFTER_MISSED, missed_count=3)
+        upcoming = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("147.18"),
+            status="scheduled",
+            scheduled_date=timezone.localdate() + timedelta(days=14),
+        )
+        collection = self._failed_collection("EftFailedAccountClosed")
+        LoanService.apply_collection_failure_fee(
+            collection,
+            reason="EftFailedAccountClosed",
+        )
+        self.loan.refresh_from_db()
+        upcoming.refresh_from_db()
+        self.assertEqual(self.loan.status, "stopped")
+        self.assertEqual(upcoming.status, "unscheduled")
+
+    def test_no_debit_allowed_stops_and_unschedules_immediately(self):
+        save_settings(mode=AUTO_STOP_MODE_AFTER_MISSED, missed_count=3)
+        upcoming = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("147.18"),
+            status="scheduled",
+            scheduled_date=timezone.localdate() + timedelta(days=14),
+        )
+        collection = self._failed_collection("EftFailedNoDebitAllowed")
+        LoanService.apply_collection_failure_fee(
+            collection,
+            reason="EftFailedNoDebitAllowed",
+        )
+        self.loan.refresh_from_db()
+        upcoming.refresh_from_db()
+        self.assertEqual(self.loan.status, "stopped")
+        self.assertEqual(upcoming.status, "unscheduled")
+
+    def test_manual_mode_leaves_stop_payment_in_collections(self):
         save_settings(mode=AUTO_STOP_MODE_MANUAL, missed_count=1)
         collection = self._failed_collection("EftFailedStopPayment")
         LoanService.apply_collection_failure_fee(
@@ -111,7 +189,7 @@ class CollectionPolicyTests(APITestCase):
             reason="EftFailedStopPayment",
         )
         self.loan.refresh_from_db()
-        self.assertEqual(self.loan.status, "active")
+        self.assertEqual(self.loan.status, "defaulted")
 
     def test_three_nsf_or_two_stop_payments_are_problematic(self):
         self.assertTrue(

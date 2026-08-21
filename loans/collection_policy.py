@@ -1,8 +1,9 @@
 """Owner-controlled collection stop policy and problematic-account flags.
 
-Account-closed failures still auto-stop. NSF / stop-payment / other reasons
-either stay on Active for staff review, or auto-stop after N missed collections
-when the owner enables that setting.
+Closed/unusable bank accounts stop Zum collections immediately (Stopped +
+Unscheduled). One or two NSF/other misses move the loan to In Collections
+(defaulted) and keep sending. After N missed collections (default 3), the
+loan is Stopped until staff reactivate with a new agreement.
 """
 COLLECTION_AUTO_STOP_MODE_KEY = 'COLLECTION_AUTO_STOP_MODE'
 COLLECTION_AUTO_STOP_MISSED_COUNT_KEY = 'COLLECTION_AUTO_STOP_MISSED_COUNT'
@@ -47,7 +48,13 @@ def auto_stop_missed_count() -> int:
 def classify_failure_reason(reason: str | None) -> str:
     text = (reason or '').lower().replace('_', ' ').replace('-', ' ')
     compact = text.replace(' ', '')
-    if 'accountclosed' in compact or 'closedaccount' in compact:
+    if (
+        'accountclosed' in compact
+        or 'closedaccount' in compact
+        or 'nodebitallowed' in compact
+        or 'frozenaccount' in compact
+        or 'cannotlocateaccount' in compact
+    ):
         return 'account_closed'
     if 'stoppayment' in compact or 'stop pay' in text:
         return 'stop_payment'
@@ -98,14 +105,42 @@ def is_problematic_counts(counts: dict) -> bool:
     return bool(problematic_reasons(counts))
 
 
-def should_auto_stop_loan(loan, reason: str | None) -> bool:
-    """True when this failure should mark the loan defaulted / stopped."""
+def should_stop_collections(loan, reason: str | None) -> bool:
+    """True when Zum collections must stop (closed account, or N missed)."""
     if is_account_closed_reason(reason):
+        return True
+    counts = loan_failure_counts(loan)
+    if counts.get('account_closed'):
         return True
     if auto_stop_mode() != AUTO_STOP_MODE_AFTER_MISSED:
         return False
-    counts = loan_failure_counts(loan)
     return counts['total'] >= auto_stop_missed_count()
+
+
+def should_enter_collections(loan, reason: str | None) -> bool:
+    """First missed NSF/other stays in collections and keeps sending."""
+    if is_account_closed_reason(reason):
+        return False
+    if should_stop_collections(loan, reason):
+        return False
+    return loan_failure_counts(loan)['total'] >= 1
+
+
+def should_auto_stop_loan(loan, reason: str | None) -> bool:
+    """True when this failure should stop future Zum collections."""
+    return should_stop_collections(loan, reason)
+
+
+def should_convert_defaulted_to_stopped(loan) -> bool:
+    """Historical defaulted loans that were actually stopped, not in-collections."""
+    counts = loan_failure_counts(loan)
+    if counts.get('account_closed'):
+        return True
+    if counts.get('total', 0) == 0:
+        return True
+    if auto_stop_mode() == AUTO_STOP_MODE_AFTER_MISSED:
+        return counts['total'] >= auto_stop_missed_count()
+    return False
 
 
 def collection_risk_payload(loan) -> dict:

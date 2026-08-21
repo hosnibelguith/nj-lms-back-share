@@ -553,6 +553,7 @@ class CustomerPortalBaseView(APIView):
         'pending_funding',
         'active',
         'defaulted',
+        'stopped',
         'expired',
         'human_declined',
         'paid_off',
@@ -711,7 +712,7 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
             next_url = '/customer/loans'
             can_renew = True
 
-        elif loan.status in ['active', 'defaulted']:
+        elif loan.status in ['active', 'defaulted', 'stopped']:
             portal_state = 'active_loan'
             next_step = 'loans'
             next_url = '/customer/loans'

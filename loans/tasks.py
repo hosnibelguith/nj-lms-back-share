@@ -57,7 +57,7 @@ def process_scheduled_payments():
     payments = Payment.objects.filter(
         scheduled_date__lte=latest_due,
         status='scheduled',
-        loan__status='active',
+        loan__status__in=['active', 'defaulted'],
     ).select_related(
         'loan',
         'loan__customer',
@@ -110,26 +110,21 @@ def check_defaulted_loans():
     Run daily via celery beat.
     """
     from .models import Loan
-    
-    active_loans = Loan.objects.filter(status='active')
-    
-    defaulted_count = 0
-    from .collection_policy import AUTO_STOP_MODE_AFTER_MISSED, auto_stop_missed_count, auto_stop_mode, should_auto_stop_loan
+    from .collection_policy import should_enter_collections, should_stop_collections
 
-    if auto_stop_mode() != AUTO_STOP_MODE_AFTER_MISSED:
-        logger.info("Defaulted 0 loans (collection stop mode is manual)")
-        return 0
+    changed = 0
+    for loan in Loan.objects.filter(status__in=['active', 'defaulted']):
+        if should_stop_collections(loan, ''):
+            loan.mark_stopped(notes='Auto-stopped after missed collections')
+            changed += 1
+            logger.warning("Loan %s stopped (missed collections)", loan.id)
+        elif loan.status == 'active' and should_enter_collections(loan, ''):
+            loan.mark_defaulted(notes='Moved to collections after missed payment')
+            changed += 1
+            logger.warning("Loan %s moved to collections", loan.id)
 
-    threshold = auto_stop_missed_count()
-    for loan in active_loans:
-        nsf_count = loan.payments.filter(status='nsf').count()
-        if nsf_count >= threshold or should_auto_stop_loan(loan, ''):
-            loan.mark_defaulted()
-            defaulted_count += 1
-            logger.warning(f"Loan {loan.id} defaulted ({nsf_count} NSFs)")
-    
-    logger.info(f"Defaulted {defaulted_count} loans")
-    return defaulted_count
+    logger.info("Updated %s loans from collection policy", changed)
+    return changed
 
 
 @shared_task

@@ -1046,7 +1046,7 @@ class LoanService:
 
         Payment.objects.filter(
             loan=loan,
-            status__in=['scheduled', 'failed', 'nsf'],
+            status__in=['scheduled', 'failed', 'nsf', 'unscheduled'],
         ).delete()
 
         loan.formula = formula
@@ -1243,7 +1243,7 @@ class LoanService:
             )
         )
         replaceable = list(
-            loan.payments.filter(status__in=['scheduled', 'failed', 'nsf'])
+            loan.payments.filter(status__in=['scheduled', 'failed', 'nsf', 'unscheduled'])
             .exclude(id__in=protected_ids)
             .order_by('scheduled_date', 'created_at', 'id')
         )
@@ -1485,7 +1485,7 @@ class LoanService:
         plan['dry_run'] = False
 
         protected_ids = [p['id'] for p in plan['protected']]
-        delete_qs = loan.payments.filter(status__in=['scheduled', 'failed', 'nsf'])
+        delete_qs = loan.payments.filter(status__in=['scheduled', 'failed', 'nsf', 'unscheduled'])
         if protected_ids:
             delete_qs = delete_qs.exclude(id__in=protected_ids)
         delete_qs.delete()
@@ -2242,6 +2242,8 @@ class LoanService:
         loan.total_amount = total_after
         loan.fee = fee_after
         loan.save(update_fields=['balance', 'total_amount', 'fee', 'updated_at'])
+        if loan.status == 'stopped':
+            loan.unschedule_remaining_payments()
         return plan
 
     @staticmethod
@@ -2614,17 +2616,15 @@ class LoanService:
             (loan.total_amount or Decimal('0.00')) + total_delta
         )
         loan.balance = LoanService.money((loan.balance or Decimal('0.00')) + total_delta)
-        update_fields = ['fee', 'total_amount', 'balance', 'updated_at']
-        from .collection_policy import should_auto_stop_loan
+        loan.save(update_fields=['fee', 'total_amount', 'balance', 'updated_at'])
 
-        if loan.status != 'defaulted' and should_auto_stop_loan(
-            loan,
-            reason or collection.failure_reason,
-        ):
-            loan.status = 'defaulted'
-            loan.is_active = False
-            update_fields.extend(['status', 'is_active'])
-        loan.save(update_fields=update_fields)
+        from .collection_policy import should_enter_collections, should_stop_collections
+
+        failure_reason = reason or collection.failure_reason
+        if loan.status == 'stopped' or should_stop_collections(loan, failure_reason):
+            loan.mark_stopped(notes=f'Collections stopped: {failure_reason or "missed collections"}')
+        elif loan.status == 'active' and should_enter_collections(loan, failure_reason):
+            loan.mark_defaulted(notes=f'In collections: {failure_reason or "missed payment"}')
 
         return fee_payment
     @staticmethod

@@ -41,6 +41,7 @@ def loan_status_changed(sender, instance, **kwargs):
                         'active': ('loan_funded', 'Loan Funded'),
                         'paid_off': ('loan_paid_off', 'Loan Paid Off'),
                         'defaulted': ('loan_defaulted', 'Loan In Collections'),
+                        'stopped': ('loan_defaulted', 'Loan Stopped'),
                     }
 
                     activity_type, title = activity_types.get(

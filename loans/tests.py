@@ -453,6 +453,10 @@ class CollectionExportTests(APITestCase):
         from loans.models import Loan
 
         self.assertEqual(dict(Loan.STATUS_CHOICES)["defaulted"], "In Collections")
+        self.assertEqual(dict(Loan.STATUS_CHOICES)["stopped"], "Stopped")
+        self.loan.status = "defaulted"
+        self.loan.is_active = False
+        self.loan.save(update_fields=["status", "is_active", "updated_at"])
         response = self.client.get(f"/api/loans/{self.loan.id}/")
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data["status"], "defaulted")
@@ -1573,25 +1577,73 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertIn("deferred", response.data["error"])
 
     def test_stop_and_reactivate_loan(self):
+        formula = LoanFormula.objects.create(
+            name="Reactivate 500",
+            principal_amount=Decimal("500.00"),
+            brokerage_percent=Decimal("70.00"),
+            repayment_percent=Decimal("35.00"),
+            default_number_of_payments=8,
+            default_frequency_days=14,
+            is_active=True,
+        )
+        self.loan.formula = formula
         self.loan.status = "active"
         self.loan.is_active = True
-        self.loan.save(update_fields=["status", "is_active", "updated_at"])
+        self.loan.save(update_fields=["formula", "status", "is_active", "updated_at"])
+        scheduled = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("147.18"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+        )
 
         stop = self.client.post(f"/api/loans/{self.loan.id}/mark_defaulted/", {}, format="json")
         self.assertEqual(stop.status_code, 200, stop.data)
         self.loan.refresh_from_db()
-        self.assertEqual(self.loan.status, "defaulted")
+        scheduled.refresh_from_db()
+        self.assertEqual(self.loan.status, "stopped")
         self.assertFalse(self.loan.is_active)
+        self.assertEqual(scheduled.status, "unscheduled")
+
+        missing = self.client.post(f"/api/loans/{self.loan.id}/reactivate/", {}, format="json")
+        self.assertEqual(missing.status_code, 400)
+
+        self.loan.status = "defaulted"
+        self.loan.save(update_fields=["status", "updated_at"])
+        from_collections = self.client.post(
+            f"/api/loans/{self.loan.id}/reactivate/",
+            {
+                "start_date": str(timezone.localdate()),
+                "frequency": "bi-weekly",
+                "payment_amount": "50.00",
+            },
+            format="json",
+        )
+        self.assertEqual(from_collections.status_code, 400)
+        self.loan.status = "stopped"
+        self.loan.save(update_fields=["status", "updated_at"])
 
         reactivate = self.client.post(
             f"/api/loans/{self.loan.id}/reactivate/",
-            {"notes": "Customer resumed payments"},
+            {
+                "notes": "Customer agreed to $50 biweekly",
+                "start_date": str(timezone.localdate()),
+                "frequency": "bi-weekly",
+                "payment_amount": "50.00",
+            },
             format="json",
         )
         self.assertEqual(reactivate.status_code, 200, reactivate.data)
         self.loan.refresh_from_db()
         self.assertEqual(self.loan.status, "active")
         self.assertTrue(self.loan.is_active)
+        scheduled_rows = list(
+            self.loan.payments.filter(status="scheduled").order_by("scheduled_date")
+        )
+        self.assertGreater(len(scheduled_rows), 8)
+        self.assertEqual(scheduled_rows[0].amount, Decimal("50.00"))
+        self.assertGreater(self.loan.total_amount, Decimal("500.00"))
+        self.assertFalse(self.loan.payments.filter(status="unscheduled").exists())
 
     def test_duplicate_funding_is_blocked(self):
         FundedPayment.objects.create(
@@ -2438,6 +2490,45 @@ class ZumRailsWorkflowTests(APITestCase):
         self.assertEqual(second["initiated"], 0)
         self.assertEqual(payment.status, "pending")
         self.assertEqual(payment.collection_attempts.count(), 1)
+
+    def test_defaulted_loan_still_sends_scheduled_collections(self):
+        from loans.tasks import process_scheduled_payments
+
+        self.loan.status = "defaulted"
+        self.loan.is_active = False
+        self.loan.save(update_fields=["status", "is_active", "updated_at"])
+        payment = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+        )
+
+        result = process_scheduled_payments()
+
+        payment.refresh_from_db()
+        self.assertEqual(result["initiated"], 1)
+        self.assertEqual(payment.status, "pending")
+
+    def test_stopped_loan_does_not_send_unscheduled_or_scheduled_collections(self):
+        from loans.tasks import process_scheduled_payments
+
+        self.loan.status = "stopped"
+        self.loan.is_active = False
+        self.loan.save(update_fields=["status", "is_active", "updated_at"])
+        unscheduled = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate(),
+            status="unscheduled",
+        )
+
+        result = process_scheduled_payments()
+
+        unscheduled.refresh_from_db()
+        self.assertEqual(result["initiated"], 0)
+        self.assertEqual(unscheduled.status, "unscheduled")
+        self.assertEqual(unscheduled.collection_attempts.count(), 0)
 
     def test_collections_account_change_requires_failed_collection(self):
         response = self.client.patch(
@@ -3436,8 +3527,9 @@ class PaymentScheduleIntegrityTests(APITestCase):
             last.scheduled_date + timedelta(days=14),
         )
         self.assertEqual(fee.scheduled_date, last.scheduled_date + timedelta(days=28))
-        self.assertEqual(self.loan.status, "defaulted")
+        self.assertEqual(self.loan.status, "stopped")
         self.assertEqual(recovery.amount, Decimal("147.18"))
+        self.assertEqual(recovery.status, "unscheduled")
         self.assertFalse(
             self.loan.payments.filter(
                 notes__startswith=LoanService.COLLECTION_FAILURE_INTEREST_NOTE,
