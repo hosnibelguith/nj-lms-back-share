@@ -288,7 +288,7 @@ class LoanService:
             )
 
         return loan
-
+    
     BLOCKING_APPLICATION_STATUSES = (
         'ibv_pending',
         'pending',
@@ -744,7 +744,7 @@ class LoanService:
             template_id = str(template.id)
             transaction.on_commit(
                 lambda: send_template_message.delay(customer_id, template_id, loan_id)
-            )
+        )
 
         return loan
 
@@ -820,8 +820,6 @@ class LoanService:
     
     @staticmethod
     @transaction.atomic
-    @staticmethod
-    @transaction.atomic
     def record_payment(
         loan: Loan,
         amount: Decimal,
@@ -830,7 +828,7 @@ class LoanService:
         received_date=None,
         reference: str = '',
         notes: str = '',
-        user=None,
+                user=None,
     ) -> Payment:
         """Record a received Interac/manual payment and shorten remaining PAD rows."""
         loan = Loan.objects.select_for_update().get(pk=loan.pk)
@@ -883,7 +881,7 @@ class LoanService:
 
         from activity.services import actor_label, log_staff_action
 
-        method_label = 'Interac' if payment_type == 'etransfer' else 'manual'
+        method_label = LoanService._staff_credit_label(payment_type)
         try:
             customer = Customer.objects.get(pk=loan.customer_id)
         except Customer.DoesNotExist:
@@ -966,9 +964,101 @@ class LoanService:
     @staticmethod
     def is_recorded_staff_payment(payment: Payment) -> bool:
         return (
-            payment.type in ('manual', 'etransfer')
+            payment.type in ('manual', 'etransfer', 'rebate')
             and payment.status == 'completed'
         )
+
+    @staticmethod
+    def _staff_credit_label(payment_type: str) -> str:
+        if payment_type == 'etransfer':
+            return 'Interac'
+        if payment_type == 'rebate':
+            return 'rebate'
+        return 'manual'
+
+    REBATE_NOTE_PREFIX = 'Rebate: '
+    REBATE_REASONS = {
+        'nsf_discount': 'NSF discount',
+        'courtesy': 'Courtesy discount',
+        'other': 'Other',
+    }
+
+    @staticmethod
+    @transaction.atomic
+    def apply_rebate(
+        loan: Loan,
+        amount: Decimal,
+        *,
+        reason: str = 'nsf_discount',
+        applied_date=None,
+        notes: str = '',
+        user=None,
+    ) -> Payment:
+        """Credit the client balance (e.g. NSF fee discount) and shorten remaining PAD."""
+        loan = Loan.objects.select_for_update().get(pk=loan.pk)
+        if loan.status not in ('active', 'defaulted'):
+            raise ValueError('Only collecting loans can receive a rebate.')
+        if reason not in LoanService.REBATE_REASONS:
+            raise ValueError('Choose a valid rebate reason.')
+        if loan.payments.filter(status='pending').exists():
+            raise ValueError(
+                'Cannot apply a rebate while a collection is processing.'
+            )
+
+        amount = LoanService.money(amount)
+        if amount <= 0:
+            raise ValueError('Amount must be greater than zero.')
+        balance = LoanService.money(loan.balance or Decimal('0.00'))
+        if amount > balance:
+            raise ValueError(
+                f'Amount cannot exceed the remaining balance of ${balance}.'
+            )
+
+        applied_date = applied_date or timezone.localdate()
+        reason_label = LoanService.REBATE_REASONS[reason]
+        payment_notes = f'{LoanService.REBATE_NOTE_PREFIX}{reason_label}'
+        if notes:
+            payment_notes = f'{payment_notes}\n{notes}'
+        payment = Payment.objects.create(
+            loan=loan,
+            amount=amount,
+            type='rebate',
+            status='completed',
+            scheduled_date=applied_date,
+            original_date=applied_date,
+            processed_at=timezone.now(),
+            notes=payment_notes,
+            created_by=user if getattr(user, 'is_authenticated', False) else None,
+        )
+        loan.apply_payment(amount, user=user)
+        LoanService._align_scheduled_payments_to_balance(loan)
+
+        from activity.services import actor_label, log_staff_action
+
+        try:
+            customer = Customer.objects.get(pk=loan.customer_id)
+        except Customer.DoesNotExist:
+            customer = None
+        if customer is not None:
+            log_staff_action(
+                customer=customer,
+                loan=loan,
+                user=user,
+                type_value='system',
+                title='Rebate Applied',
+                description=(
+                    f'Rebate of ${amount} ({reason_label}) applied on {applied_date} '
+                    f'by {actor_label(user)}.'
+                ),
+                metadata={
+                    'action': 'apply_rebate',
+                    'payment_id': str(payment.id),
+                    'amount': str(amount),
+                    'reason': reason,
+                    'applied_date': str(applied_date),
+                },
+            )
+        return payment
 
     @staticmethod
     def _collecting_status_after_revert(loan: Loan) -> str:
@@ -987,7 +1077,7 @@ class LoanService:
     def _assert_recorded_payment_mutable(payment: Payment, loan: Loan) -> None:
         if not LoanService.is_recorded_staff_payment(payment):
             raise ValueError(
-                'Only recorded Interac or manual payments can be reverted or updated.'
+                'Only recorded Interac, manual, or rebate rows can be reverted or updated.'
             )
         if loan.status not in ('active', 'defaulted', 'paid_off'):
             raise ValueError(
@@ -1043,7 +1133,7 @@ class LoanService:
 
         from activity.services import actor_label, log_staff_action
 
-        method_label = 'Interac' if payment_type == 'etransfer' else 'manual'
+        method_label = LoanService._staff_credit_label(payment_type)
         try:
             customer = Customer.objects.get(pk=loan.customer_id)
         except Customer.DoesNotExist:
@@ -1100,7 +1190,11 @@ class LoanService:
             )
         next_date = received_date or payment.scheduled_date
 
-        forgive = LoanService._unused_interest_to_forgive(loan, next_amount)
+        forgive = (
+            Decimal('0.00')
+            if payment.type == 'rebate'
+            else LoanService._unused_interest_to_forgive(loan, next_amount)
+        )
         notes = LoanService._strip_forgiven_interest_note(payment.notes or '')
         if forgive > 0:
             forgive_line = (
@@ -1513,7 +1607,7 @@ class LoanService:
 
         if notes:
             detail = f'{detail} {notes}'
-        loan.log_state_event(
+            loan.log_state_event(
             event_type='amount_updated',
             previous_status=loan.status,
             new_status=loan.status,
@@ -1863,7 +1957,7 @@ class LoanService:
             'proposed': proposed,
             'completed': [_row(p) for p in completed],
         }
-
+    
     @staticmethod
     @transaction.atomic
     def heal_upcoming_schedule_keeping_pending(
@@ -1936,7 +2030,7 @@ class LoanService:
         for row in plan['proposed']:
             created.append(
                 Payment.objects.create(
-                    loan=loan,
+            loan=loan,
                     amount=row['amount'],
                     scheduled_date=row['scheduled_date'],
                     original_date=row.get('original_date') or row['scheduled_date'],
@@ -1973,11 +2067,11 @@ class LoanService:
         )
         plan['created_ids'] = [str(p.id) for p in created]
         return plan
-
+    
     @staticmethod
     @transaction.atomic
-    def generate_payment_schedule(loan: Loan, num_payments: int,
-                                  payment_amount: Decimal,
+    def generate_payment_schedule(loan: Loan, num_payments: int, 
+                                  payment_amount: Decimal, 
                                   start_date,
                                   frequency_days: int = 14,
                                   schedule_total: Decimal = None,
@@ -2009,7 +2103,7 @@ class LoanService:
                 **date_fields,
             )
             payments.append(payment)
-
+        
         return payments
 
     @staticmethod

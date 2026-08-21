@@ -507,6 +507,7 @@ class Payment(models.Model):
         ('scheduled', 'Scheduled PAD'),       # Pre-authorized debit
         ('manual', 'Manual Payment'),          # Agent-recorded payment
         ('etransfer', 'e-Transfer Received'),  # Customer sent e-transfer
+        ('rebate', 'Rebate'),                  # Staff credit / NSF discount
     ]
     
     # Payment Status

@@ -885,6 +885,21 @@ class RecordPaymentSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True)
 
 
+class ApplyRebateSerializer(serializers.Serializer):
+    """Staff credit against the remaining balance (NSF discount or similar)."""
+    amount = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=Decimal('0.01'),
+    )
+    reason = serializers.ChoiceField(
+        choices=['nsf_discount', 'courtesy', 'other'],
+        default='nsf_discount',
+    )
+    applied_date = serializers.DateField(required=False)
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+
 class RecordedPaymentUpdateSerializer(serializers.Serializer):
     """Correct a staff-recorded Interac/manual payment."""
     amount = serializers.DecimalField(

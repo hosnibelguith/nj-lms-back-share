@@ -41,7 +41,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         queryset = (
             Loan.objects.filter(
-                payments__type__in=("manual", "etransfer"),
+                payments__type__in=("manual", "etransfer", "rebate"),
                 payments__status="completed",
             )
             .filter(status__in=("active", "defaulted", "paid_off"))

@@ -4157,6 +4157,114 @@ class PaymentScheduleIntegrityTests(APITestCase):
         self.assertEqual(balances[str(scheduled[0].id)], Decimal("47.18"))
         self.assertEqual(balances[str(scheduled[1].id)], Decimal("0.00"))
 
+    def test_apply_nsf_rebate_reduces_balance_and_shortens_schedule(self):
+        nsf = self._add_payment("147.18", status="nsf")
+        second = self._add_payment("147.18", days=14)
+        last = self._add_payment("147.18", days=28)
+        self.loan.status = "defaulted"
+        self.loan.balance = Decimal("294.36")
+        self.loan.save(update_fields=["status", "balance", "updated_at"])
+        applied = timezone.localdate() + timedelta(days=3)
+
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/apply_rebate/",
+            {
+                "amount": "50.00",
+                "reason": "nsf_discount",
+                "applied_date": applied.isoformat(),
+                "notes": "Waive NSF fee",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.loan.refresh_from_db()
+        nsf.refresh_from_db()
+        rebate = self.loan.payments.get(type="rebate", status="completed")
+        scheduled = list(
+            self.loan.payments.filter(status="scheduled").order_by("scheduled_date")
+        )
+        self.assertEqual(rebate.amount, Decimal("50.00"))
+        self.assertEqual(rebate.scheduled_date, applied)
+        self.assertIn("Rebate: NSF discount", rebate.notes)
+        self.assertIn("Waive NSF fee", rebate.notes)
+        self.assertEqual(self.loan.balance, Decimal("244.36"))
+        self.assertEqual(nsf.status, "nsf")
+        self.assertEqual(nsf.amount, Decimal("147.18"))
+        self.assertEqual(len(scheduled), 2)
+        self.assertEqual(scheduled[0].id, second.id)
+        self.assertEqual(scheduled[0].amount, Decimal("147.18"))
+        self.assertEqual(scheduled[1].id, last.id)
+        self.assertEqual(scheduled[1].amount, Decimal("97.18"))
+        self.assertEqual(
+            sum((p.amount for p in scheduled), Decimal("0.00")),
+            self.loan.balance,
+        )
+        balances = self._balance_after_map()
+        self.assertEqual(balances[str(nsf.id)], Decimal("294.36"))
+        self.assertEqual(balances[str(rebate.id)], Decimal("244.36"))
+        self.assertEqual(balances[str(scheduled[0].id)], Decimal("97.18"))
+        self.assertEqual(balances[str(scheduled[1].id)], Decimal("0.00"))
+
+        revert = self.client.post(
+            f"/api/payments/{rebate.id}/revert-recorded/",
+            {},
+            format="json",
+        )
+        self.assertEqual(revert.status_code, 200, revert.data)
+        self.loan.refresh_from_db()
+        rebate.refresh_from_db()
+        self.assertEqual(rebate.status, "cancelled")
+        self.assertEqual(self.loan.balance, Decimal("294.36"))
+        restored = list(
+            self.loan.payments.filter(status="scheduled").order_by("scheduled_date")
+        )
+        self.assertEqual(
+            sum((p.amount for p in restored), Decimal("0.00")),
+            self.loan.balance,
+        )
+
+    def test_apply_rebate_rejects_overpay_pending_and_non_collecting_loans(self):
+        self._add_payment("147.18")
+        self.loan.balance = Decimal("147.18")
+        self.loan.save(update_fields=["balance", "updated_at"])
+
+        overpay = self.client.post(
+            f"/api/loans/{self.loan.id}/apply_rebate/",
+            {"amount": "200.00", "reason": "nsf_discount"},
+            format="json",
+        )
+        self.assertEqual(overpay.status_code, 400, overpay.data)
+
+        pending = self._add_payment("50.00", days=14, status="pending")
+        self.loan.balance = Decimal("197.18")
+        self.loan.save(update_fields=["balance", "updated_at"])
+        in_flight = self.client.post(
+            f"/api/loans/{self.loan.id}/apply_rebate/",
+            {"amount": "10.00", "reason": "nsf_discount"},
+            format="json",
+        )
+        self.assertEqual(in_flight.status_code, 400, in_flight.data)
+        pending.delete()
+
+        self.loan.status = "stopped"
+        self.loan.is_active = False
+        self.loan.save(update_fields=["status", "is_active", "updated_at"])
+        stopped = self.client.post(
+            f"/api/loans/{self.loan.id}/apply_rebate/",
+            {"amount": "10.00", "reason": "nsf_discount"},
+            format="json",
+        )
+        self.assertEqual(stopped.status_code, 400, stopped.data)
+        self.assertFalse(self.loan.payments.filter(type="rebate").exists())
+
+        cash = self.client.post(
+            f"/api/loans/{self.loan.id}/record_payment/",
+            {"amount": "10.00", "type": "etransfer"},
+            format="json",
+        )
+        self.assertEqual(cash.status_code, 400, cash.data)
+
     def test_record_payment_rejects_overpay_pending_and_stopped_loans(self):
         self._add_payment("147.18")
         self.loan.balance = Decimal("147.18")

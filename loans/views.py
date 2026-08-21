@@ -58,6 +58,7 @@ from .serializers import (
     LoanFundSerializer,
     LoanFundingConfigurationSerializer,
     RecordPaymentSerializer,
+    ApplyRebateSerializer,
     RecordedPaymentUpdateSerializer,
     LoanStateEventSerializer,
     LoanReactivateSerializer,
@@ -985,6 +986,34 @@ class LoanViewSet(viewsets.ModelViewSet):
                 serializer.validated_data['type'],
                 received_date=serializer.validated_data.get('received_date'),
                 reference=serializer.validated_data.get('reference') or '',
+                notes=serializer.validated_data.get('notes') or '',
+                user=request.user,
+            )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
+
+        loan.refresh_from_db()
+        return Response(LoanSerializer(loan).data)
+
+    @action(detail=True, methods=['post'])
+    def apply_rebate(self, request, pk=None):
+        loan = self.get_object()
+
+        if loan.status not in ('active', 'defaulted'):
+            return Response(
+                {'error': 'Only collecting loans can receive a rebate'},
+                status=400,
+            )
+
+        serializer = ApplyRebateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            LoanService.apply_rebate(
+                loan,
+                serializer.validated_data['amount'],
+                reason=serializer.validated_data.get('reason') or 'nsf_discount',
+                applied_date=serializer.validated_data.get('applied_date'),
                 notes=serializer.validated_data.get('notes') or '',
                 user=request.user,
             )
