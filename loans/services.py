@@ -97,7 +97,7 @@ class LoanService:
         return LoanService.money(principal_balance + total_interest)
 
     @staticmethod
-    def get_interest_breakdown(loan: Loan, as_of_date=None) -> dict:
+    def get_interest_breakdown(loan: Loan, as_of_date=None, *, include_timeline: bool = True) -> dict:
         """
         Decompose a loan's already-priced fee into brokerage + day-by-day
         interest so staff can explain early-payoff savings or late-payoff
@@ -177,15 +177,21 @@ class LoanService:
 
         rounded_daily = money(daily_interest)
         base_balance = money(principal + brokerage_fee)
+        remaining_balance = money(loan.balance or Decimal('0.00'))
+        unused_daily_interest = money(
+            max(-interest_adjustment, Decimal('0.00'))
+        )
+        payoff_today = money(max(remaining_balance - unused_daily_interest, Decimal('0.00')))
         timeline = []
-        for day in range(1, charged_days + 1):
-            timeline.append({
-                'day': day,
-                'type': 'interest' if day <= planned_days else 'late_interest',
-                'amount': str(rounded_daily),
-                'balance': str(money(base_balance + rounded_daily * Decimal(day))),
-                'date': (projection_start + timedelta(days=day)).isoformat(),
-            })
+        if include_timeline:
+            for day in range(1, charged_days + 1):
+                timeline.append({
+                    'day': day,
+                    'type': 'interest' if day <= planned_days else 'late_interest',
+                    'amount': str(rounded_daily),
+                    'balance': str(money(base_balance + rounded_daily * Decimal(day))),
+                    'date': (projection_start + timedelta(days=day)).isoformat(),
+                })
 
         return {
             'capital': str(money(principal)),
@@ -201,8 +207,22 @@ class LoanService:
             'status': loan.status,
             'actual_interest': str(actual_interest),
             'interest_adjustment': str(interest_adjustment),
+            'unused_daily_interest': str(unused_daily_interest),
+            'payoff_today': str(payoff_today),
             'timeline': timeline,
         }
+
+    @staticmethod
+    def payoff_today_amount(loan: Loan, as_of_date=None):
+        """Remaining balance if the client pays today (unearned daily interest removed)."""
+        money = LoanService.money
+        breakdown = LoanService.get_interest_breakdown(
+            loan, as_of_date=as_of_date, include_timeline=False
+        )
+        return (
+            money(Decimal(breakdown['payoff_today'])),
+            money(Decimal(breakdown['unused_daily_interest'])),
+        )
 
     @staticmethod
     @transaction.atomic
@@ -800,6 +820,8 @@ class LoanService:
     
     @staticmethod
     @transaction.atomic
+    @staticmethod
+    @transaction.atomic
     def record_payment(
         loan: Loan,
         amount: Decimal,
@@ -831,6 +853,17 @@ class LoanService:
             )
 
         received_date = received_date or timezone.localdate()
+        forgive = LoanService._unused_interest_to_forgive(loan, amount)
+        payment_notes = notes or ''
+        if forgive > 0:
+            forgive_line = (
+                f'{LoanService.RECORDED_INTEREST_FORGIVEN_NOTE}{forgive}'
+            )
+            payment_notes = (
+                f'{payment_notes}\n{forgive_line}'.strip()
+                if payment_notes
+                else forgive_line
+            )
         payment = Payment.objects.create(
             loan=loan,
             amount=amount,
@@ -840,11 +873,13 @@ class LoanService:
             original_date=received_date,
             processed_at=timezone.now(),
             reference=reference or '',
-            notes=notes or '',
+            notes=payment_notes,
             created_by=user if getattr(user, 'is_authenticated', False) else None,
         )
+        if forgive > 0:
+            LoanService._apply_interest_forgiveness(loan, forgive)
         loan.apply_payment(amount, user=user)
-        LoanService._trim_scheduled_payments_to_balance(loan)
+        LoanService._align_scheduled_payments_to_balance(loan)
 
         from activity.services import actor_label, log_staff_action
 
@@ -870,6 +905,256 @@ class LoanService:
                     'amount': str(amount),
                     'type': payment_type,
                     'received_date': str(received_date),
+                    'interest_forgiven': str(forgive),
+                },
+            )
+        return payment
+
+    RECORDED_INTEREST_FORGIVEN_NOTE = 'Unused daily interest forgiven: $'
+
+    @staticmethod
+    def recorded_interest_forgiven_amount(payment: Payment) -> Decimal:
+        prefix = LoanService.RECORDED_INTEREST_FORGIVEN_NOTE
+        for line in (payment.notes or '').splitlines():
+            if not line.startswith(prefix):
+                continue
+            try:
+                return LoanService.money(Decimal(line.split('$', 1)[1]))
+            except Exception:
+                return Decimal('0.00')
+        return Decimal('0.00')
+
+    @staticmethod
+    def _unused_interest_to_forgive(loan: Loan, amount: Decimal) -> Decimal:
+        """Forgive leftover unearned interest when the payment pays the loan off today."""
+        money = LoanService.money
+        amount = money(amount)
+        payoff, _unused = LoanService.payoff_today_amount(loan)
+        if amount < payoff:
+            return Decimal('0.00')
+        forgive = money((loan.balance or Decimal('0.00')) - amount)
+        if forgive <= 0:
+            return Decimal('0.00')
+        return forgive
+
+    @staticmethod
+    def _apply_interest_forgiveness(loan: Loan, amount: Decimal) -> None:
+        money = LoanService.money
+        amount = money(amount)
+        if amount <= 0:
+            return
+        loan.fee = money(max((loan.fee or Decimal('0.00')) - amount, Decimal('0.00')))
+        loan.total_amount = money(
+            max((loan.total_amount or Decimal('0.00')) - amount, Decimal('0.00'))
+        )
+        loan.balance = money(
+            max((loan.balance or Decimal('0.00')) - amount, Decimal('0.00'))
+        )
+        loan.save(update_fields=['fee', 'total_amount', 'balance', 'updated_at'])
+
+    @staticmethod
+    def _restore_interest_forgiveness(loan: Loan, amount: Decimal) -> None:
+        money = LoanService.money
+        amount = money(amount)
+        if amount <= 0:
+            return
+        loan.fee = money((loan.fee or Decimal('0.00')) + amount)
+        loan.total_amount = money((loan.total_amount or Decimal('0.00')) + amount)
+        loan.balance = money((loan.balance or Decimal('0.00')) + amount)
+        loan.save(update_fields=['fee', 'total_amount', 'balance', 'updated_at'])
+
+    @staticmethod
+    def is_recorded_staff_payment(payment: Payment) -> bool:
+        return (
+            payment.type in ('manual', 'etransfer')
+            and payment.status == 'completed'
+        )
+
+    @staticmethod
+    def _collecting_status_after_revert(loan: Loan) -> str:
+        event = (
+            loan.state_events.filter(event_type='paid_off')
+            .order_by('-created_at')
+            .first()
+        )
+        if event and event.previous_status in ('active', 'defaulted'):
+            return event.previous_status
+        if loan.payments.filter(status__in=('nsf', 'failed')).exists():
+            return 'defaulted'
+        return 'active'
+
+    @staticmethod
+    def _assert_recorded_payment_mutable(payment: Payment, loan: Loan) -> None:
+        if not LoanService.is_recorded_staff_payment(payment):
+            raise ValueError(
+                'Only recorded Interac or manual payments can be reverted or updated.'
+            )
+        if loan.status not in ('active', 'defaulted', 'paid_off'):
+            raise ValueError(
+                'This recorded payment can no longer be reverted or updated.'
+            )
+        if loan.payments.filter(status='pending').exists():
+            raise ValueError(
+                'Cannot change a recorded payment while a collection is processing.'
+            )
+
+    @staticmethod
+    def _unapply_recorded_payment(loan: Loan, payment: Payment, *, user=None) -> None:
+        money = LoanService.money
+        amount = money(payment.amount or Decimal('0.00'))
+        forgiven = LoanService.recorded_interest_forgiven_amount(payment)
+        if forgiven > 0:
+            LoanService._restore_interest_forgiveness(loan, forgiven)
+        loan.balance = money((loan.balance or Decimal('0.00')) + amount)
+        if loan.status == 'paid_off':
+            restore = LoanService._collecting_status_after_revert(loan)
+            loan.status = restore
+            loan.is_active = restore == 'active'
+        loan.save(update_fields=['balance', 'status', 'is_active', 'updated_at'])
+
+    @staticmethod
+    def _strip_forgiven_interest_note(notes: str) -> str:
+        prefix = LoanService.RECORDED_INTEREST_FORGIVEN_NOTE
+        lines = [
+            line
+            for line in (notes or '').splitlines()
+            if not line.startswith(prefix)
+        ]
+        return '\n'.join(lines).strip()
+
+    @staticmethod
+    @transaction.atomic
+    def revert_recorded_payment(payment: Payment, *, user=None) -> Payment:
+        """Cancel a staff-recorded Interac/manual payment and restore the schedule."""
+        payment = Payment.objects.select_for_update().select_related('loan').get(
+            pk=payment.pk
+        )
+        loan = Loan.objects.select_for_update().get(pk=payment.loan_id)
+        LoanService._assert_recorded_payment_mutable(payment, loan)
+
+        amount = LoanService.money(payment.amount or Decimal('0.00'))
+        received_date = payment.scheduled_date
+        payment_type = payment.type
+        LoanService._unapply_recorded_payment(loan, payment, user=user)
+        payment.status = 'cancelled'
+        payment.processed_at = None
+        payment.save(update_fields=['status', 'processed_at'])
+        LoanService._align_scheduled_payments_to_balance(loan)
+
+        from activity.services import actor_label, log_staff_action
+
+        method_label = 'Interac' if payment_type == 'etransfer' else 'manual'
+        try:
+            customer = Customer.objects.get(pk=loan.customer_id)
+        except Customer.DoesNotExist:
+            customer = None
+        if customer is not None:
+            log_staff_action(
+                customer=customer,
+                loan=loan,
+                user=user,
+                type_value='system',
+                title='Recorded Payment Reverted',
+                description=(
+                    f'{method_label} payment of ${amount} on {received_date} '
+                    f'reverted by {actor_label(user)}.'
+                ),
+                metadata={
+                    'action': 'revert_recorded_payment',
+                    'payment_id': str(payment.id),
+                    'amount': str(amount),
+                    'type': payment_type,
+                },
+            )
+        return payment
+
+    @staticmethod
+    @transaction.atomic
+    def update_recorded_payment(
+        payment: Payment,
+        *,
+        amount: Decimal = None,
+        received_date=None,
+        user=None,
+    ) -> Payment:
+        """Correct amount/date on a staff-recorded Interac/manual payment."""
+        payment = Payment.objects.select_for_update().select_related('loan').get(
+            pk=payment.pk
+        )
+        loan = Loan.objects.select_for_update().get(pk=payment.loan_id)
+        LoanService._assert_recorded_payment_mutable(payment, loan)
+        if amount is None and received_date is None:
+            raise ValueError('Provide amount and/or received date to update.')
+
+        previous_amount = LoanService.money(payment.amount or Decimal('0.00'))
+        previous_date = payment.scheduled_date
+        LoanService._unapply_recorded_payment(loan, payment, user=user)
+
+        next_amount = previous_amount if amount is None else LoanService.money(amount)
+        if next_amount <= 0:
+            raise ValueError('Amount must be greater than zero.')
+        balance = LoanService.money(loan.balance or Decimal('0.00'))
+        if next_amount > balance:
+            raise ValueError(
+                f'Amount cannot exceed the remaining balance of ${balance}.'
+            )
+        next_date = received_date or payment.scheduled_date
+
+        forgive = LoanService._unused_interest_to_forgive(loan, next_amount)
+        notes = LoanService._strip_forgiven_interest_note(payment.notes or '')
+        if forgive > 0:
+            forgive_line = (
+                f'{LoanService.RECORDED_INTEREST_FORGIVEN_NOTE}{forgive}'
+            )
+            notes = f'{notes}\n{forgive_line}'.strip() if notes else forgive_line
+
+        payment.amount = next_amount
+        payment.scheduled_date = next_date
+        payment.original_date = next_date
+        payment.status = 'completed'
+        payment.processed_at = timezone.now()
+        payment.notes = notes
+        payment.save(
+            update_fields=[
+                'amount',
+                'scheduled_date',
+                'original_date',
+                'status',
+                'processed_at',
+                'notes',
+            ]
+        )
+        if forgive > 0:
+            LoanService._apply_interest_forgiveness(loan, forgive)
+        loan.apply_payment(next_amount, user=user)
+        LoanService._align_scheduled_payments_to_balance(loan)
+
+        from activity.services import actor_label, log_staff_action
+
+        try:
+            customer = Customer.objects.get(pk=loan.customer_id)
+        except Customer.DoesNotExist:
+            customer = None
+        if customer is not None:
+            log_staff_action(
+                customer=customer,
+                loan=loan,
+                user=user,
+                type_value='payment_completed',
+                title='Recorded Payment Updated',
+                description=(
+                    f'Recorded payment updated by {actor_label(user)}: '
+                    f'${previous_amount} on {previous_date} → '
+                    f'${next_amount} on {next_date}.'
+                ),
+                metadata={
+                    'action': 'update_recorded_payment',
+                    'payment_id': str(payment.id),
+                    'previous_amount': str(previous_amount),
+                    'new_amount': str(next_amount),
+                    'previous_date': str(previous_date),
+                    'new_date': str(next_date),
+                    'interest_forgiven': str(forgive),
                 },
             )
         return payment
@@ -902,6 +1187,61 @@ class LoanService:
             row.amount = money(amount - extra)
             row.save(update_fields=['amount'])
             extra = Decimal('0.00')
+
+    @staticmethod
+    def _expand_scheduled_payments_by_amount(loan: Loan, amount: Decimal) -> None:
+        """Add amount back onto the last scheduled installment (or create one)."""
+        money = LoanService.money
+        amount = money(amount)
+        if amount <= 0:
+            return
+        last = (
+            loan.payments.filter(status='scheduled')
+            .order_by('-scheduled_date', '-created_at', '-id')
+            .first()
+        )
+        if last:
+            last.amount = money((last.amount or Decimal('0.00')) + amount)
+            last.save(update_fields=['amount'])
+            return
+        frequency_days = LoanService._schedule_frequency_days(loan)
+        last_any = (
+            loan.payments.exclude(status='cancelled')
+            .order_by('-scheduled_date', '-created_at', '-id')
+            .first()
+        )
+        start = timezone.localdate()
+        if last_any and last_any.scheduled_date:
+            start = last_any.scheduled_date + timedelta(days=frequency_days)
+            if start < timezone.localdate():
+                start = timezone.localdate() + timedelta(days=frequency_days)
+        date_fields = business_calendar.payment_date_fields(start)
+        Payment.objects.create(
+            loan=loan,
+            amount=amount,
+            type='scheduled',
+            status='scheduled',
+            **date_fields,
+        )
+
+    @staticmethod
+    def _align_scheduled_payments_to_balance(loan: Loan) -> None:
+        money = LoanService.money
+        target = money(loan.balance or Decimal('0.00'))
+        current = money(
+            sum(
+                (
+                    money(row.amount or Decimal('0.00'))
+                    for row in loan.payments.filter(status='scheduled')
+                ),
+                Decimal('0.00'),
+            )
+        )
+        extra = money(current - target)
+        if extra > 0:
+            LoanService._trim_scheduled_payments_to_balance(loan)
+        elif extra < 0:
+            LoanService._expand_scheduled_payments_by_amount(loan, money(-extra))
 
     @staticmethod
     @transaction.atomic
@@ -1726,6 +2066,17 @@ class LoanService:
                 delta = Decimal('0.00')
 
     @staticmethod
+    def _assert_future_scheduled_installment(payment: Payment, *, action: str) -> None:
+        if payment.status in ('failed', 'nsf'):
+            raise ValueError('Missed or failed installments cannot be updated.')
+        if payment.status in ('completed', 'cancelled'):
+            raise ValueError(f'Paid installments cannot be {action}.')
+        if payment.status != 'scheduled':
+            raise ValueError(f'Only scheduled installments can be {action}.')
+        if payment.scheduled_date and payment.scheduled_date < timezone.localdate():
+            raise ValueError('Past-due installments cannot be updated.')
+
+    @staticmethod
     @transaction.atomic
     def update_scheduled_payment(
         payment: Payment,
@@ -1749,8 +2100,7 @@ class LoanService:
         ]:
             raise ValueError(f'Cannot edit payments for loan in status: {loan.status}')
 
-        if payment.status not in ('scheduled', 'pending', 'failed', 'nsf'):
-            raise ValueError('Only open schedule installments can be edited.')
+        LoanService._assert_future_scheduled_installment(payment, action='edited')
 
         if payment.collection_attempts.filter(status__in=['processing', 'completed']).exists():
             raise ValueError(
@@ -1782,13 +2132,6 @@ class LoanService:
 
         if not update_fields:
             return payment
-
-        # Failed/NSF rows that staff re-date or re-amount become collectible again.
-        if payment.status in ('failed', 'nsf'):
-            payment.status = 'scheduled'
-            payment.failure_reason = None
-            payment.processed_at = None
-            update_fields.extend(['status', 'failure_reason', 'processed_at'])
 
         payment.save(update_fields=list(dict.fromkeys(update_fields)))
 
@@ -2481,8 +2824,7 @@ class LoanService:
         ]:
             raise ValueError(f'Cannot defer payments for loan in status: {loan.status}')
 
-        if payment.status not in ('scheduled', 'pending', 'failed', 'nsf'):
-            raise ValueError('Only open schedule installments can be deferred.')
+        LoanService._assert_future_scheduled_installment(payment, action='deferred')
 
         if LoanService.is_deferral_fee_payment(payment):
             raise ValueError('Deferral fee payments cannot be deferred again.')
@@ -2514,11 +2856,6 @@ class LoanService:
         if extra_interest > 0:
             payment.amount = LoanService.money(previous_amount + extra_interest)
             update_fields.append('amount')
-        if payment.status in ('failed', 'nsf'):
-            payment.status = 'scheduled'
-            payment.failure_reason = None
-            payment.processed_at = None
-            update_fields.extend(['status', 'failure_reason', 'processed_at'])
         defer_note = f'Deferred from {previous_date}'
         if extra_interest > 0:
             defer_note = f'{defer_note}; daily interest ${extra_interest}'

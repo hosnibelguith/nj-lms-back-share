@@ -1466,7 +1466,7 @@ class ZumRailsWorkflowTests(APITestCase):
         )
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("open schedule", response.data["error"])
+        self.assertIn("cannot be edited", response.data["error"].lower())
 
     def test_defer_scheduled_payment_moves_to_end_and_schedules_fee(self):
         from loans.services import LoanService
@@ -4015,7 +4015,7 @@ class PaymentScheduleIntegrityTests(APITestCase):
         payment.refresh_from_db()
         self.assertEqual(payment.amount, Decimal("147.18"))
 
-    def test_failed_installment_edit_resets_status_and_rebalances(self):
+    def test_failed_installment_cannot_be_edited(self):
         failed = self._add_payment("100.00", status="failed")
         later = self._add_payment("783.09", days=14)
 
@@ -4024,14 +4024,13 @@ class PaymentScheduleIntegrityTests(APITestCase):
             {"amount": "400.00"},
             format="json",
         )
-        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("missed or failed", response.data["error"].lower())
         failed.refresh_from_db()
-        self.assertEqual(failed.status, "scheduled")
-        self.assertEqual(failed.amount, Decimal("400.00"))
-        self.assertEqual(self._open_sum(), self.loan.total_amount)
-        if Payment.objects.filter(pk=later.pk).exists():
-            later.refresh_from_db()
-            self.assertEqual(failed.amount + later.amount, self.loan.total_amount)
+        later.refresh_from_db()
+        self.assertEqual(failed.status, "failed")
+        self.assertEqual(failed.amount, Decimal("100.00"))
+        self.assertEqual(later.amount, Decimal("783.09"))
 
     def test_protects_edited_amount_when_no_other_scheduled_to_trim(self):
         """If only the edited row is scheduled, overshoot cannot be trimmed away."""
@@ -4152,6 +4151,11 @@ class PaymentScheduleIntegrityTests(APITestCase):
             )
         ]
         self.assertEqual(dates, [nsf.scheduled_date, received, second.scheduled_date, last.scheduled_date])
+        balances = self._balance_after_map()
+        self.assertEqual(balances[str(nsf.id)], Decimal("294.36"))
+        self.assertEqual(balances[str(interac.id)], Decimal("194.36"))
+        self.assertEqual(balances[str(scheduled[0].id)], Decimal("47.18"))
+        self.assertEqual(balances[str(scheduled[1].id)], Decimal("0.00"))
 
     def test_record_payment_rejects_overpay_pending_and_stopped_loans(self):
         self._add_payment("147.18")
@@ -4200,6 +4204,168 @@ class PaymentScheduleIntegrityTests(APITestCase):
         self.assertTrue(
             self.loan.payments.filter(type="etransfer", status="completed").exists()
         )
+
+    def test_nsf_and_past_due_installments_cannot_be_updated(self):
+        nsf = self._add_payment("147.18", status="nsf")
+        past_due = self._add_payment("147.18", days=-7)
+        future = self._add_payment("147.18", days=14)
+
+        nsf_response = self.client.patch(
+            f"/api/payments/{nsf.id}/",
+            {"amount": "100.00"},
+            format="json",
+        )
+        self.assertEqual(nsf_response.status_code, 400, nsf_response.data)
+        nsf.refresh_from_db()
+        self.assertEqual(nsf.amount, Decimal("147.18"))
+        self.assertEqual(nsf.status, "nsf")
+
+        past_response = self.client.patch(
+            f"/api/payments/{past_due.id}/",
+            {"amount": "100.00"},
+            format="json",
+        )
+        self.assertEqual(past_response.status_code, 400, past_response.data)
+        past_due.refresh_from_db()
+        self.assertEqual(past_due.amount, Decimal("147.18"))
+        self.assertEqual(past_due.status, "scheduled")
+
+        defer_nsf = self.client.post(f"/api/payments/{nsf.id}/defer/", {}, format="json")
+        self.assertEqual(defer_nsf.status_code, 400, defer_nsf.data)
+
+        future_response = self.client.patch(
+            f"/api/payments/{future.id}/",
+            {"amount": "160.00"},
+            format="json",
+        )
+        self.assertEqual(future_response.status_code, 200, future_response.data)
+        future.refresh_from_db()
+        self.assertEqual(future.amount, Decimal("160.00"))
+
+    def test_revert_and_update_recorded_interac_restores_schedule(self):
+        nsf = self._add_payment("147.18", status="nsf")
+        second = self._add_payment("147.18", days=14)
+        last = self._add_payment("147.18", days=28)
+        self.loan.balance = Decimal("294.36")
+        self.loan.save(update_fields=["balance", "updated_at"])
+        received = timezone.localdate() + timedelta(days=7)
+
+        recorded = self.client.post(
+            f"/api/loans/{self.loan.id}/record_payment/",
+            {
+                "amount": "100.00",
+                "type": "etransfer",
+                "received_date": received.isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(recorded.status_code, 200, recorded.data)
+        interac = self.loan.payments.get(type="etransfer", status="completed")
+
+        updated = self.client.patch(
+            f"/api/payments/{interac.id}/update-recorded/",
+            {"amount": "50.00"},
+            format="json",
+        )
+        self.assertEqual(updated.status_code, 200, updated.data)
+        self.loan.refresh_from_db()
+        interac.refresh_from_db()
+        last.refresh_from_db()
+        nsf.refresh_from_db()
+        self.assertEqual(interac.amount, Decimal("50.00"))
+        self.assertEqual(self.loan.balance, Decimal("244.36"))
+        self.assertEqual(nsf.amount, Decimal("147.18"))
+        self.assertEqual(nsf.status, "nsf")
+        self.assertEqual(second.amount, Decimal("147.18"))
+        self.assertEqual(last.amount, Decimal("97.18"))
+
+        rejected_nsf = self.client.patch(
+            f"/api/payments/{nsf.id}/update-recorded/",
+            {"amount": "10.00"},
+            format="json",
+        )
+        self.assertEqual(rejected_nsf.status_code, 400, rejected_nsf.data)
+
+        reverted = self.client.post(
+            f"/api/payments/{interac.id}/revert-recorded/",
+            {},
+            format="json",
+        )
+        self.assertEqual(reverted.status_code, 200, reverted.data)
+        self.loan.refresh_from_db()
+        interac.refresh_from_db()
+        last.refresh_from_db()
+        self.assertEqual(interac.status, "cancelled")
+        self.assertEqual(self.loan.balance, Decimal("294.36"))
+        self.assertEqual(self.loan.status, "active")
+        self.assertEqual(last.amount, Decimal("147.18"))
+        self.assertEqual(
+            sum(
+                (p.amount for p in self.loan.payments.filter(status="scheduled")),
+                Decimal("0.00"),
+            ),
+            self.loan.balance,
+        )
+
+    def test_payoff_today_removes_unused_interest_and_marks_paid_off(self):
+        self._add_payment(str(self.loan.balance), days=14)
+        breakdown = self.client.get(f"/api/loans/{self.loan.id}/interest-breakdown/")
+        self.assertEqual(breakdown.status_code, 200, breakdown.data)
+        payoff = Decimal(str(breakdown.data["payoff_today"]))
+        unused = Decimal(str(breakdown.data["unused_daily_interest"]))
+        original_fee = self.loan.fee
+        self.assertGreater(unused, Decimal("0.00"))
+        self.assertLess(payoff, self.loan.balance)
+
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/record_payment/",
+            {
+                "amount": str(payoff),
+                "type": "etransfer",
+                "received_date": timezone.localdate().isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "paid_off")
+        self.assertEqual(self.loan.balance, Decimal("0.00"))
+        self.assertEqual(self.loan.fee, original_fee - unused)
+        self.assertFalse(self.loan.payments.filter(status="scheduled").exists())
+        interac = self.loan.payments.get(type="etransfer", status="completed")
+        self.assertEqual(interac.amount, payoff)
+        self.assertIn("Unused daily interest forgiven", interac.notes or "")
+
+    def test_heal_recorded_payment_schedules_aligns_scheduled_to_balance(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        self._add_payment("147.18", days=14)
+        last = self._add_payment("147.18", days=28)
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("50.00"),
+            type="etransfer",
+            status="completed",
+            scheduled_date=timezone.localdate(),
+            processed_at=timezone.now(),
+        )
+        self.loan.balance = Decimal("244.36")
+        self.loan.save(update_fields=["balance", "updated_at"])
+
+        out = StringIO()
+        call_command("heal_recorded_payment_schedules", "--apply", stdout=out)
+        last.refresh_from_db()
+        self.assertEqual(last.amount, Decimal("97.18"))
+        self.assertEqual(
+            sum(
+                (p.amount for p in self.loan.payments.filter(status="scheduled")),
+                Decimal("0.00"),
+            ),
+            self.loan.balance,
+        )
+        self.assertIn("Updated 1", out.getvalue())
 
 
 @override_settings(ZUMRAILS_DRY_RUN=True)

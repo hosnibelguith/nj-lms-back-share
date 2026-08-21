@@ -24,9 +24,9 @@ def _payment_balance_after(obj, context):
     """
     Remaining loan total after this schedule row in display order.
 
-    Failed collection rows are history only and do not reduce the balance.
-    Added recovery and fee rows after the original schedule are collectible,
-    so they reduce the displayed balance in order.
+    Failed/NSF collection rows are history only and do not reduce the balance.
+    Completed payments (including Interac/manual) and remaining open rows
+    reduce the displayed running balance in order.
     """
     from .services import LoanService
 
@@ -40,11 +40,23 @@ def _payment_balance_after(obj, context):
             .order_by('scheduled_date', 'created_at', 'id')
             .only('id', 'amount', 'status', 'notes', 'scheduled_date', 'created_at')
         )
-        running_balance = money(loan.balance or loan.total_amount or Decimal('0.00'))
+        completed_sum = sum(
+            (
+                money(payment.amount or Decimal('0.00'))
+                for payment in payments
+                if payment.status == 'completed'
+            ),
+            Decimal('0.00'),
+        )
+        running_balance = money(
+            (loan.balance or loan.total_amount or Decimal('0.00')) + completed_sum
+        )
         mapping = {}
         for payment in payments:
             amount = money(payment.amount or Decimal('0.00'))
-            if payment.status not in ('completed', 'failed', 'nsf'):
+            # Failed/NSF rows are history only. Completed (including Interac)
+            # and remaining open rows reduce the displayed running balance.
+            if payment.status not in ('failed', 'nsf'):
                 running_balance = money(running_balance - amount)
             mapping[payment.id] = max(running_balance, Decimal('0.00'))
         cache[loan_key] = mapping
@@ -187,6 +199,7 @@ class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
             'id',
             'amount',
             'original_amount',
+            'type',
             'status',
             'status_display',
             'scheduled_date',
@@ -395,6 +408,8 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
     ai_decision_display = serializers.CharField(source='get_ai_decision_display', read_only=True)
     contract_signed = serializers.BooleanField(read_only=True)
     holiday_warnings = serializers.SerializerMethodField()
+    payoff_today = serializers.SerializerMethodField()
+    unused_daily_interest = serializers.SerializerMethodField()
 
     class Meta:
         model = Loan
@@ -422,6 +437,8 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
             'contract_sent_at',
             'paymentSchedule',
             'holiday_warnings',
+            'payoff_today',
+            'unused_daily_interest',
             'created_at',
             'updated_at',
         ]
@@ -444,6 +461,26 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
 
     def get_holiday_warnings(self, obj):
         return _loan_holiday_warnings(obj)
+
+    def _payoff_today_pair(self, obj):
+        from .services import LoanService
+
+        cache = self.context.setdefault('_payoff_today_by_loan', {})
+        loan_key = str(obj.id)
+        if loan_key not in cache:
+            if obj.status not in ('active', 'defaulted'):
+                cache[loan_key] = (None, None)
+            else:
+                cache[loan_key] = LoanService.payoff_today_amount(obj)
+        return cache[loan_key]
+
+    def get_payoff_today(self, obj):
+        payoff, _unused = self._payoff_today_pair(obj)
+        return payoff
+
+    def get_unused_daily_interest(self, obj):
+        _payoff, unused = self._payoff_today_pair(obj)
+        return unused
 
 
 class LoanSerializer(serializers.ModelSerializer):
@@ -846,6 +883,24 @@ class RecordPaymentSerializer(serializers.Serializer):
     received_date = serializers.DateField(required=False)
     reference = serializers.CharField(required=False, max_length=100, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)
+
+
+class RecordedPaymentUpdateSerializer(serializers.Serializer):
+    """Correct a staff-recorded Interac/manual payment."""
+    amount = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=Decimal('0.01'),
+        required=False,
+    )
+    received_date = serializers.DateField(required=False)
+
+    def validate(self, attrs):
+        if attrs.get('amount') is None and attrs.get('received_date') is None:
+            raise serializers.ValidationError(
+                'Provide amount and/or received_date to update.'
+            )
+        return attrs
 
 
 class CollectionInitiateSerializer(serializers.Serializer):

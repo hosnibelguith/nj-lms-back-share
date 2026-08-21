@@ -58,6 +58,7 @@ from .serializers import (
     LoanFundSerializer,
     LoanFundingConfigurationSerializer,
     RecordPaymentSerializer,
+    RecordedPaymentUpdateSerializer,
     LoanStateEventSerializer,
     LoanReactivateSerializer,
     FundedPaymentSerializer,
@@ -1313,6 +1314,33 @@ class PaymentViewSet(viewsets.ModelViewSet):
             'payment': PaymentSerializer(payment).data,
             'deferral_fee': PaymentSerializer(fee_payment).data,
         })
+
+    @action(detail=True, methods=['post'], url_path='revert-recorded')
+    def revert_recorded(self, request, pk=None):
+        payment = self.get_object()
+        try:
+            LoanService.revert_recorded_payment(payment, user=request.user)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
+        payment.loan.refresh_from_db()
+        return Response(LoanSerializer(payment.loan).data)
+
+    @action(detail=True, methods=['patch'], url_path='update-recorded')
+    def update_recorded(self, request, pk=None):
+        payment = self.get_object()
+        serializer = RecordedPaymentUpdateSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        try:
+            LoanService.update_recorded_payment(
+                payment,
+                amount=serializer.validated_data.get('amount'),
+                received_date=serializer.validated_data.get('received_date'),
+                user=request.user,
+            )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
+        payment.loan.refresh_from_db()
+        return Response(LoanSerializer(payment.loan).data)
 
     @action(detail=True, methods=['post'], url_path='mark-paid')
     def mark_paid(self, request, pk=None):

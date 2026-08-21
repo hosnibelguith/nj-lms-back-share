@@ -259,8 +259,9 @@ class Loan(models.Model):
         # Auto-calculate total_amount if not set
         if not self.total_amount:
             self.total_amount = self.principal + self.fee
-        # Initialize balance to total_amount for new loans
-        if not self.balance:
+        # Initialize balance on create only. A true $0 balance (paid off)
+        # is falsy and must not be reset to total_amount.
+        if self._state.adding and not self.balance and self.status != 'paid_off':
             self.balance = self.total_amount
         super().save(*args, **kwargs)
     
