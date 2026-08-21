@@ -836,9 +836,14 @@ class LoanFundingConfigurationSerializer(serializers.Serializer):
 
 
 class RecordPaymentSerializer(serializers.Serializer):
-    """Record manual payment."""
-    amount = serializers.DecimalField(max_digits=10, decimal_places=2)
+    """Record a received Interac or manual payment."""
+    amount = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=Decimal('0.01'),
+    )
     type = serializers.ChoiceField(choices=['manual', 'etransfer'], default='manual')
+    received_date = serializers.DateField(required=False)
     reference = serializers.CharField(required=False, max_length=100, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)
 

@@ -800,20 +800,108 @@ class LoanService:
     
     @staticmethod
     @transaction.atomic
-    def record_payment(loan: Loan, amount: Decimal, payment_type: str = 'manual') -> Payment:
-        """Record a payment on a loan."""
+    def record_payment(
+        loan: Loan,
+        amount: Decimal,
+        payment_type: str = 'manual',
+        *,
+        received_date=None,
+        reference: str = '',
+        notes: str = '',
+        user=None,
+    ) -> Payment:
+        """Record a received Interac/manual payment and shorten remaining PAD rows."""
+        loan = Loan.objects.select_for_update().get(pk=loan.pk)
+        if loan.status not in ('active', 'defaulted'):
+            raise ValueError('Only collecting loans can record a received payment.')
+        if payment_type not in ('manual', 'etransfer'):
+            raise ValueError('Payment type must be manual or Interac e-transfer.')
+        if loan.payments.filter(status='pending').exists():
+            raise ValueError(
+                'Cannot record a received payment while a collection is processing.'
+            )
+
+        amount = LoanService.money(amount)
+        if amount <= 0:
+            raise ValueError('Amount must be greater than zero.')
+        balance = LoanService.money(loan.balance or Decimal('0.00'))
+        if amount > balance:
+            raise ValueError(
+                f'Amount cannot exceed the remaining balance of ${balance}.'
+            )
+
+        received_date = received_date or timezone.localdate()
         payment = Payment.objects.create(
             loan=loan,
             amount=amount,
             type=payment_type,
             status='completed',
-            scheduled_date=timezone.now().date(),
-            processed_at=timezone.now()
+            scheduled_date=received_date,
+            original_date=received_date,
+            processed_at=timezone.now(),
+            reference=reference or '',
+            notes=notes or '',
+            created_by=user if getattr(user, 'is_authenticated', False) else None,
         )
-        
-        # Apply payment to loan balance
-        loan.apply_payment(amount)
+        loan.apply_payment(amount, user=user)
+        LoanService._trim_scheduled_payments_to_balance(loan)
+
+        from activity.services import actor_label, log_staff_action
+
+        method_label = 'Interac' if payment_type == 'etransfer' else 'manual'
+        try:
+            customer = Customer.objects.get(pk=loan.customer_id)
+        except Customer.DoesNotExist:
+            customer = None
+        if customer is not None:
+            log_staff_action(
+                customer=customer,
+                loan=loan,
+                user=user,
+                type_value='payment_completed',
+                title='Payment Received',
+                description=(
+                    f'{method_label} payment of ${amount} recorded on {received_date} '
+                    f'by {actor_label(user)}.'
+                ),
+                metadata={
+                    'action': 'record_payment',
+                    'payment_id': str(payment.id),
+                    'amount': str(amount),
+                    'type': payment_type,
+                    'received_date': str(received_date),
+                },
+            )
         return payment
+
+    @staticmethod
+    def _trim_scheduled_payments_to_balance(loan: Loan) -> None:
+        """Drop or shrink future scheduled rows so they match remaining balance."""
+        money = LoanService.money
+        target = money(loan.balance or Decimal('0.00'))
+        scheduled = list(
+            loan.payments.filter(status='scheduled').order_by(
+                '-scheduled_date', '-created_at', '-id'
+            )
+        )
+        current = money(
+            sum((money(row.amount or Decimal('0.00')) for row in scheduled), Decimal('0.00'))
+        )
+        extra = money(current - target)
+        if extra <= 0:
+            return
+
+        for row in scheduled:
+            if extra <= 0:
+                break
+            amount = money(row.amount or Decimal('0.00'))
+            if amount <= extra:
+                extra = money(extra - amount)
+                row.delete()
+                continue
+            row.amount = money(amount - extra)
+            row.save(update_fields=['amount'])
+            extra = Decimal('0.00')
 
     @staticmethod
     @transaction.atomic

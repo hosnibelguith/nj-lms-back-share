@@ -968,28 +968,29 @@ class LoanViewSet(viewsets.ModelViewSet):
     def record_payment(self, request, pk=None):
         loan = self.get_object()
 
-        if loan.status != 'active':
-            return Response({'error': 'Invalid loan state'}, status=400)
+        if loan.status not in ('active', 'defaulted'):
+            return Response(
+                {'error': 'Only collecting loans can record a received payment'},
+                status=400,
+            )
 
         serializer = RecordPaymentSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        payment = Payment.objects.create(
-            loan=loan,
-            amount=serializer.validated_data['amount'],
-            type=serializer.validated_data['type'],
-            scheduled_date=timezone.now().date(),
-            reference=serializer.validated_data.get('reference', ''),
-            notes=serializer.validated_data.get('notes', ''),
-            created_by=request.user
-        )
+        try:
+            LoanService.record_payment(
+                loan,
+                serializer.validated_data['amount'],
+                serializer.validated_data['type'],
+                received_date=serializer.validated_data.get('received_date'),
+                reference=serializer.validated_data.get('reference') or '',
+                notes=serializer.validated_data.get('notes') or '',
+                user=request.user,
+            )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
 
-        payment.status = 'completed'
-        payment.processed_at = timezone.now()
-        payment.save()
-
-        loan.apply_payment(payment.amount, user=request.user)
-
+        loan.refresh_from_db()
         return Response(LoanSerializer(loan).data)
 
     @action(detail=True, methods=['post'])

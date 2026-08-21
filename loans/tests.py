@@ -4105,6 +4105,102 @@ class PaymentScheduleIntegrityTests(APITestCase):
             any(p.scheduled_date == start_a for p in after_second)
         )
 
+    def test_record_interac_payment_reduces_balance_and_shortens_schedule(self):
+        nsf = self._add_payment("147.18", status="nsf")
+        second = self._add_payment("147.18", days=14)
+        last = self._add_payment("147.18", days=28)
+        self.loan.balance = Decimal("294.36")
+        self.loan.save(update_fields=["balance", "updated_at"])
+        received = timezone.localdate() + timedelta(days=7)
+
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/record_payment/",
+            {
+                "amount": "100.00",
+                "type": "etransfer",
+                "received_date": received.isoformat(),
+                "notes": "Interac received",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.loan.refresh_from_db()
+        nsf.refresh_from_db()
+        interac = self.loan.payments.get(type="etransfer", status="completed")
+        scheduled = list(
+            self.loan.payments.filter(status="scheduled").order_by("scheduled_date")
+        )
+        self.assertEqual(interac.amount, Decimal("100.00"))
+        self.assertEqual(interac.scheduled_date, received)
+        self.assertEqual(interac.notes, "Interac received")
+        self.assertEqual(self.loan.balance, Decimal("194.36"))
+        self.assertEqual(nsf.status, "nsf")
+        self.assertEqual(len(scheduled), 2)
+        self.assertEqual(scheduled[0].id, second.id)
+        self.assertEqual(scheduled[0].amount, Decimal("147.18"))
+        self.assertEqual(scheduled[1].id, last.id)
+        self.assertEqual(scheduled[1].amount, Decimal("47.18"))
+        self.assertEqual(
+            sum((p.amount for p in scheduled), Decimal("0.00")),
+            self.loan.balance,
+        )
+        dates = [
+            p.scheduled_date
+            for p in self.loan.payments.exclude(status="cancelled").order_by(
+                "scheduled_date", "created_at", "id"
+            )
+        ]
+        self.assertEqual(dates, [nsf.scheduled_date, received, second.scheduled_date, last.scheduled_date])
+
+    def test_record_payment_rejects_overpay_pending_and_stopped_loans(self):
+        self._add_payment("147.18")
+        self.loan.balance = Decimal("147.18")
+        self.loan.save(update_fields=["balance", "updated_at"])
+
+        overpay = self.client.post(
+            f"/api/loans/{self.loan.id}/record_payment/",
+            {"amount": "200.00", "type": "etransfer"},
+            format="json",
+        )
+        self.assertEqual(overpay.status_code, 400, overpay.data)
+
+        pending = self._add_payment("50.00", days=14, status="pending")
+        self.loan.balance = Decimal("197.18")
+        self.loan.save(update_fields=["balance", "updated_at"])
+        in_flight = self.client.post(
+            f"/api/loans/{self.loan.id}/record_payment/",
+            {"amount": "10.00", "type": "etransfer"},
+            format="json",
+        )
+        self.assertEqual(in_flight.status_code, 400, in_flight.data)
+        pending.delete()
+
+        self.loan.status = "stopped"
+        self.loan.is_active = False
+        self.loan.balance = Decimal("147.18")
+        self.loan.save(update_fields=["status", "is_active", "balance", "updated_at"])
+        stopped = self.client.post(
+            f"/api/loans/{self.loan.id}/record_payment/",
+            {"amount": "10.00", "type": "etransfer"},
+            format="json",
+        )
+        self.assertEqual(stopped.status_code, 400, stopped.data)
+
+        self.loan.status = "defaulted"
+        self.loan.save(update_fields=["status", "updated_at"])
+        allowed = self.client.post(
+            f"/api/loans/{self.loan.id}/record_payment/",
+            {"amount": "47.18", "type": "etransfer", "notes": "Interac received"},
+            format="json",
+        )
+        self.assertEqual(allowed.status_code, 200, allowed.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.balance, Decimal("100.00"))
+        self.assertTrue(
+            self.loan.payments.filter(type="etransfer", status="completed").exists()
+        )
+
 
 @override_settings(ZUMRAILS_DRY_RUN=True)
 class HealScheduleKeepingPendingTests(APITestCase):
