@@ -79,13 +79,15 @@ class StaffReportCenterTests(APITestCase):
             loan=self.loan,
             amount=Decimal("176.61"),
             scheduled_date=date(2026, 8, 10),
-            status="scheduled",
+            status="completed",
+            type="manual",
         )
         Payment.objects.create(
             loan=self.loan,
             amount=Decimal("50.00"),
             scheduled_date=date(2026, 7, 1),
-            status="scheduled",
+            status="completed",
+            type="manual",
         )
 
         response = self.client.get(
@@ -101,6 +103,180 @@ class StaffReportCenterTests(APITestCase):
         self.assertEqual(response.data["count"], 1)
         self.assertEqual(response.data["results"][0]["payment_id"], str(matching.id))
         self.assertEqual(Decimal(response.data["results"][0]["amount"]), Decimal("176.61"))
+
+    def test_payment_report_only_includes_completed_payments_on_active_loans(self):
+        collected = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=date(2026, 8, 10),
+            status="completed",
+            type="manual",
+        )
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("50.00"),
+            scheduled_date=date(2026, 8, 11),
+            status="scheduled",
+            type="scheduled",
+        )
+        declined_customer = Customer.objects.create(
+            first_name="Dana",
+            last_name="West",
+            email="dana.west@example.com",
+            phone="4165553333",
+            province="ON",
+            status="active",
+            source="organic",
+        )
+        declined_loan = Loan.objects.create(
+            customer=declined_customer,
+            principal=Decimal("400.00"),
+            fee=Decimal("80.00"),
+            total_amount=Decimal("480.00"),
+            balance=Decimal("480.00"),
+            status="human_declined",
+            is_active=False,
+        )
+        Payment.objects.create(
+            loan=declined_loan,
+            amount=Decimal("25.00"),
+            scheduled_date=date(2026, 8, 12),
+            status="completed",
+            type="manual",
+        )
+
+        response = self.client.get("/api/loans/reports/", {"report_type": "payment"})
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["payment_id"], str(collected.id))
+        self.assertEqual(response.data["results"][0]["loan_status"], "active")
+        self.assertEqual(response.data["summary"]["row_count"], 1)
+        self.assertEqual(response.data["summary"]["amount_total"], "100.00")
+
+    def test_payment_report_status_filter_includes_completed_collections_payments(self):
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("10.00"),
+            scheduled_date=date(2026, 8, 10),
+            status="completed",
+            type="manual",
+        )
+        defaulted_customer = Customer.objects.create(
+            first_name="Casey",
+            last_name="Lane",
+            email="casey.lane@example.com",
+            phone="4165554444",
+            province="ON",
+            status="active",
+            source="organic",
+        )
+        defaulted_loan = Loan.objects.create(
+            customer=defaulted_customer,
+            principal=Decimal("700.00"),
+            fee=Decimal("100.00"),
+            total_amount=Decimal("800.00"),
+            balance=Decimal("400.00"),
+            status="defaulted",
+            is_active=True,
+        )
+        collected = Payment.objects.create(
+            loan=defaulted_loan,
+            amount=Decimal("40.00"),
+            scheduled_date=date(2026, 8, 11),
+            status="completed",
+            type="manual",
+        )
+
+        active_only = self.client.get("/api/loans/reports/", {"report_type": "payment"})
+        collections = self.client.get(
+            "/api/loans/reports/",
+            {"report_type": "payment", "status": "defaulted"},
+        )
+
+        self.assertEqual(active_only.data["count"], 1)
+        self.assertEqual(collections.data["count"], 1)
+        self.assertEqual(collections.data["results"][0]["payment_id"], str(collected.id))
+
+    def test_loan_report_filters_align_with_loans_page(self):
+        arrive_customer = Customer.objects.create(
+            first_name="Avery",
+            last_name="Stone",
+            email="avery.stone@example.com",
+            phone="4165555555",
+            province="BC",
+            status="active",
+            source="arrive",
+            arrive_application_id="ARR-100",
+            banking_verified=True,
+        )
+        arrive_loan = Loan.objects.create(
+            customer=arrive_customer,
+            principal=Decimal("300.00"),
+            fee=Decimal("60.00"),
+            total_amount=Decimal("360.00"),
+            balance=Decimal("360.00"),
+            status="expired",
+            ai_decision="declined",
+            is_active=False,
+        )
+
+        province = self.client.get(
+            "/api/loans/reports/",
+            {"report_type": "loan", "province": "ON"},
+        )
+        status = self.client.get(
+            "/api/loans/reports/",
+            {"report_type": "loan", "status": "active"},
+        )
+        source = self.client.get(
+            "/api/loans/reports/",
+            {"report_type": "loan", "source": "arrive"},
+        )
+        ai = self.client.get(
+            "/api/loans/reports/",
+            {"report_type": "loan", "ai_decision": "declined"},
+        )
+        ibv = self.client.get(
+            "/api/loans/reports/",
+            {"report_type": "loan", "ibv_status": "completed"},
+        )
+
+        self.assertEqual(province.data["count"], 1)
+        self.assertEqual(province.data["results"][0]["loan_id"], str(self.loan.id))
+        self.assertEqual(status.data["count"], 1)
+        self.assertEqual(source.data["count"], 1)
+        self.assertEqual(source.data["results"][0]["loan_id"], str(arrive_loan.id))
+        self.assertEqual(ai.data["count"], 1)
+        self.assertEqual(ibv.data["count"], 1)
+        self.assertEqual(ibv.data["results"][0]["loan_id"], str(arrive_loan.id))
+
+    def test_loan_report_summary_uses_full_queryset_not_truncated_rows(self):
+        from unittest.mock import patch
+
+        Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("200.00"),
+            fee=Decimal("40.00"),
+            total_amount=Decimal("240.00"),
+            balance=Decimal("240.00"),
+            status="active",
+            is_active=True,
+        )
+
+        with patch("loans.reports.MAX_ROWS", 1):
+            response = self.client.get("/api/loans/reports/", {"report_type": "loan"})
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["count"], 2)
+        self.assertTrue(response.data["truncated"])
+        self.assertEqual(len(response.data["results"]), 1)
+        self.assertEqual(response.data["summary"]["row_count"], 2)
+        self.assertEqual(response.data["summary"]["amount_total"], "700.00")
+        status_counts = {
+            row["value"]: row["count"] for row in response.data["summary"]["category_counts"]
+        }
+        self.assertEqual(status_counts["active"], 2)
 
     def test_fees_report_includes_deferral_and_nsf_fee_rows_only(self):
         deferral = Payment.objects.create(

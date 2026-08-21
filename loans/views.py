@@ -1279,12 +1279,20 @@ class LoanViewSet(viewsets.ModelViewSet):
             else None
         )
         source = (request.query_params.get('source') or '').strip().lower()
+        province = (request.query_params.get('province') or '').strip()
+        status = (request.query_params.get('status') or '').strip()
+        ai_decision = (request.query_params.get('ai_decision') or '').strip()
+        ibv_status = (request.query_params.get('ibv_status') or '').strip()
         return Response(
             run_report(
                 report_type,
                 date_from=date_from,
                 date_to=date_to,
                 source=source,
+                province=province or None,
+                status=status or None,
+                ai_decision=ai_decision or None,
+                ibv_status=ibv_status or None,
             )
         )
 

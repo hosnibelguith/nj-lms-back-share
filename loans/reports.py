@@ -1,7 +1,7 @@
 """Staff Report Center — only report types this LMS actually stores."""
 from decimal import Decimal
 
-from django.db.models import Count, Min, Q, Sum
+from django.db.models import Count, Exists, Min, OuterRef, Q, Sum
 
 from accounts.models import Customer, User
 from activity.models import ActivityHistory, Comment
@@ -9,11 +9,13 @@ from banking.models import BankConnection
 from communications.models import Communication
 from contracts.models import Contract
 
-from .models import Loan, Payment
+from .models import FundedPayment, Loan, Payment
 from .services import LoanService
 
 MAX_ROWS = 2000
 ALERT_ACTIVITY_TYPES = ('payment_failed', 'loan_defaulted', 'customer_blocked')
+REAL_PAYMENT_STATUSES = ('completed',)
+ACTIVE_LOAN_STATUS = 'active'
 
 
 def _money(value):
@@ -64,6 +66,134 @@ def _apply_source(qs, source, lookup='customer__source'):
     return qs
 
 
+def _filter_loan_list_dates(qs, date_from, date_to, *, prefix=''):
+    """Match the loans page: funded date when present, otherwise created date."""
+    funded = f'{prefix}funded_at' if prefix else 'funded_at'
+    created = f'{prefix}created_at' if prefix else 'created_at'
+    if date_from:
+        qs = qs.filter(
+            Q(**{f'{funded}__date__gte': date_from})
+            | Q(**{f'{funded}__isnull': True, f'{created}__date__gte': date_from})
+        )
+    if date_to:
+        qs = qs.filter(
+            Q(**{f'{funded}__date__lte': date_to})
+            | Q(**{f'{funded}__isnull': True, f'{created}__date__lte': date_to})
+        )
+    return qs
+
+
+def _funding_loan_id_ref(prefix=''):
+    return OuterRef('loan_id') if prefix else OuterRef('pk')
+
+
+def _failed_funding_exists(prefix=''):
+    return FundedPayment.objects.filter(
+        loan_id=_funding_loan_id_ref(prefix),
+        status__in=('failed', 'returned', 'cancelled'),
+    )
+
+
+def _active_funding_exists(prefix=''):
+    return FundedPayment.objects.filter(
+        loan_id=_funding_loan_id_ref(prefix),
+        status__in=('processing', 'completed'),
+    )
+
+
+def _apply_loan_status_filter(qs, status, *, prefix=''):
+    status = (status or '').strip()
+    if not status or status == 'all':
+        return qs
+    status_field = f'{prefix}status' if prefix else 'status'
+    customer = f'{prefix}customer' if prefix else 'customer'
+    signed_at = f'{prefix}contract_signed_at' if prefix else 'contract_signed_at'
+    if status == 'approved_pending_signature':
+        return qs.filter(**{status_field: 'pending_funding'}).filter(
+            Q(**{f'{signed_at}__isnull': True}),
+            Q(**{f'{customer}__contract_completed': False}),
+        )
+    if status == 'pending_funding':
+        qs = qs.filter(**{status_field: 'pending_funding'}).filter(
+            Q(**{f'{signed_at}__isnull': False})
+            | Q(**{f'{customer}__contract_completed': True})
+        )
+        return qs.exclude(Exists(_active_funding_exists(prefix)))
+    if status == 'funding_failed':
+        qs = qs.filter(**{status_field: 'pending_funding'}).filter(
+            Exists(_failed_funding_exists(prefix))
+        )
+        return qs.exclude(Exists(_active_funding_exists(prefix)))
+    return qs.filter(**{status_field: status})
+
+
+def _apply_loan_staff_filters(qs, extra, *, prefix=''):
+    """Province / status / AI / IBV / source — same meaning as the loans page."""
+    extra = extra or {}
+    customer = f'{prefix}customer' if prefix else 'customer'
+    status_field = f'{prefix}status' if prefix else 'status'
+    ai_field = f'{prefix}ai_decision' if prefix else 'ai_decision'
+
+    source = (extra.get('source') or '').strip().lower()
+    if source == 'arrive':
+        qs = qs.filter(
+            Q(**{f'{customer}__source': 'arrive'})
+            | (
+                Q(**{f'{customer}__arrive_application_id__isnull': False})
+                & ~Q(**{f'{customer}__arrive_application_id': ''})
+            )
+        )
+    elif source in ('organic', 'landing', 'kyc'):
+        qs = qs.exclude(**{f'{customer}__source': 'arrive'}).filter(
+            Q(**{f'{customer}__arrive_application_id__isnull': True})
+            | Q(**{f'{customer}__arrive_application_id': ''})
+        )
+
+    province = (extra.get('province') or '').strip()
+    if province:
+        qs = qs.filter(**{f'{customer}__province': province})
+
+    qs = _apply_loan_status_filter(qs, extra.get('status'), prefix=prefix)
+
+    ai_decision = (extra.get('ai_decision') or '').strip()
+    if ai_decision:
+        qs = qs.filter(**{ai_field: ai_decision})
+
+    ibv_status = (extra.get('ibv_status') or '').strip()
+    if ibv_status == 'pending':
+        qs = qs.filter(
+            Q(**{status_field: 'ibv_pending'})
+            | Q(**{f'{customer}__banking_verified': False})
+        )
+    elif ibv_status == 'completed':
+        qs = qs.filter(**{f'{customer}__banking_verified': True})
+    return qs
+
+
+def _queryset_summary(qs, *, category_field, amount_field=None, amount_label=None):
+    count = qs.count()
+    amount_total = None
+    if amount_field:
+        amount_total = format(
+            Decimal(str(qs.aggregate(total=Sum(amount_field))['total'] or Decimal('0.00'))),
+            '.2f',
+        )
+    category_counts = [
+        {'value': row[category_field], 'count': row['count']}
+        for row in qs.values(category_field)
+        .annotate(count=Count('id'))
+        .order_by('-count', category_field)
+    ]
+    return {
+        'row_count': count,
+        'amount_key': amount_field,
+        'amount_label': amount_label,
+        'amount_total': amount_total,
+        'category_key': category_field,
+        'category_counts': category_counts,
+    }
+
+
 def _slice_rows(qs, row_fn):
     count = qs.count()
     truncated = count > MAX_ROWS
@@ -75,12 +205,29 @@ def _cols(*pairs):
     return [{'key': key, 'label': label} for key, label in pairs]
 
 
-def build_customer_report(date_from, date_to, source):
-    qs = _apply_source(
-        _filter_datetime(Customer.objects.all(), 'created_at', date_from, date_to),
-        source,
-        lookup='source',
-    ).order_by('-created_at', 'id')
+def build_customer_report(date_from, date_to, source, extra=None):
+    extra = dict(extra or {})
+    extra.setdefault('source', source)
+    qs = _filter_datetime(Customer.objects.all(), 'created_at', date_from, date_to)
+    source_val = (extra.get('source') or '').strip().lower()
+    if source_val == 'arrive':
+        qs = qs.filter(
+            Q(source='arrive')
+            | (Q(arrive_application_id__isnull=False) & ~Q(arrive_application_id=''))
+        )
+    elif source_val in ('organic', 'landing', 'kyc'):
+        qs = qs.exclude(source='arrive').filter(
+            Q(arrive_application_id__isnull=True) | Q(arrive_application_id='')
+        )
+    province = (extra.get('province') or '').strip()
+    if province:
+        qs = qs.filter(province=province)
+    ibv_status = (extra.get('ibv_status') or '').strip()
+    if ibv_status == 'pending':
+        qs = qs.filter(banking_verified=False)
+    elif ibv_status == 'completed':
+        qs = qs.filter(banking_verified=True)
+    qs = qs.order_by('-created_at', 'id')
 
     def row(customer):
         return {
@@ -109,16 +256,23 @@ def build_customer_report(date_from, date_to, source):
     ), count, truncated, rows
 
 
-def build_loan_report(date_from, date_to, source):
-    qs = _apply_source(
-        _filter_datetime(
+def build_loan_report(date_from, date_to, source, extra=None):
+    extra = dict(extra or {})
+    extra.setdefault('source', source)
+    qs = _apply_loan_staff_filters(
+        _filter_loan_list_dates(
             Loan.objects.select_related('customer'),
-            'created_at',
             date_from,
             date_to,
         ),
-        source,
+        extra,
     ).order_by('-created_at', 'id')
+    summary = _queryset_summary(
+        qs,
+        category_field='status',
+        amount_field='principal',
+        amount_label='Principal',
+    )
 
     def row(loan):
         return {
@@ -148,26 +302,39 @@ def build_loan_report(date_from, date_to, source):
         ('balance', 'Balance'),
         ('funded_at', 'Funded'),
         ('created_at', 'Created'),
-    ), count, truncated, rows
+    ), count, truncated, rows, summary
 
 
-def build_payment_report(date_from, date_to, source):
-    qs = _apply_source(
+def build_payment_report(date_from, date_to, source, extra=None):
+    extra = dict(extra or {})
+    extra.setdefault('source', source)
+    if not (extra.get('status') or '').strip() or extra.get('status') == 'all':
+        extra['status'] = ACTIVE_LOAN_STATUS
+    qs = _apply_loan_staff_filters(
         _filter_date(
-            Payment.objects.select_related('loan__customer'),
+            Payment.objects.select_related('loan__customer').filter(
+                status__in=REAL_PAYMENT_STATUSES,
+            ),
             'scheduled_date',
             date_from,
             date_to,
         ),
-        source,
-        lookup='loan__customer__source',
+        extra,
+        prefix='loan__',
     ).order_by('-scheduled_date', '-created_at', 'id')
+    summary = _queryset_summary(
+        qs,
+        category_field='type',
+        amount_field='amount',
+        amount_label='Amount',
+    )
 
     def row(payment):
         return {
             'payment_id': str(payment.id),
             'loan_id': str(payment.loan_id),
             'customer_name': _customer_name(payment.loan.customer),
+            'loan_status': payment.loan.status,
             'amount': _money(payment.amount),
             'type': payment.type,
             'status': payment.status,
@@ -182,6 +349,7 @@ def build_payment_report(date_from, date_to, source):
         ('payment_id', 'Payment ID'),
         ('loan_id', 'Loan ID'),
         ('customer_name', 'Customer'),
+        ('loan_status', 'Loan status'),
         ('amount', 'Amount'),
         ('type', 'Type'),
         ('status', 'Status'),
@@ -189,12 +357,14 @@ def build_payment_report(date_from, date_to, source):
         ('original_date', 'Original date'),
         ('processed_at', 'Processed'),
         ('notes', 'Notes'),
-    ), count, truncated, rows
+    ), count, truncated, rows, summary
 
 
-def build_payment_plan_report(date_from, date_to, source):
-    qs = _apply_source(
-        _filter_datetime(
+def build_payment_plan_report(date_from, date_to, source, extra=None):
+    extra = dict(extra or {})
+    extra.setdefault('source', source)
+    qs = _apply_loan_staff_filters(
+        _filter_loan_list_dates(
             Loan.objects.select_related('customer').annotate(
                 payment_count=Count('payments'),
                 next_due=Min(
@@ -206,11 +376,10 @@ def build_payment_plan_report(date_from, date_to, source):
                     filter=Q(payments__status='scheduled'),
                 ),
             ),
-            'created_at',
             date_from,
             date_to,
         ),
-        source,
+        extra,
     ).order_by('-created_at', 'id')
 
     def row(loan):
@@ -238,7 +407,7 @@ def build_payment_plan_report(date_from, date_to, source):
     ), count, truncated, rows
 
 
-def build_contract_report(date_from, date_to, source):
+def build_contract_report(date_from, date_to, source, extra=None):
     qs = _apply_source(
         _filter_datetime(
             Contract.objects.select_related('customer', 'loan'),
@@ -272,7 +441,7 @@ def build_contract_report(date_from, date_to, source):
     ), count, truncated, rows
 
 
-def build_communication_report(date_from, date_to, source):
+def build_communication_report(date_from, date_to, source, extra=None):
     qs = _apply_source(
         _filter_datetime(
             Communication.objects.select_related('customer', 'loan'),
@@ -310,7 +479,7 @@ def build_communication_report(date_from, date_to, source):
     ), count, truncated, rows
 
 
-def build_notification_report(date_from, date_to, source):
+def build_notification_report(date_from, date_to, source, extra=None):
     qs = _apply_source(
         _filter_datetime(
             Communication.objects.select_related('customer').filter(
@@ -346,7 +515,7 @@ def build_notification_report(date_from, date_to, source):
     ), count, truncated, rows
 
 
-def build_automation_report(date_from, date_to, source):
+def build_automation_report(date_from, date_to, source, extra=None):
     qs = _apply_source(
         _filter_datetime(
             Communication.objects.select_related('customer').exclude(
@@ -382,7 +551,7 @@ def build_automation_report(date_from, date_to, source):
     ), count, truncated, rows
 
 
-def build_bank_verification_report(date_from, date_to, source):
+def build_bank_verification_report(date_from, date_to, source, extra=None):
     qs = _apply_source(
         _filter_datetime(
             BankConnection.objects.select_related('customer'),
@@ -418,8 +587,10 @@ def build_bank_verification_report(date_from, date_to, source):
     ), count, truncated, rows
 
 
-def build_fees_report(date_from, date_to, source):
-    qs = _apply_source(
+def build_fees_report(date_from, date_to, source, extra=None):
+    extra = dict(extra or {})
+    extra.setdefault('source', source)
+    qs = _apply_loan_staff_filters(
         _filter_date(
             Payment.objects.select_related('loan__customer').filter(
                 Q(notes__startswith='Deferral fee')
@@ -429,8 +600,8 @@ def build_fees_report(date_from, date_to, source):
             date_from,
             date_to,
         ),
-        source,
-        lookup='loan__customer__source',
+        extra,
+        prefix='loan__',
     ).order_by('-scheduled_date', '-created_at', 'id')
 
     rows = []
@@ -468,15 +639,16 @@ def build_fees_report(date_from, date_to, source):
     ), len(rows) if not truncated else MAX_ROWS, truncated, rows
 
 
-def build_interest_report(date_from, date_to, source):
-    qs = _apply_source(
-        _filter_datetime(
+def build_interest_report(date_from, date_to, source, extra=None):
+    extra = dict(extra or {})
+    extra.setdefault('source', source)
+    qs = _apply_loan_staff_filters(
+        _filter_loan_list_dates(
             Loan.objects.select_related('customer', 'formula').prefetch_related('payments'),
-            'created_at',
             date_from,
             date_to,
         ),
-        source,
+        extra,
     ).order_by('-created_at', 'id')
 
     def row(loan):
@@ -518,7 +690,7 @@ def build_interest_report(date_from, date_to, source):
     ), count, truncated, rows
 
 
-def build_leads_report(date_from, date_to, source):
+def build_leads_report(date_from, date_to, source, extra=None):
     qs = _apply_source(
         _filter_datetime(Customer.objects.all(), 'created_at', date_from, date_to),
         source,
@@ -551,7 +723,7 @@ def build_leads_report(date_from, date_to, source):
     ), count, truncated, rows
 
 
-def build_notes_report(date_from, date_to, source):
+def build_notes_report(date_from, date_to, source, extra=None):
     qs = _apply_source(
         _filter_datetime(
             Comment.objects.select_related('customer', 'loan', 'created_by'),
@@ -588,7 +760,7 @@ def build_notes_report(date_from, date_to, source):
     ), count, truncated, rows
 
 
-def build_opt_in_report(date_from, date_to, source):
+def build_opt_in_report(date_from, date_to, source, extra=None):
     qs = _apply_source(
         _filter_datetime(Customer.objects.all(), 'created_at', date_from, date_to),
         source,
@@ -620,7 +792,7 @@ def build_opt_in_report(date_from, date_to, source):
     ), count, truncated, rows
 
 
-def build_customer_alert_report(date_from, date_to, source):
+def build_customer_alert_report(date_from, date_to, source, extra=None):
     qs = _apply_source(
         _filter_datetime(
             ActivityHistory.objects.select_related('customer', 'loan').filter(
@@ -656,7 +828,7 @@ def build_customer_alert_report(date_from, date_to, source):
     ), count, truncated, rows
 
 
-def build_employee_report(date_from, date_to, source):
+def build_employee_report(date_from, date_to, source, extra=None):
     del source
     qs = _filter_datetime(
         User.objects.filter(user_type='staff'),
@@ -774,7 +946,7 @@ REPORT_SPECS = (
     {
         'id': 'payment',
         'label': 'Payment Report',
-        'description': 'Scheduled and collected payments.',
+        'description': 'Completed payments on active loans.',
         'builder': build_payment_report,
     },
     {
@@ -800,10 +972,32 @@ def list_report_types():
     ]
 
 
-def run_report(report_type, *, date_from=None, date_to=None, source=None):
+def run_report(
+    report_type,
+    *,
+    date_from=None,
+    date_to=None,
+    source=None,
+    province=None,
+    status=None,
+    ai_decision=None,
+    ibv_status=None,
+):
     spec = REPORT_BY_ID[report_type]
-    columns, count, truncated, rows = spec['builder'](date_from, date_to, source)
-    return {
+    extra = {
+        'source': source,
+        'province': province,
+        'status': status,
+        'ai_decision': ai_decision,
+        'ibv_status': ibv_status,
+    }
+    result = spec['builder'](date_from, date_to, source, extra)
+    summary = None
+    if len(result) == 5:
+        columns, count, truncated, rows, summary = result
+    else:
+        columns, count, truncated, rows = result
+    payload = {
         'report_type': spec['id'],
         'label': spec['label'],
         'columns': columns,
@@ -811,3 +1005,6 @@ def run_report(report_type, *, date_from=None, date_to=None, source=None):
         'truncated': truncated,
         'results': rows,
     }
+    if summary:
+        payload['summary'] = summary
+    return payload
