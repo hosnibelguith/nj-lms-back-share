@@ -160,6 +160,11 @@ class StaffReportCenterTests(APITestCase):
         self.assertEqual(response.data["count"], 2)
         self.assertEqual(response.data["summary"]["row_count"], 2)
         self.assertEqual(response.data["summary"]["amount_total"], "150.00")
+        type_amounts = {
+            row["value"]: row["amount"] for row in response.data["summary"]["category_counts"]
+        }
+        self.assertEqual(type_amounts["manual"], "100.00")
+        self.assertEqual(type_amounts["scheduled"], "50.00")
         self.assertTrue(all(row["loan_status"] == "active" for row in response.data["results"]))
 
     def test_payment_report_status_filter_includes_completed_collections_payments(self):
@@ -281,10 +286,20 @@ class StaffReportCenterTests(APITestCase):
         self.assertEqual(len(response.data["results"]), 1)
         self.assertEqual(response.data["summary"]["row_count"], 2)
         self.assertEqual(response.data["summary"]["amount_total"], "700.00")
+        money_parts = {
+            row["label"]: row["amount"] for row in response.data["summary"]["money_parts"]
+        }
+        self.assertEqual(money_parts["Principal"], "700.00")
+        self.assertEqual(money_parts["Fee"], "140.00")
+        self.assertEqual(money_parts["Total"], "840.00")
         status_counts = {
             row["value"]: row["count"] for row in response.data["summary"]["category_counts"]
         }
         self.assertEqual(status_counts["active"], 2)
+        status_amounts = {
+            row["value"]: row["amount"] for row in response.data["summary"]["category_counts"]
+        }
+        self.assertEqual(status_amounts["active"], "700.00")
 
     def test_fees_report_includes_deferral_and_nsf_fee_rows_only(self):
         deferral = Payment.objects.create(

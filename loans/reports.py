@@ -170,25 +170,59 @@ def _apply_loan_staff_filters(qs, extra, *, prefix=''):
     return qs
 
 
-def _queryset_summary(qs, *, category_field, amount_field=None, amount_label=None):
+def _format_money_total(value):
+    return format(Decimal(str(value or Decimal('0.00'))), '.2f')
+
+
+def _queryset_summary(
+    qs,
+    *,
+    category_field,
+    amount_field=None,
+    amount_label=None,
+    extra_amount_fields=None,
+):
     count = qs.count()
     amount_total = None
     if amount_field:
-        amount_total = format(
-            Decimal(str(qs.aggregate(total=Sum(amount_field))['total'] or Decimal('0.00'))),
-            '.2f',
+        amount_total = _format_money_total(
+            qs.aggregate(total=Sum(amount_field))['total']
         )
-    category_counts = [
-        {'value': row[category_field], 'count': row['count']}
-        for row in qs.values(category_field)
-        .annotate(count=Count('id'))
-        .order_by('-count', category_field)
-    ]
+
+    annotations = {'count': Count('id')}
+    if amount_field:
+        annotations['amount'] = Sum(amount_field)
+    category_counts = []
+    for row in qs.values(category_field).annotate(**annotations).order_by(
+        '-count', category_field
+    ):
+        item = {'value': row[category_field], 'count': row['count']}
+        if amount_field:
+            item['amount'] = _format_money_total(row['amount'])
+        category_counts.append(item)
+
+    money_parts = []
+    extra_amount_fields = tuple(extra_amount_fields or ())
+    if extra_amount_fields:
+        totals = qs.aggregate(
+            **{
+                f'total_{field}': Sum(field)
+                for field, _label in extra_amount_fields
+            }
+        )
+        for field, label in extra_amount_fields:
+            money_parts.append({
+                'key': field,
+                'label': label,
+                'amount': _format_money_total(totals.get(f'total_{field}')),
+            })
+
     return {
         'row_count': count,
         'amount_key': amount_field,
         'amount_label': amount_label,
         'amount_total': amount_total,
+        'money_parts': money_parts,
         'category_key': category_field,
         'category_counts': category_counts,
     }
@@ -271,7 +305,12 @@ def build_loan_report(date_from, date_to, source, extra=None):
         qs,
         category_field='status',
         amount_field='principal',
-        amount_label='Principal',
+        amount_label='Amounts',
+        extra_amount_fields=(
+            ('principal', 'Principal'),
+            ('fee', 'Fee'),
+            ('total_amount', 'Total'),
+        ),
     )
 
     def row(loan):
