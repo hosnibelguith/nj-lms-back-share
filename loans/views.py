@@ -708,7 +708,7 @@ class LoanViewSet(viewsets.ModelViewSet):
         # Align loan destinations with the primary bank the staff UI already shows
         # so Fund Customer is not stuck on "destination/collections required".
         try:
-            loan = FundingConfigurationService.ensure_defaults(loan, user=request.user)
+            loan = FundingConfigurationService.ensure_defaults(loan)
         except ValueError:
             pass
 

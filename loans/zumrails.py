@@ -1894,6 +1894,9 @@ class FundingConfigurationService:
         The staff UI pre-fills the primary account locally. Without saving those
         choices onto the loan, readiness still reports "Funding destination /
         Collections account required" and Fund Customer stays disabled.
+
+        This is page-load hydration, not a staff decision. Activity History
+        attributes it to System even if a viewer user is passed in.
         """
         if loan.status not in FundingConfigurationService.CONFIGURABLE_STATUSES:
             return loan
@@ -1928,7 +1931,8 @@ class FundingConfigurationService:
         elif needs_collections:
             kwargs["collections_account_id"] = account.id
 
-        return FundingConfigurationService.configure(loan, user=user, **kwargs)
+        # Page-load hydration is not a staff choice — always attribute to System.
+        return FundingConfigurationService.configure(loan, user=None, **kwargs)
 
     @staticmethod
     @transaction.atomic
@@ -2011,10 +2015,18 @@ class FundingConfigurationService:
         loan.save(update_fields=update_fields)
 
         actor = actor_label(user)
+        automatic = user is None
+        actor_phrase = (
+            "by System (applied automatically from the customer's verified bank)"
+            if automatic
+            else f"by {actor}"
+        )
         if changes:
-            description = f"{'; '.join(changes)} by {actor}."
+            description = f"{'; '.join(changes)} {actor_phrase}."
         else:
-            description = f"Funding destination and collections account selections were saved by {actor}."
+            description = (
+                f"Funding destination and collections account selections were saved {actor_phrase}."
+            )
 
         log_staff_action(
             customer=loan.customer,
@@ -2023,7 +2035,12 @@ class FundingConfigurationService:
             type_value="system",
             title="Funding Configured",
             description=description,
-            metadata={"action": "funding_configured", "changes": changes},
+            metadata={
+                "action": "funding_configured",
+                "changes": changes,
+                "source": "auto_default" if automatic else "staff",
+                "actor": "System" if automatic else actor,
+            },
         )
         return loan
 
