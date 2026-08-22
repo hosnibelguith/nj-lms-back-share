@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -388,3 +388,133 @@ class BankHolidayCalendarApiTests(APITestCase):
             format="json",
         )
         self.assertEqual(response.status_code, 400)
+
+
+class PaymentDateActivityHistoryTests(APITestCase):
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            email="activity-agent@example.com",
+            password="password123",
+            full_name="Activity Agent",
+            user_type="staff",
+            is_staff=True,
+            permission_level=4,
+        )
+        self.customer = Customer.objects.create(
+            first_name="Activity",
+            last_name="Customer",
+            email="activity-customer@example.com",
+            phone="4165550101",
+            province="ON",
+            status="active",
+        )
+        self.loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("100.00"),
+            total_amount=Decimal("600.00"),
+            balance=Decimal("600.00"),
+            status="active",
+            is_active=True,
+        )
+        self.client.force_authenticate(user=self.staff)
+
+    def test_generate_schedule_logs_weekend_date_adjustments(self):
+        from activity.models import ActivityHistory
+
+        LoanService.generate_payment_schedule(
+            self.loan,
+            num_payments=2,
+            payment_amount=Decimal("300.00"),
+            start_date=date(2026, 5, 16),
+            frequency_days=7,
+            schedule_total=Decimal("600.00"),
+        )
+
+        logs = list(
+            ActivityHistory.objects.filter(
+                loan=self.loan,
+                title="Date Adjusted",
+            ).order_by("created_at")
+        )
+        self.assertEqual(len(logs), 2)
+        self.assertEqual(logs[0].created_by, "system")
+        self.assertIn("2026-05-16", logs[0].description)
+        self.assertIn("2026-05-15", logs[0].description)
+        self.assertIn("weekend", logs[0].description)
+        self.assertIn("previous business day", logs[0].description)
+
+    def test_weekday_payment_create_does_not_log_date_adjusted(self):
+        from activity.models import ActivityHistory
+
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=date(2026, 5, 15),
+            original_date=date(2026, 5, 15),
+            status="scheduled",
+        )
+
+        self.assertFalse(
+            ActivityHistory.objects.filter(
+                loan=self.loan,
+                title="Date Adjusted",
+            ).exists()
+        )
+
+    def test_staff_date_edit_logs_once_and_notes_business_day_shift(self):
+        from activity.models import ActivityHistory
+
+        today = timezone.localdate()
+        saturday = today + timedelta(days=1)
+        while saturday.weekday() != 5:
+            saturday += timedelta(days=1)
+        weekday = previous_business_day(saturday)
+
+        payment = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=weekday,
+            original_date=weekday,
+            status="scheduled",
+        )
+
+        LoanService.update_scheduled_payment(
+            payment,
+            scheduled_date=saturday,
+            user=self.staff,
+        )
+
+        staff_logs = ActivityHistory.objects.filter(
+            loan=self.loan,
+            title="Payment Installment Updated",
+        )
+        system_logs = ActivityHistory.objects.filter(
+            loan=self.loan,
+            title="Date Adjusted",
+        )
+        self.assertEqual(staff_logs.count(), 1)
+        self.assertEqual(system_logs.count(), 0)
+        self.assertIn("previous business day", staff_logs.get().description)
+        self.assertIn(str(saturday), staff_logs.get().description)
+        self.assertIn(str(weekday), staff_logs.get().description)
+
+    def test_direct_scheduled_date_change_logs_system_adjustment(self):
+        from activity.models import ActivityHistory
+
+        payment = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("80.00"),
+            scheduled_date=date(2026, 5, 15),
+            original_date=date(2026, 5, 15),
+            status="scheduled",
+        )
+        payment.scheduled_date = date(2026, 5, 14)
+        payment.original_date = date(2026, 5, 16)
+        payment.save(update_fields=["scheduled_date", "original_date"])
+
+        log = ActivityHistory.objects.get(loan=self.loan, title="Date Adjusted")
+        self.assertEqual(log.created_by, "system")
+        self.assertEqual(log.metadata.get("actor"), "System")
+        self.assertIn("2026-05-15", log.description)
+        self.assertIn("2026-05-14", log.description)

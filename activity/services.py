@@ -63,6 +63,68 @@ def actor_id(user) -> str:
     return str(getattr(user, "id", "staff"))
 
 
+DATE_ADJUSTED_TITLE = "Date Adjusted"
+
+
+def log_payment_date_adjustment(
+    *,
+    payment,
+    previous_date=None,
+    user=None,
+) -> ActivityHistory | None:
+    """Audit a system or staff payment-date move (weekend/holiday or edit)."""
+    scheduled = getattr(payment, "scheduled_date", None)
+    original = getattr(payment, "original_date", None)
+    if scheduled is None:
+        return None
+    if previous_date is None and (original is None or original == scheduled):
+        return None
+
+    loan = getattr(payment, "loan", None)
+    customer = getattr(loan, "customer", None) if loan is not None else None
+    if customer is None:
+        return None
+
+    actor = actor_label(user)
+    if previous_date is not None and previous_date != scheduled:
+        description = (
+            f"Payment of ${payment.amount} date moved from {previous_date} "
+            f"to {scheduled} by {actor}."
+        )
+    else:
+        description = (
+            f"Payment of ${payment.amount} date adjusted from {original} "
+            f"to {scheduled} by {actor}."
+        )
+
+    if original is not None and original != scheduled:
+        from loans.business_calendar import is_weekend
+
+        kind = "weekend" if is_weekend(original) else "non-business day"
+        description = (
+            f"{description} {original} was a {kind}; "
+            f"moved to the previous business day."
+        )
+
+    return log_staff_action(
+        customer=customer,
+        loan=loan,
+        user=user,
+        type_value="payment_scheduled",
+        title=DATE_ADJUSTED_TITLE,
+        description=description,
+        metadata={
+            "action": "payment_date_adjusted",
+            "payment_id": str(payment.id),
+            "previous_date": str(previous_date) if previous_date else None,
+            "original_date": str(original) if original else None,
+            "scheduled_date": str(scheduled),
+            "amount": str(payment.amount),
+            "actor": actor,
+        },
+    )
+
+
 def format_account_label(account_or_snapshot) -> str:
     """Short bank account label for before→after logs."""
     if not account_or_snapshot:

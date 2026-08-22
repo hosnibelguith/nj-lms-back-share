@@ -89,42 +89,64 @@ def loan_status_changed(sender, instance, **kwargs):
 
 @receiver(pre_save, sender=Payment)
 def payment_status_changed(sender, instance, **kwargs):
-    """Log activity when payment status changes to completed or failed."""
+    """Log payment status changes and system date adjustments."""
+    if getattr(instance, '_suppress_payment_activity', False):
+        return
+
+    old_instance = None
     if instance.pk:
         try:
             old_instance = Payment.objects.get(pk=instance.pk)
-            if old_instance.status != instance.status:
-                from activity.models import ActivityHistory
-                
-                if instance.status == 'completed':
-                    ActivityHistory.objects.create(
-                        customer=instance.loan.customer,
-                        loan=instance.loan,
-                        type='payment_completed',
-                        title='Payment Received',
-                        description=f'Payment of ${instance.amount} received (status changed from {old_instance.status} to completed).',
-                        created_by='system',
-                        metadata={'loan_id': str(instance.loan_id)},
-                    )
-                elif instance.status == 'failed':
-                    ActivityHistory.objects.create(
-                        customer=instance.loan.customer,
-                        loan=instance.loan,
-                        type='payment_failed',
-                        title='Payment Failed',
-                        description=f'Payment of ${instance.amount} failed: {instance.failure_reason or "Unknown reason"}',
-                        created_by='system',
-                        metadata={'loan_id': str(instance.loan_id)},
-                    )
-                elif instance.status == 'nsf':
-                    ActivityHistory.objects.create(
-                        customer=instance.loan.customer,
-                        loan=instance.loan,
-                        type='payment_failed',
-                        title='Payment NSF',
-                        description=f'Payment of ${instance.amount} returned NSF',
-                        created_by='system',
-                        metadata={'loan_id': str(instance.loan_id)},
-                    )
         except Payment.DoesNotExist:
-            pass
+            old_instance = None
+
+    if old_instance is None:
+        original = getattr(instance, 'original_date', None)
+        scheduled = getattr(instance, 'scheduled_date', None)
+        if original and scheduled and original != scheduled:
+            from activity.services import log_payment_date_adjustment
+
+            log_payment_date_adjustment(payment=instance)
+        return
+
+    if old_instance.status != instance.status:
+        from activity.models import ActivityHistory
+
+        if instance.status == 'completed':
+            ActivityHistory.objects.create(
+                customer=instance.loan.customer,
+                loan=instance.loan,
+                type='payment_completed',
+                title='Payment Received',
+                description=f'Payment of ${instance.amount} received (status changed from {old_instance.status} to completed).',
+                created_by='system',
+                metadata={'loan_id': str(instance.loan_id)},
+            )
+        elif instance.status == 'failed':
+            ActivityHistory.objects.create(
+                customer=instance.loan.customer,
+                loan=instance.loan,
+                type='payment_failed',
+                title='Payment Failed',
+                description=f'Payment of ${instance.amount} failed: {instance.failure_reason or "Unknown reason"}',
+                created_by='system',
+                metadata={'loan_id': str(instance.loan_id)},
+            )
+        elif instance.status == 'nsf':
+            ActivityHistory.objects.create(
+                customer=instance.loan.customer,
+                loan=instance.loan,
+                type='payment_failed',
+                title='Payment NSF',
+                description=f'Payment of ${instance.amount} returned NSF',
+                created_by='system',
+                metadata={'loan_id': str(instance.loan_id)},
+            )
+
+    if old_instance.scheduled_date != instance.scheduled_date:
+        from activity.services import log_payment_date_adjustment
+
+        log_payment_date_adjustment(
+            payment=instance,
+            previous_date=old_instance.scheduled_date,
+        )

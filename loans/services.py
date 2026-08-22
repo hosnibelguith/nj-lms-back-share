@@ -1208,6 +1208,7 @@ class LoanService:
         payment.status = 'completed'
         payment.processed_at = timezone.now()
         payment.notes = notes
+        payment._suppress_payment_activity = True
         payment.save(
             update_fields=[
                 'amount',
@@ -2227,6 +2228,7 @@ class LoanService:
         if not update_fields:
             return payment
 
+        payment._suppress_payment_activity = True
         payment.save(update_fields=list(dict.fromkeys(update_fields)))
 
         if amount_changed:
@@ -2241,7 +2243,15 @@ class LoanService:
         actor = actor_label(user)
         changes = []
         if 'scheduled_date' in update_fields:
-            changes.append(f'date {previous_date} → {payment.scheduled_date}')
+            date_note = f'date {previous_date} → {payment.scheduled_date}'
+            if (
+                payment.original_date
+                and payment.original_date != payment.scheduled_date
+            ):
+                date_note += (
+                    f' (system moved {payment.original_date} to previous business day)'
+                )
+            changes.append(date_note)
         if 'amount' in update_fields:
             changes.append(f'amount ${previous_amount} → ${payment.amount}')
         detail = f'Schedule installment updated by {actor}: {", ".join(changes)}.'
@@ -2958,6 +2968,7 @@ class LoanService:
             f'{existing_notes}\n{defer_note}'.strip() if existing_notes else defer_note
         )
         update_fields.append('notes')
+        payment._suppress_payment_activity = True
         payment.save(update_fields=update_fields)
 
         loan.fee = LoanService.money((loan.fee or Decimal('0.00')) + total_delta)
