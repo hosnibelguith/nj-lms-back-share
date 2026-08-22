@@ -104,7 +104,7 @@ class StaffReportCenterTests(APITestCase):
         self.assertEqual(response.data["results"][0]["payment_id"], str(matching.id))
         self.assertEqual(Decimal(response.data["results"][0]["amount"]), Decimal("176.61"))
 
-    def test_payment_report_only_includes_completed_payments_on_active_loans(self):
+    def test_payment_report_includes_future_scheduled_on_active_loans(self):
         collected = Payment.objects.create(
             loan=self.loan,
             amount=Decimal("100.00"),
@@ -112,10 +112,10 @@ class StaffReportCenterTests(APITestCase):
             status="completed",
             type="manual",
         )
-        Payment.objects.create(
+        upcoming = Payment.objects.create(
             loan=self.loan,
             amount=Decimal("50.00"),
-            scheduled_date=date(2026, 8, 11),
+            scheduled_date=date(2026, 8, 25),
             status="scheduled",
             type="scheduled",
         )
@@ -144,15 +144,23 @@ class StaffReportCenterTests(APITestCase):
             status="completed",
             type="manual",
         )
+        Payment.objects.create(
+            loan=declined_loan,
+            amount=Decimal("25.00"),
+            scheduled_date=date(2026, 9, 12),
+            status="scheduled",
+            type="scheduled",
+        )
 
         response = self.client.get("/api/loans/reports/", {"report_type": "payment"})
 
         self.assertEqual(response.status_code, 200, response.data)
-        self.assertEqual(response.data["count"], 1)
-        self.assertEqual(response.data["results"][0]["payment_id"], str(collected.id))
-        self.assertEqual(response.data["results"][0]["loan_status"], "active")
-        self.assertEqual(response.data["summary"]["row_count"], 1)
-        self.assertEqual(response.data["summary"]["amount_total"], "100.00")
+        payment_ids = {row["payment_id"] for row in response.data["results"]}
+        self.assertEqual(payment_ids, {str(collected.id), str(upcoming.id)})
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(response.data["summary"]["row_count"], 2)
+        self.assertEqual(response.data["summary"]["amount_total"], "150.00")
+        self.assertTrue(all(row["loan_status"] == "active" for row in response.data["results"]))
 
     def test_payment_report_status_filter_includes_completed_collections_payments(self):
         Payment.objects.create(

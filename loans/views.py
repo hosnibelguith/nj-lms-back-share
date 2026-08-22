@@ -1148,7 +1148,9 @@ class LoanViewSet(viewsets.ModelViewSet):
             status='nsf',
             processed_at__isnull=False,
         )
-        sent_payments = Payment.objects.all()
+        sent_payments = Payment.objects.filter(
+            status__in=('completed', 'pending', 'nsf', 'failed'),
+        )
 
         if source in ('arrive', 'organic'):
             funded_payments = funded_payments.filter(loan__customer__source=source)
@@ -1201,6 +1203,17 @@ class LoanViewSet(viewsets.ModelViewSet):
         received_arrive = received_loans.filter(customer__source='arrive')
         received_organic = received_loans.exclude(customer__source='arrive')
 
+        current_loans = loans
+        current_customers = Customer.objects.all()
+        if source in ('arrive', 'organic'):
+            current_customers = current_customers.filter(source=source)
+
+        paid_off_loans = loans.filter(status='paid_off')
+        if date_from:
+            paid_off_loans = paid_off_loans.filter(updated_at__date__gte=date_from)
+        if date_to:
+            paid_off_loans = paid_off_loans.filter(updated_at__date__lte=date_to)
+
         # Ops KPIs use loan timestamps (created/approved/funded). Other lifecycle
         # counts still use LoanStateEvent for trend compatibility.
         totals = {
@@ -1214,16 +1227,18 @@ class LoanViewSet(viewsets.ModelViewSet):
             "approved_loans_count": approved_loans.count(),
             "declined_loans_count": events.filter(event_type='human_declined').count(),
             "funded_loans_count": funded_loans.count(),
-            "paid_off_loans_count": events.filter(event_type='paid_off').count(),
+            "paid_off_loans_count": paid_off_loans.count(),
             "defaulted_loans_count": defaulted_loans.count(),
             "reactivated_loans_count": events.filter(event_type='reactivated').count(),
-            "current_active_loans_count": Loan.objects.filter(is_active=True).count(),
-            "current_defaulted_loans_count": Loan.objects.filter(status='defaulted').count(),
-            "current_pending_loans_count": Loan.objects.filter(
+            "current_active_loans_count": current_loans.filter(status='active').count(),
+            "current_defaulted_loans_count": current_loans.filter(status='defaulted').count(),
+            "current_pending_loans_count": current_loans.filter(
                 status__in=('ibv_pending', 'pending', 'pending_signature'),
             ).count(),
-            "current_customers_count": Customer.objects.count(),
-            "current_active_customers_count": Customer.objects.filter(status='active').count(),
+            "current_customers_count": current_customers.count(),
+            "current_active_customers_count": current_customers.filter(
+                loans__status='active',
+            ).distinct().count(),
             "nsf_payments_count": nsf_payments_count,
             "sent_payments_count": sent_payments_count,
             "nsf_ratio": nsf_ratio,

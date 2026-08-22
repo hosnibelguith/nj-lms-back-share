@@ -171,6 +171,73 @@ class DashboardAnalyticsTests(APITestCase):
         self.assertEqual(response.data["totals"]["current_customers_count"], 2)
         self.assertEqual(response.data["totals"]["current_active_customers_count"], 1)
         self.assertEqual(response.data["totals"]["current_pending_loans_count"], 1)
+        self.assertEqual(response.data["totals"]["current_active_loans_count"], 1)
+
+    def test_dashboard_active_loan_and_customer_counts_ignore_pending_flags(self):
+        idle = Customer.objects.create(
+            first_name="Lead",
+            last_name="Only",
+            email="lead-only@example.com",
+            phone="4165550103",
+            province="ON",
+            status="active",
+        )
+        Loan.objects.create(
+            customer=idle,
+            principal=Decimal("300.00"),
+            fee=Decimal("60.00"),
+            total_amount=Decimal("360.00"),
+            balance=Decimal("360.00"),
+            status="pending",
+            is_active=True,
+        )
+        paid = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("200.00"),
+            fee=Decimal("40.00"),
+            total_amount=Decimal("240.00"),
+            balance=Decimal("0.00"),
+            status="paid_off",
+            is_active=False,
+        )
+        self.assertEqual(paid.status, "paid_off")
+
+        response = self.client.get("/api/loans/dashboard/analytics/")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["totals"]["current_active_loans_count"], 1)
+        self.assertEqual(response.data["totals"]["current_active_customers_count"], 1)
+        self.assertEqual(response.data["totals"]["paid_off_loans_count"], 1)
+        self.assertEqual(response.data["totals"]["current_customers_count"], 2)
+
+    def test_dashboard_sent_payments_exclude_unsent_scheduled_rows(self):
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("100.00"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+        )
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("50.00"),
+            scheduled_date=timezone.localdate(),
+            status="completed",
+            processed_at=timezone.now(),
+        )
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("25.00"),
+            scheduled_date=timezone.localdate(),
+            status="nsf",
+            processed_at=timezone.now(),
+        )
+
+        response = self.client.get("/api/loans/dashboard/analytics/")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["totals"]["sent_payments_count"], 2)
+        self.assertEqual(response.data["totals"]["nsf_payments_count"], 1)
+        self.assertEqual(response.data["totals"]["nsf_ratio"], 50.0)
 
 
 @override_settings(ZUMRAILS_DRY_RUN=True)
@@ -1171,7 +1238,7 @@ class ZumRailsWorkflowTests(APITestCase):
 
         self.assertIn(response.status_code, [400, 403])
         if response.status_code == 400:
-        self.assertIn("schedule_confirmed", response.data)
+            self.assertIn("schedule_confirmed", response.data)
 
     def test_adjust_schedule_reprices_daily_interest_from_selected_terms(self):
         formula = LoanFormula.objects.create(

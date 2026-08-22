@@ -14,7 +14,7 @@ from .services import LoanService
 
 MAX_ROWS = 2000
 ALERT_ACTIVITY_TYPES = ('payment_failed', 'loan_defaulted', 'customer_blocked')
-REAL_PAYMENT_STATUSES = ('completed',)
+REAL_PAYMENT_STATUSES = ('completed', 'scheduled', 'pending')
 ACTIVE_LOAN_STATUS = 'active'
 
 
@@ -946,7 +946,7 @@ REPORT_SPECS = (
     {
         'id': 'payment',
         'label': 'Payment Report',
-        'description': 'Completed payments on active loans.',
+        'description': 'Completed, scheduled, and processing payments on active loans.',
         'builder': build_payment_report,
     },
     {
