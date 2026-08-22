@@ -1,7 +1,7 @@
 """Staff Report Center — only report types this LMS actually stores."""
 from decimal import Decimal
 
-from django.db.models import Count, Exists, Min, OuterRef, Q, Sum
+from django.db.models import Case, CharField, Count, Exists, Min, OuterRef, Q, Sum, Value, When
 
 from accounts.models import Customer, User
 from activity.models import ActivityHistory, Comment
@@ -15,7 +15,12 @@ from .services import LoanService
 MAX_ROWS = 2000
 ALERT_ACTIVITY_TYPES = ('payment_failed', 'loan_defaulted', 'customer_blocked')
 REAL_PAYMENT_STATUSES = ('completed', 'scheduled', 'pending')
-ACTIVE_LOAN_STATUS = 'active'
+FUNDED_PAYMENT_LOAN_STATUSES = ('active', 'defaulted')
+PAYMENT_STATUS_LABELS = {
+    'completed': 'Completed',
+    'scheduled': 'Scheduled',
+    'pending': 'Processing',
+}
 
 
 def _money(value):
@@ -228,6 +233,14 @@ def _queryset_summary(
     }
 
 
+def _relabel_category_counts(summary, labels):
+    for row in summary.get('category_counts') or []:
+        value = row.get('value')
+        if value in labels:
+            row['value'] = labels[value]
+    return summary
+
+
 def _slice_rows(qs, row_fn):
     count = qs.count()
     truncated = count > MAX_ROWS
@@ -277,6 +290,7 @@ def build_customer_report(date_from, date_to, source, extra=None):
         }
 
     count, truncated, rows = _slice_rows(qs, row)
+    summary = _queryset_summary(qs, category_field='status')
     return _cols(
         ('customer_id', 'Customer ID'),
         ('customer_name', 'Customer'),
@@ -287,7 +301,7 @@ def build_customer_report(date_from, date_to, source, extra=None):
         ('source', 'Source'),
         ('sms_opted_out', 'SMS opted out'),
         ('created_at', 'Created'),
-    ), count, truncated, rows
+    ), count, truncated, rows, summary
 
 
 def build_loan_report(date_from, date_to, source, extra=None):
@@ -347,25 +361,26 @@ def build_loan_report(date_from, date_to, source, extra=None):
 def build_payment_report(date_from, date_to, source, extra=None):
     extra = dict(extra or {})
     extra.setdefault('source', source)
-    if not (extra.get('status') or '').strip() or extra.get('status') == 'all':
-        extra['status'] = ACTIVE_LOAN_STATUS
+    loan_status = (extra.get('status') or '').strip()
+    payments = Payment.objects.select_related('loan__customer').filter(
+        status__in=REAL_PAYMENT_STATUSES,
+    )
+    if not loan_status or loan_status == 'all':
+        extra['status'] = ''
+        payments = payments.filter(loan__status__in=FUNDED_PAYMENT_LOAN_STATUSES)
     qs = _apply_loan_staff_filters(
-        _filter_date(
-            Payment.objects.select_related('loan__customer').filter(
-                status__in=REAL_PAYMENT_STATUSES,
-            ),
-            'scheduled_date',
-            date_from,
-            date_to,
-        ),
+        _filter_date(payments, 'scheduled_date', date_from, date_to),
         extra,
         prefix='loan__',
     ).order_by('-scheduled_date', '-created_at', 'id')
-    summary = _queryset_summary(
-        qs,
-        category_field='type',
-        amount_field='amount',
-        amount_label='Amount',
+    summary = _relabel_category_counts(
+        _queryset_summary(
+            qs,
+            category_field='status',
+            amount_field='amount',
+            amount_label='Amount',
+        ),
+        PAYMENT_STATUS_LABELS,
     )
 
     def row(payment):
@@ -434,6 +449,13 @@ def build_payment_plan_report(date_from, date_to, source, extra=None):
         }
 
     count, truncated, rows = _slice_rows(qs, row)
+    summary = _queryset_summary(
+        qs,
+        category_field='status',
+        amount_field='scheduled_remaining',
+        amount_label='Scheduled remaining',
+        extra_amount_fields=(('balance', 'Balance'),),
+    )
     return _cols(
         ('loan_id', 'Loan ID'),
         ('customer_name', 'Customer'),
@@ -443,7 +465,7 @@ def build_payment_plan_report(date_from, date_to, source, extra=None):
         ('payment_count', 'Payments'),
         ('scheduled_remaining', 'Scheduled remaining'),
         ('next_due', 'Next due'),
-    ), count, truncated, rows
+    ), count, truncated, rows, summary
 
 
 def build_contract_report(date_from, date_to, source, extra=None):
@@ -469,6 +491,7 @@ def build_contract_report(date_from, date_to, source, extra=None):
         }
 
     count, truncated, rows = _slice_rows(qs, row)
+    summary = _queryset_summary(qs, category_field='status')
     return _cols(
         ('contract_id', 'Contract ID'),
         ('loan_id', 'Loan ID'),
@@ -477,7 +500,7 @@ def build_contract_report(date_from, date_to, source, extra=None):
         ('typed_name', 'Signed name'),
         ('signed_date', 'Signed'),
         ('created_at', 'Created'),
-    ), count, truncated, rows
+    ), count, truncated, rows, summary
 
 
 def build_communication_report(date_from, date_to, source, extra=None):
@@ -505,6 +528,7 @@ def build_communication_report(date_from, date_to, source, extra=None):
         }
 
     count, truncated, rows = _slice_rows(qs, row)
+    summary = _queryset_summary(qs, category_field='type')
     return _cols(
         ('communication_id', 'ID'),
         ('customer_name', 'Customer'),
@@ -515,7 +539,7 @@ def build_communication_report(date_from, date_to, source, extra=None):
         ('to', 'To'),
         ('template_name', 'Template'),
         ('created_at', 'Created'),
-    ), count, truncated, rows
+    ), count, truncated, rows, summary
 
 
 def build_notification_report(date_from, date_to, source, extra=None):
@@ -543,6 +567,7 @@ def build_notification_report(date_from, date_to, source, extra=None):
         }
 
     count, truncated, rows = _slice_rows(qs, row)
+    summary = _queryset_summary(qs, category_field='status')
     return _cols(
         ('communication_id', 'ID'),
         ('customer_name', 'Customer'),
@@ -551,7 +576,7 @@ def build_notification_report(date_from, date_to, source, extra=None):
         ('subject', 'Subject'),
         ('to', 'To'),
         ('created_at', 'Created'),
-    ), count, truncated, rows
+    ), count, truncated, rows, summary
 
 
 def build_automation_report(date_from, date_to, source, extra=None):
@@ -579,6 +604,7 @@ def build_automation_report(date_from, date_to, source, extra=None):
         }
 
     count, truncated, rows = _slice_rows(qs, row)
+    summary = _queryset_summary(qs, category_field='type')
     return _cols(
         ('communication_id', 'ID'),
         ('customer_name', 'Customer'),
@@ -587,7 +613,7 @@ def build_automation_report(date_from, date_to, source, extra=None):
         ('template_name', 'Template'),
         ('subject', 'Subject'),
         ('created_at', 'Created'),
-    ), count, truncated, rows
+    ), count, truncated, rows, summary
 
 
 def build_bank_verification_report(date_from, date_to, source, extra=None):
@@ -614,6 +640,7 @@ def build_bank_verification_report(date_from, date_to, source, extra=None):
         }
 
     count, truncated, rows = _slice_rows(qs, row)
+    summary = _queryset_summary(qs, category_field='sync_status')
     return _cols(
         ('connection_id', 'Connection ID'),
         ('customer_name', 'Customer'),
@@ -623,7 +650,7 @@ def build_bank_verification_report(date_from, date_to, source, extra=None):
         ('is_active', 'Active'),
         ('last_synced_at', 'Last synced'),
         ('created_at', 'Created'),
-    ), count, truncated, rows
+    ), count, truncated, rows, summary
 
 
 def build_fees_report(date_from, date_to, source, extra=None):
@@ -666,6 +693,18 @@ def build_fees_report(date_from, date_to, source, extra=None):
 
     truncated = len(rows) > MAX_ROWS
     rows = rows[:MAX_ROWS]
+    summary = _queryset_summary(
+        qs.annotate(
+            fee_type=Case(
+                When(notes__startswith='Deferral fee', then=Value('deferral')),
+                default=Value('nsf'),
+                output_field=CharField(),
+            )
+        ),
+        category_field='fee_type',
+        amount_field='amount',
+        amount_label='Amount',
+    )
     return _cols(
         ('payment_id', 'Payment ID'),
         ('loan_id', 'Loan ID'),
@@ -675,7 +714,7 @@ def build_fees_report(date_from, date_to, source, extra=None):
         ('status', 'Status'),
         ('scheduled_date', 'Scheduled'),
         ('notes', 'Notes'),
-    ), len(rows) if not truncated else MAX_ROWS, truncated, rows
+    ), len(rows) if not truncated else MAX_ROWS, truncated, rows, summary
 
 
 def build_interest_report(date_from, date_to, source, extra=None):
@@ -716,6 +755,13 @@ def build_interest_report(date_from, date_to, source, extra=None):
         }
 
     count, truncated, rows = _slice_rows(qs, row)
+    summary = _queryset_summary(
+        qs,
+        category_field='status',
+        amount_field='fee',
+        amount_label='Total fee',
+        extra_amount_fields=(('principal', 'Principal'),),
+    )
     return _cols(
         ('loan_id', 'Loan ID'),
         ('customer_name', 'Customer'),
@@ -726,7 +772,7 @@ def build_interest_report(date_from, date_to, source, extra=None):
         ('collection_failure_interest', 'NSF extra interest'),
         ('total_fee', 'Total fee'),
         ('created_at', 'Created'),
-    ), count, truncated, rows
+    ), count, truncated, rows, summary
 
 
 def build_leads_report(date_from, date_to, source, extra=None):
@@ -750,6 +796,7 @@ def build_leads_report(date_from, date_to, source, extra=None):
         }
 
     count, truncated, rows = _slice_rows(qs.prefetch_related('loans'), row)
+    summary = _queryset_summary(qs, category_field='source')
     return _cols(
         ('customer_id', 'Customer ID'),
         ('customer_name', 'Customer'),
@@ -759,7 +806,7 @@ def build_leads_report(date_from, date_to, source, extra=None):
         ('onboarding_stage', 'Onboarding'),
         ('loan_status', 'Latest loan'),
         ('created_at', 'Created'),
-    ), count, truncated, rows
+    ), count, truncated, rows, summary
 
 
 def build_notes_report(date_from, date_to, source, extra=None):
@@ -819,6 +866,7 @@ def build_opt_in_report(date_from, date_to, source, extra=None):
         }
 
     count, truncated, rows = _slice_rows(qs, row)
+    summary = _queryset_summary(qs, category_field='sms_opted_out')
     return _cols(
         ('customer_id', 'Customer ID'),
         ('customer_name', 'Customer'),
@@ -828,7 +876,7 @@ def build_opt_in_report(date_from, date_to, source, extra=None):
         ('sms_opted_out', 'SMS opted out'),
         ('sms_opted_out_at', 'Opted out at'),
         ('sms_opt_out_reason', 'Reason'),
-    ), count, truncated, rows
+    ), count, truncated, rows, summary
 
 
 def build_customer_alert_report(date_from, date_to, source, extra=None):
@@ -856,6 +904,7 @@ def build_customer_alert_report(date_from, date_to, source, extra=None):
         }
 
     count, truncated, rows = _slice_rows(qs, row)
+    summary = _queryset_summary(qs, category_field='type')
     return _cols(
         ('activity_id', 'Activity ID'),
         ('customer_name', 'Customer'),
@@ -864,7 +913,7 @@ def build_customer_alert_report(date_from, date_to, source, extra=None):
         ('title', 'Title'),
         ('description', 'Description'),
         ('created_at', 'Created'),
-    ), count, truncated, rows
+    ), count, truncated, rows, summary
 
 
 def build_employee_report(date_from, date_to, source, extra=None):
@@ -887,6 +936,7 @@ def build_employee_report(date_from, date_to, source, extra=None):
         }
 
     count, truncated, rows = _slice_rows(qs, row)
+    summary = _queryset_summary(qs, category_field='is_active')
     return _cols(
         ('user_id', 'User ID'),
         ('full_name', 'Name'),
@@ -894,7 +944,7 @@ def build_employee_report(date_from, date_to, source, extra=None):
         ('permission_level', 'Permission'),
         ('is_active', 'Active'),
         ('created_at', 'Created'),
-    ), count, truncated, rows
+    ), count, truncated, rows, summary
 
 
 REPORT_SPECS = (
@@ -985,7 +1035,7 @@ REPORT_SPECS = (
     {
         'id': 'payment',
         'label': 'Payment Report',
-        'description': 'Completed, scheduled, and processing payments on active loans.',
+        'description': 'Collected, future, and processing payments on active and in-collections loans.',
         'builder': build_payment_report,
     },
     {

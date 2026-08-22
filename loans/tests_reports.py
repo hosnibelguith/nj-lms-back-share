@@ -70,6 +70,8 @@ class StaffReportCenterTests(APITestCase):
         self.assertEqual(customers.status_code, 200, customers.data)
         self.assertEqual(loans.status_code, 200, loans.data)
         self.assertEqual(customers.data["count"], 1)
+        self.assertEqual(customers.data["summary"]["row_count"], 1)
+        self.assertEqual(customers.data["summary"]["category_counts"][0]["value"], "active")
         self.assertEqual(customers.data["results"][0]["email"], "riley.cole@example.com")
         self.assertEqual(loans.data["results"][0]["customer_name"], "Riley Cole")
         self.assertEqual(Decimal(loans.data["results"][0]["principal"]), Decimal("500.00"))
@@ -160,11 +162,11 @@ class StaffReportCenterTests(APITestCase):
         self.assertEqual(response.data["count"], 2)
         self.assertEqual(response.data["summary"]["row_count"], 2)
         self.assertEqual(response.data["summary"]["amount_total"], "150.00")
-        type_amounts = {
+        status_amounts = {
             row["value"]: row["amount"] for row in response.data["summary"]["category_counts"]
         }
-        self.assertEqual(type_amounts["manual"], "100.00")
-        self.assertEqual(type_amounts["scheduled"], "50.00")
+        self.assertEqual(status_amounts["Completed"], "100.00")
+        self.assertEqual(status_amounts["Scheduled"], "50.00")
         self.assertTrue(all(row["loan_status"] == "active" for row in response.data["results"]))
 
     def test_payment_report_status_filter_includes_completed_collections_payments(self):
@@ -207,9 +209,55 @@ class StaffReportCenterTests(APITestCase):
             {"report_type": "payment", "status": "defaulted"},
         )
 
-        self.assertEqual(active_only.data["count"], 1)
+        self.assertEqual(active_only.data["count"], 2)
         self.assertEqual(collections.data["count"], 1)
         self.assertEqual(collections.data["results"][0]["payment_id"], str(collected.id))
+
+    def test_payment_report_includes_future_scheduled_on_collections_loans(self):
+        customer = Customer.objects.create(
+            first_name="Ivy",
+            last_name="Cole",
+            email="ivy.cole@example.com",
+            phone="4165550144",
+            province="ON",
+            status="active",
+        )
+        loan = Loan.objects.create(
+            customer=customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("100.00"),
+            total_amount=Decimal("600.00"),
+            balance=Decimal("600.00"),
+            status="defaulted",
+            is_active=True,
+        )
+        Payment.objects.create(
+            loan=loan,
+            amount=Decimal("150.00"),
+            scheduled_date=date(2026, 9, 12),
+            status="scheduled",
+            type="scheduled",
+        )
+        Payment.objects.create(
+            loan=loan,
+            amount=Decimal("75.00"),
+            scheduled_date=date(2026, 8, 11),
+            status="completed",
+            type="scheduled",
+        )
+
+        response = self.client.get("/api/loans/reports/", {"report_type": "payment"})
+        payload = response.data
+        status_amounts = {
+            row["value"]: row["amount"]
+            for row in payload["summary"]["category_counts"]
+            if row.get("amount")
+        }
+
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["summary"]["amount_total"], "225.00")
+        self.assertEqual(status_amounts["Completed"], "75.00")
+        self.assertEqual(status_amounts["Scheduled"], "150.00")
 
     def test_loan_report_filters_align_with_loans_page(self):
         arrive_customer = Customer.objects.create(
@@ -331,6 +379,12 @@ class StaffReportCenterTests(APITestCase):
         fee_types = {row["fee_type"]: row["payment_id"] for row in response.data["results"]}
         self.assertEqual(fee_types["deferral"], str(deferral.id))
         self.assertEqual(fee_types["nsf"], str(nsf.id))
+        fee_amounts = {
+            row["value"]: row["amount"] for row in response.data["summary"]["category_counts"]
+        }
+        self.assertEqual(response.data["summary"]["amount_total"], "85.00")
+        self.assertEqual(fee_amounts["deferral"], "35.00")
+        self.assertEqual(fee_amounts["nsf"], "50.00")
 
     def test_opt_in_and_notes_reports_use_customer_records(self):
         self.customer.sms_opted_out = True
@@ -372,6 +426,7 @@ class StaffReportCenterTests(APITestCase):
 
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data["results"][0]["communication_id"], str(message.id))
+        self.assertEqual(response.data["summary"]["category_counts"][0]["value"], "sms")
         self.assertEqual(automation.data["count"], 1)
         self.assertEqual(automation.data["results"][0]["template_name"], "payment_reminder")
 
