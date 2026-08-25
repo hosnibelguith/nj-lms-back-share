@@ -435,6 +435,7 @@ class Loan(models.Model):
             self.status = 'paid_off'
             self.is_active = False
             paid_off_now = True
+            self._activity_actor = user
 
         self.save()
 
@@ -451,6 +452,7 @@ class Loan(models.Model):
         previous_status = self.status
         self.status = 'defaulted'
         self.is_active = False
+        self._activity_actor = user
         self.save()
 
         self.log_state_event(
@@ -470,6 +472,7 @@ class Loan(models.Model):
         previous_status = self.status
         self.status = 'stopped'
         self.is_active = False
+        self._activity_actor = user
         self.save()
         self.unschedule_remaining_payments()
 
@@ -487,6 +490,7 @@ class Loan(models.Model):
         previous_status = self.status
         self.status = 'active'
         self.is_active = True
+        self._activity_actor = user
         self.save()
 
         self.log_state_event(

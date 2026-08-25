@@ -48,10 +48,16 @@ def loan_status_changed(sender, instance, **kwargs):
                         instance.status,
                         ('system', 'Loan Status Changed')
                     )
+                    # New status alone is not enough: stopped → active is a
+                    # reactivation, not a disbursement.
+                    if old_instance.status == 'stopped' and instance.status == 'active':
+                        activity_type, title = 'system', 'Loan Reactivated'
 
-                    actor_user = getattr(instance, 'approved_by', None)
-                    created_by = actor_id(actor_user) if actor_user else 'system'
-                    actor = actor_label(actor_user) if actor_user else 'System'
+                    # approved_by is the original approver, not who caused this
+                    # transition (NSF policy, Celery, or a later staff action).
+                    actor_user = getattr(instance, '_activity_actor', None)
+                    created_by = actor_id(actor_user)
+                    actor = actor_label(actor_user)
                     description = (
                         f'Status changed from {old_instance.get_status_display()} '
                         f'to {instance.get_status_display()} by {actor}.'
@@ -68,6 +74,7 @@ def loan_status_changed(sender, instance, **kwargs):
                             'loan_id': str(instance.id),
                             'previous_status': old_instance.status,
                             'new_status': instance.status,
+                            'actor': actor,
                         },
                     )
 
