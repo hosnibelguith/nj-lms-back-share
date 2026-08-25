@@ -193,6 +193,10 @@ class LoanService:
                     'date': (projection_start + timedelta(days=day)).isoformat(),
                 })
 
+        failed_section = LoanService._failed_payment_interest_section(
+            loan, planned_interest
+        )
+
         return {
             'capital': str(money(principal)),
             'brokerage_fee': str(brokerage_fee),
@@ -210,6 +214,7 @@ class LoanService:
             'unused_daily_interest': str(unused_daily_interest),
             'payoff_today': str(payoff_today),
             'timeline': timeline,
+            **failed_section,
         }
 
     @staticmethod
@@ -2351,6 +2356,64 @@ class LoanService:
             except Exception:
                 return Decimal('0.00')
         return Decimal('0.00')
+
+    @staticmethod
+    def collection_failure_nsf_fee_amount(payment: Payment) -> Decimal:
+        for line in (payment.notes or '').splitlines():
+            if not line.startswith('NSF fee: $'):
+                continue
+            try:
+                return LoanService.money(Decimal(line.split('$', 1)[1]))
+            except Exception:
+                return Decimal('0.00')
+        return Decimal('0.00')
+
+    @staticmethod
+    def _failed_payment_interest_section(loan: Loan, planned_interest: Decimal) -> dict:
+        """Fees and updated interest for loans that have a failed/NSF payment.
+
+        Planned interest on the loan is ``fee - brokerage``, which already
+        includes NSF fees when they were applied. Updated interest is that
+        figure with the NSF fees removed (original planned + extra interest).
+        """
+        money = LoanService.money
+        payments = list(loan.payments.exclude(status='cancelled'))
+        has_failed_payments = any(
+            payment.status in ('failed', 'nsf') for payment in payments
+        )
+        if not has_failed_payments:
+            return {
+                'has_failed_payments': False,
+                'collection_failure_fees': None,
+                'updated_interest': None,
+            }
+
+        fees_by_id: dict[str, Decimal] = {}
+        unmatched_fees = Decimal('0.00')
+        for payment in payments:
+            nsf = LoanService.collection_failure_nsf_fee_amount(payment)
+            if nsf <= 0 and LoanService.is_collection_failure_fee_payment(payment):
+                nsf = LoanService.COLLECTION_FAILURE_FEE_AMOUNT
+            if nsf <= 0:
+                continue
+            ids = LoanService._collection_failure_ids_from_payment(payment)
+            if ids:
+                for collection_id in ids:
+                    fees_by_id.setdefault(collection_id, nsf)
+            else:
+                unmatched_fees = money(unmatched_fees + nsf)
+
+        collection_failure_fees = money(
+            sum(fees_by_id.values(), unmatched_fees)
+        )
+        updated_interest = money(
+            max(planned_interest - collection_failure_fees, Decimal('0.00'))
+        )
+        return {
+            'has_failed_payments': True,
+            'collection_failure_fees': str(collection_failure_fees),
+            'updated_interest': str(updated_interest),
+        }
 
     @staticmethod
     def _collection_failure_original_fill_plan(payments, *, amount: Decimal, cap: Decimal):
