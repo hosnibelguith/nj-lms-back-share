@@ -1350,6 +1350,23 @@ class PaymentViewSet(viewsets.ModelViewSet):
             return Response({'error': str(exc)}, status=400)
         return Response(PaymentSerializer(payment).data)
 
+    def destroy(self, request, *args, **kwargs):
+        payment = self.get_object()
+        if (
+            payment.status in ('failed', 'nsf')
+            or LoanService.is_collection_failure_extra_payment(payment)
+        ):
+            return Response(
+                {
+                    'error': (
+                        'Failed payments, NSF fees, and extra interest '
+                        'cannot be removed from the schedule.'
+                    )
+                },
+                status=400,
+            )
+        return super().destroy(request, *args, **kwargs)
+
     @action(detail=True, methods=['post'])
     def defer(self, request, pk=None):
         """Move installment to schedule end and add a scheduled $35 fee payment."""

@@ -160,6 +160,11 @@ class LoanStatusActivityActorTests(APITestCase):
         self.assertEqual(missed.status, "nsf")
         self.assertEqual(missed.amount, Decimal("147.18"))
         self.assertFalse(self.loan.payments.filter(status="unscheduled").exists())
+        fee_row = self.loan.payments.get(
+            notes=LoanService.COLLECTION_FAILURE_FEE_NOTE
+        )
+        self.assertEqual(fee_row.status, "scheduled")
+        self.assertEqual(fee_row.amount, nsf_extra)
         scheduled_total = sum(
             (row.amount for row in self.loan.payments.filter(status="scheduled")),
             Decimal("0.00"),

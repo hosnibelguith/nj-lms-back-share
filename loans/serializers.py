@@ -191,6 +191,7 @@ class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
     balance_after = serializers.SerializerMethodField()
     original_amount = serializers.SerializerMethodField()
     is_deferral_fee = serializers.SerializerMethodField()
+    is_collection_failure_extra = serializers.SerializerMethodField()
     instruction_send_at = serializers.SerializerMethodField()
 
     class Meta:
@@ -211,6 +212,7 @@ class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
             'method',
             'balance_after',
             'is_deferral_fee',
+            'is_collection_failure_extra',
             'notes',
         ]
 
@@ -221,6 +223,10 @@ class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
     def get_is_deferral_fee(self, obj):
         from .services import LoanService
         return LoanService.is_deferral_fee_payment(obj)
+
+    def get_is_collection_failure_extra(self, obj):
+        from .services import LoanService
+        return LoanService.is_collection_failure_extra_payment(obj)
 
     def get_instruction_send_at(self, obj):
         from .business_calendar import instruction_send_at as send_at

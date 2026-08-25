@@ -1606,10 +1606,20 @@ class LoanService:
         if preserve_totals:
             detail = f'{detail} Existing fees and balance kept.'
 
-        delete_statuses = ['scheduled', 'unscheduled']
-        if not preserve_totals:
-            delete_statuses.extend(['failed', 'nsf'])
-        Payment.objects.filter(loan=loan, status__in=delete_statuses).delete()
+        money = LoanService.money
+        locked_extra_sum = Decimal('0.00')
+        for payment in loan.payments.filter(status__in=['scheduled', 'unscheduled']):
+            if LoanService.is_collection_failure_extra_payment(payment):
+                locked_extra_sum += money(payment.amount or Decimal('0.00'))
+        locked_extra_sum = money(locked_extra_sum)
+        keep_ids = LoanService._permanent_schedule_keep_ids(loan)
+        Payment.objects.filter(
+            loan=loan,
+            status__in=['scheduled', 'unscheduled'],
+        ).exclude(id__in=keep_ids).delete()
+        for extra in loan.payments.filter(status='unscheduled', id__in=keep_ids):
+            extra.status = 'scheduled'
+            extra.save(update_fields=['status'])
 
         loan.schedule_frequency = frequency
         if month_days:
@@ -1626,21 +1636,40 @@ class LoanService:
         ]
         if not preserve_totals:
             loan.formula = formula
-            loan.fee = LoanService.money(total_amount - principal)
-            loan.total_amount = total_amount
-            loan.balance = balance_due
+            loan.fee = money((total_amount - principal) + locked_extra_sum)
+            loan.total_amount = money(total_amount + locked_extra_sum)
+            loan.balance = money(balance_due + locked_extra_sum)
             update_fields.extend(['formula', 'fee', 'total_amount', 'balance'])
         loan.save(update_fields=update_fields)
 
-        payments = LoanService.generate_payment_schedule(
-            loan=loan,
-            num_payments=num_payments,
-            payment_amount=payment_amount,
-            start_date=start_date,
-            frequency_days=frequency_days,
-            schedule_total=balance_due,
-            month_days=month_days,
+        generate_total = money(
+            max((loan.balance or Decimal('0.00')) - locked_extra_sum, Decimal('0.00'))
         )
+        payments = []
+        if generate_total > 0:
+            if calculation_mode == 'number_of_payments':
+                payment_amount = money(generate_total / Decimal(num_payments))
+            else:
+                num_payments = None
+                for candidate_count in range(1, max_payments + 1):
+                    if payment_amount * Decimal(candidate_count) >= generate_total:
+                        num_payments = candidate_count
+                        break
+                if num_payments is None:
+                    minimum_payment = money(generate_total / Decimal(max_payments))
+                    raise ValueError(
+                        f'Payment amount is too low for this schedule. '
+                        f'Use at least ${minimum_payment}.'
+                    )
+            payments = LoanService.generate_payment_schedule(
+                loan=loan,
+                num_payments=num_payments,
+                payment_amount=payment_amount,
+                start_date=start_date,
+                frequency_days=frequency_days,
+                schedule_total=generate_total,
+                month_days=month_days,
+            )
 
         if notes:
             detail = f'{detail} {notes}'
@@ -1806,6 +1835,17 @@ class LoanService:
             .exclude(id__in=protected_ids)
             .order_by('scheduled_date', 'created_at', 'id')
         )
+        keep_ids = LoanService._permanent_schedule_keep_ids(loan)
+        extra_sum = Decimal('0.00')
+        kept_replaceable = []
+        for payment in replaceable:
+            if payment.id in keep_ids:
+                if LoanService.is_collection_failure_extra_payment(payment):
+                    extra_sum += money(payment.amount or Decimal('0.00'))
+                continue
+            kept_replaceable.append(payment)
+        replaceable = kept_replaceable
+        extra_sum = money(extra_sum)
 
         completed_sum = sum(
             (money(p.amount or Decimal('0.00')) for p in completed),
@@ -1815,7 +1855,7 @@ class LoanService:
             (money(p.amount or Decimal('0.00')) for p in protected),
             Decimal('0.00'),
         )
-        reserved = money(completed_sum + protected_sum)
+        reserved = money(completed_sum + protected_sum + extra_sum)
 
         formula = LoanService.get_formula_for_amount(principal) or loan.formula
         if start_date is None:
@@ -1970,7 +2010,11 @@ class LoanService:
                 'status': payment.status,
             }
 
-        open_after = money(protected_sum + sum((p['amount'] for p in proposed), Decimal('0.00')))
+        open_after = money(
+            protected_sum
+            + extra_sum
+            + sum((p['amount'] for p in proposed), Decimal('0.00'))
+        )
         return {
             'loan_id': str(loan.id),
             'loan_status': loan.status,
@@ -2044,10 +2088,16 @@ class LoanService:
         plan['dry_run'] = False
 
         protected_ids = [p['id'] for p in plan['protected']]
+        keep_ids = LoanService._permanent_schedule_keep_ids(loan)
         delete_qs = loan.payments.filter(status__in=['scheduled', 'failed', 'nsf', 'unscheduled'])
         if protected_ids:
             delete_qs = delete_qs.exclude(id__in=protected_ids)
+        if keep_ids:
+            delete_qs = delete_qs.exclude(id__in=keep_ids)
         delete_qs.delete()
+        for extra in loan.payments.filter(status='unscheduled', id__in=keep_ids):
+            extra.status = 'scheduled'
+            extra.save(update_fields=['status'])
 
         if reprice:
             principal = LoanService.money(loan.principal or Decimal('0.00'))
@@ -2166,7 +2216,7 @@ class LoanService:
             target_open = Decimal('0.00')
 
         open_payments = [
-            p for p in payments if p.status in ('scheduled', 'pending', 'failed', 'nsf')
+            p for p in payments if p.status in ('scheduled', 'pending')
         ]
         open_sum = sum(
             (money(p.amount or Decimal('0.00')) for p in open_payments),
@@ -2200,6 +2250,10 @@ class LoanService:
     def _assert_future_scheduled_installment(payment: Payment, *, action: str) -> None:
         if payment.status in ('failed', 'nsf'):
             raise ValueError('Missed or failed installments cannot be updated.')
+        if LoanService.is_collection_failure_extra_payment(payment):
+            raise ValueError(
+                'Collection failure fees and extra interest cannot be updated.'
+            )
         if payment.status in ('completed', 'cancelled'):
             raise ValueError(f'Paid installments cannot be {action}.')
         if payment.status != 'scheduled':
@@ -2345,6 +2399,24 @@ class LoanService:
     def is_collection_failure_interest_payment(payment: Payment) -> bool:
         notes = (payment.notes or '').strip()
         return notes.startswith(LoanService.COLLECTION_FAILURE_INTEREST_NOTE)
+
+    @staticmethod
+    def is_collection_failure_extra_payment(payment: Payment) -> bool:
+        """NSF fee and extra-interest rows that stay on the schedule."""
+        return (
+            LoanService.is_collection_failure_fee_payment(payment)
+            or LoanService.is_collection_failure_interest_payment(payment)
+        )
+
+    @staticmethod
+    def _permanent_schedule_keep_ids(loan: Loan) -> set:
+        keep = set()
+        for payment in loan.payments.exclude(status='cancelled'):
+            if payment.status in ('failed', 'nsf'):
+                keep.add(payment.id)
+            elif LoanService.is_collection_failure_extra_payment(payment):
+                keep.add(payment.id)
+        return keep
 
     @staticmethod
     def collection_failure_interest_amount(payment: Payment) -> Decimal:
