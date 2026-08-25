@@ -50,7 +50,10 @@ def loan_status_changed(sender, instance, **kwargs):
                     )
                     # New status alone is not enough: stopped → active is a
                     # reactivation, not a disbursement.
-                    if old_instance.status == 'stopped' and instance.status == 'active':
+                    reactivated = (
+                        old_instance.status == 'stopped' and instance.status == 'active'
+                    )
+                    if reactivated:
                         activity_type, title = 'system', 'Loan Reactivated'
 
                     # approved_by is the original approver, not who caused this
@@ -58,10 +61,17 @@ def loan_status_changed(sender, instance, **kwargs):
                     actor_user = getattr(instance, '_activity_actor', None)
                     created_by = actor_id(actor_user)
                     actor = actor_label(actor_user)
-                    description = (
-                        f'Status changed from {old_instance.get_status_display()} '
-                        f'to {instance.get_status_display()} by {actor}.'
-                    )
+                    if reactivated:
+                        description = (
+                            f'Reactivated by {actor}. '
+                            f'Status changed from {old_instance.get_status_display()} '
+                            f'to {instance.get_status_display()}.'
+                        )
+                    else:
+                        description = (
+                            f'Status changed from {old_instance.get_status_display()} '
+                            f'to {instance.get_status_display()} by {actor}.'
+                        )
 
                     ActivityHistory.objects.create(
                         customer=instance.customer,

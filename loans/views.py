@@ -1062,6 +1062,7 @@ class LoanViewSet(viewsets.ModelViewSet):
                     user=request.user,
                     notes=serializer.validated_data.get('notes') or '',
                     month_days=serializer.validated_data.get('month_days'),
+                    preserve_totals=True,
                 )
         except ValueError as exc:
             return Response({'error': str(exc)}, status=400)
