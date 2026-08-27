@@ -11,12 +11,12 @@ from twilio.request_validator import RequestValidator
 from accounts.models import Customer, User
 from accounts.tasks import send_sms_otp_task
 from activity.models import ActivityHistory
-from communications.models import Communication
+from communications.models import Communication, CommunicationTemplate
 from communications.services.inbox_grouping import (
     collapsed_unanswered_email_counts,
     mark_same_day_inbound_answered,
 )
-from communications.tasks import send_sms
+from communications.tasks import send_email, send_sms, send_template_message
 from communications.twilio_sms import (
     TwilioConfigurationError,
     TwilioService,
@@ -717,3 +717,215 @@ class EmailInboxGroupingTests(APITestCase):
         self.assertEqual(by_id[str(automated.id)]["created_by_name"], "Automation")
         self.assertEqual(str(by_id[str(manual.id)]["created_by"]), str(self.staff.id))
         self.assertEqual(by_id[str(manual.id)]["created_by_name"], self.staff.full_name)
+
+    def test_customer_history_returns_all_rows_past_default_page_size(self):
+        loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("100.00"),
+            total_amount=Decimal("600.00"),
+            balance=Decimal("600.00"),
+            status="active",
+        )
+        for index in range(30):
+            Communication.objects.create(
+                customer=self.customer,
+                loan=loan,
+                type="email" if index % 2 == 0 else "sms",
+                direction="outbound",
+                subject=f"Message {index}",
+                to_address=self.customer.email,
+                to_phone=self.customer.phone,
+                content=f"Body {index}",
+                status="sent",
+                template_name="Fund/Approve Template" if index == 0 else None,
+            )
+
+        response = self.client.get(
+            "/api/communications/history/",
+            {"customer_id": str(self.customer.id)},
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertIsInstance(response.data, list)
+        self.assertEqual(len(response.data), 30)
+        self.assertTrue(
+            any(item["template_name"] == "Fund/Approve Template" for item in response.data)
+        )
+        self.assertTrue(any(item["type"] == "sms" for item in response.data))
+
+
+@override_settings(CELERY_TASK_ALWAYS_EAGER=True, **TWILIO_SETTINGS)
+class AutomatedSendActivityHistoryTests(APITestCase):
+    """Template automations must appear on the customer History tab after send."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            email="automation-history@example.com",
+            password="password123",
+            full_name="History Agent",
+            user_type="staff",
+            is_staff=True,
+            permission_level=4,
+        )
+        self.customer = Customer.objects.create(
+            first_name="Ava",
+            last_name="Funded",
+            email="ava.funded@example.com",
+            phone="4165550199",
+            phone_normalized="4165550199",
+            province="ON",
+            status="active",
+        )
+        self.loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("100.00"),
+            total_amount=Decimal("600.00"),
+            balance=Decimal("600.00"),
+            status="active",
+            is_active=True,
+        )
+        self.client.force_authenticate(self.staff)
+
+    def _email(self, *, template_name=None, status="pending"):
+        return Communication.objects.create(
+            customer=self.customer,
+            loan=self.loan,
+            type="email",
+            direction="outbound",
+            to_address=self.customer.email,
+            subject="Funds sent",
+            content="Your funds have been sent.",
+            status=status,
+            template_name=template_name,
+        )
+
+    def _sms(self, *, template_name=None):
+        return Communication.objects.create(
+            customer=self.customer,
+            loan=self.loan,
+            type="sms",
+            direction="outbound",
+            to_phone=self.customer.phone,
+            content="Your funds have been sent.",
+            status="pending",
+            template_name=template_name,
+        )
+
+    def _activity_rows(self):
+        return ActivityHistory.objects.filter(
+            customer=self.customer, type__in=("email_sent", "sms_sent")
+        )
+
+    @patch("communications.tasks._send_email_via_provider")
+    def test_fund_template_email_logs_automation_on_history(self, mock_send):
+        mock_send.return_value = (True, "msg-1", None)
+        communication = self._email(template_name="Fund/Approve Template")
+
+        send_email(str(communication.id))
+
+        communication.refresh_from_db()
+        self.assertEqual(communication.status, "sent")
+        row = self._activity_rows().get()
+        self.assertEqual(row.type, "email_sent")
+        self.assertEqual(row.title, "Automated Email Sent")
+        self.assertIn("Fund/Approve Template", row.description)
+        self.assertEqual(row.created_by, "system")
+        self.assertEqual(row.metadata["actor"], "Automation")
+        self.assertTrue(row.metadata["automated"])
+        self.assertEqual(row.metadata["template_name"], "Fund/Approve Template")
+        self.assertEqual(row.metadata["communication_id"], str(communication.id))
+        self.assertEqual(str(row.loan_id), str(self.loan.id))
+
+        timeline = self.client.get(
+            f"/api/activities/timeline/?customer_id={self.customer.id}"
+        )
+        self.assertEqual(timeline.status_code, 200, timeline.data)
+        item = next(row for row in timeline.data if row["title"] == "Automated Email Sent")
+        self.assertEqual(item["created_by_name"], "System")
+        self.assertEqual(item["metadata"]["actor"], "Automation")
+        self.assertEqual(item["metadata"]["template_name"], "Fund/Approve Template")
+
+    @patch("communications.tasks._send_email_via_provider")
+    def test_manual_email_send_does_not_log_from_task(self, mock_send):
+        mock_send.return_value = (True, None, None)
+        communication = self._email(template_name=None)
+
+        send_email(str(communication.id))
+
+        self.assertFalse(self._activity_rows().exists())
+
+    @patch("communications.tasks._send_email_via_provider")
+    def test_failed_template_email_does_not_log_sent_history(self, mock_send):
+        mock_send.return_value = (False, None, "SMTP error")
+        communication = self._email(template_name="Fund/Approve Template")
+
+        send_email(str(communication.id))
+
+        communication.refresh_from_db()
+        self.assertEqual(communication.status, "failed")
+        self.assertFalse(self._activity_rows().exists())
+
+    @patch("communications.tasks._send_email_via_provider")
+    def test_template_send_does_not_duplicate_history(self, mock_send):
+        mock_send.return_value = (True, None, None)
+        communication = self._email(template_name="Fund/Approve Template")
+
+        send_email(str(communication.id))
+        communication.status = "pending"
+        communication.save(update_fields=["status"])
+        send_email(str(communication.id))
+
+        self.assertEqual(self._activity_rows().count(), 1)
+
+    @patch("twilio.rest.Client")
+    def test_template_sms_logs_automation_on_history(self, mock_client):
+        mock_client.return_value.messages.create.return_value = _twilio_message("SM-AUTO")
+        communication = self._sms(template_name="Fund/Approve Template")
+
+        send_sms(str(communication.id))
+
+        communication.refresh_from_db()
+        self.assertEqual(communication.status, "sent")
+        row = self._activity_rows().get()
+        self.assertEqual(row.type, "sms_sent")
+        self.assertEqual(row.title, "Automated SMS Sent")
+        self.assertEqual(row.metadata["actor"], "Automation")
+        self.assertEqual(row.metadata["template_name"], "Fund/Approve Template")
+
+    @patch("twilio.rest.Client")
+    def test_manual_sms_send_does_not_log_from_task(self, mock_client):
+        mock_client.return_value.messages.create.return_value = _twilio_message("SM-MANUAL")
+        send_sms(str(self._sms(template_name=None).id))
+        self.assertFalse(self._activity_rows().exists())
+
+    @patch("communications.tasks._send_email_via_provider")
+    def test_send_template_message_writes_history_after_email_sends(self, mock_send):
+        mock_send.return_value = (True, None, None)
+        template = CommunicationTemplate.objects.filter(
+            name="Fund/Approve Template",
+            type="email",
+            is_active=True,
+        ).first()
+        if template is None:
+            template = CommunicationTemplate.objects.create(
+                name="Fund/Approve Template",
+                type="email",
+                subject="Funds sent",
+                content="Hi {{customer_first_name}}, funds were sent.",
+                is_active=True,
+            )
+
+        send_template_message(
+            str(self.customer.id),
+            str(template.id),
+            str(self.loan.id),
+        )
+
+        communication = Communication.objects.get(
+            customer=self.customer, template_name="Fund/Approve Template"
+        )
+        self.assertEqual(communication.status, "sent")
+        row = self._activity_rows().get()
+        self.assertEqual(row.title, "Automated Email Sent")
+        self.assertEqual(row.metadata["communication_id"], str(communication.id))

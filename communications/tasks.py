@@ -24,6 +24,47 @@ def _setting_int(key: str, default: int) -> int:
         return default
 
 
+def _log_template_send_activity(communication) -> None:
+    """Record a successful template send on the customer Activity History.
+
+    Manual Comms-tab sends already log from the view. Template automations
+    (fund, decline, reminders) only created a Communication row, so staff
+    looking at History thought nothing was sent.
+    """
+    template_name = (communication.template_name or "").strip()
+    if not template_name or not communication.customer_id:
+        return
+
+    from activity.models import ActivityHistory
+
+    communication_id = str(communication.id)
+    already_logged = ActivityHistory.objects.filter(
+        customer_id=communication.customer_id,
+        type__in=("email_sent", "sms_sent"),
+        metadata__communication_id=communication_id,
+    ).exists()
+    if already_logged:
+        return
+
+    channel = "Email" if communication.type == "email" else "SMS"
+    recipient = communication.to_address or communication.to_phone or "the customer"
+    ActivityHistory.objects.create(
+        customer_id=communication.customer_id,
+        loan_id=communication.loan_id,
+        type="email_sent" if communication.type == "email" else "sms_sent",
+        title=f"Automated {channel} Sent",
+        description=f"Automation sent {template_name} to {recipient}.",
+        created_by="system",
+        metadata={
+            "actor": "Automation",
+            "automated": True,
+            "template_name": template_name,
+            "communication_id": communication_id,
+            "status": "sent",
+        },
+    )
+
+
 def _workflow_reminder_already_sent_today(loan, template_name: str, today) -> bool:
     return loan.communications.filter(
         direction="outbound",
@@ -153,6 +194,8 @@ def send_email(self, communication_id: str):
         communication.save()
         
         logger.info(f"Email {communication_id} {'sent' if success else 'failed'}")
+        if success:
+            _log_template_send_activity(communication)
         
     except Communication.DoesNotExist:
         logger.error(f"Communication not found: {communication_id}")
@@ -353,6 +396,7 @@ def send_sms(self, communication_id: str):
         update_fields=['status', 'sent_at', 'external_id', 'error_message']
     )
     logger.info('SMS %s sent external_id=%s', communication_id, external_id)
+    _log_template_send_activity(communication)
 
 
 @shared_task

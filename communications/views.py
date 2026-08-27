@@ -71,9 +71,14 @@ class CommunicationViewSet(viewsets.ModelViewSet):
         
         return queryset
 
-    @action(detail=False, methods=['get'])
+    @action(detail=False, methods=['get'], pagination_class=None)
     def history(self, request):
-        """Return latest communication history in the PRD response shape."""
+        """Return this customer's full communication history.
+
+        The customer Comms tab needs every SMS and email (manual and automated),
+        so this action never uses the default 25-row page size. An optional
+        ``limit`` still caps the emails inbox, not the customer tab.
+        """
         queryset = self.get_queryset()
         limit = request.query_params.get('limit')
 

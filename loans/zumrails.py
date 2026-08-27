@@ -490,6 +490,8 @@ def apply_funded_payment_zum_status(
         from activity.services import resolve_funding_failure_alerts
 
         resolve_funding_failure_alerts(funding.loan, reason="funding_completed")
+        if was_incomplete or loan_was_inactive:
+            FundingService._queue_funding_email(funding.loan)
         return funding
 
     if status_value == "Returned":
