@@ -75,7 +75,7 @@ class BankAccount(models.Model):
 
     transit_number = models.CharField(max_length=10, blank=True, null=True)
     institution_number = models.CharField(max_length=10, blank=True, null=True)
-    account_number = models.CharField(max_length=20, blank=True, null=True)
+    account_number = models.CharField(max_length=64, blank=True, null=True)
     # True when staff typed/overrode coordinates from a void cheque (vs Flinks sync).
     is_manual_entry = models.BooleanField(default=False)
 

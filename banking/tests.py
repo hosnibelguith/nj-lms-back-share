@@ -387,6 +387,43 @@ class BankingConnectTests(TestCase):
         self.assertTrue(account.is_payment_blocked)
         self.assertTrue(self.customer_a.banking_verified)
 
+    def test_flinks_persists_account_number_longer_than_twenty_chars(self):
+        long_number = "218122623398012345678901"
+        self.assertGreater(len(long_number), 20)
+        connection = BankConnection.objects.create(
+            customer=self.customer_a,
+            login_id=str(uuid4()),
+            provider="flinks",
+            is_active=True,
+            sync_status="pending",
+        )
+
+        tasks._persist_accounts(
+            connection,
+            self.customer_a,
+            [
+                {
+                    "Id": "acct-long-number",
+                    "Title": "Chequing",
+                    "Type": "Chequing",
+                    "Currency": "CAD",
+                    "InstitutionNumber": "003",
+                    "TransitNumber": "12345",
+                    "AccountNumber": long_number,
+                    "Transactions": [],
+                }
+            ],
+        )
+
+        account = BankAccount.objects.get(
+            connection=connection, external_id="acct-long-number"
+        )
+        self.assertEqual(account.account_number, long_number)
+        self.assertGreaterEqual(
+            BankAccount._meta.get_field("account_number").max_length,
+            len(long_number),
+        )
+
     def test_flinks_authorize_requests_fresh_detail_not_stale_cache(self):
         connection = BankConnection.objects.create(
             customer=self.customer_a,
