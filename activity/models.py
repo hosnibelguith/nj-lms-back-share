@@ -120,7 +120,7 @@ class Comment(models.Model):
         return f"Comment on {self.customer} by {self.created_by}"
     
     def save(self, *args, **kwargs):
-        is_new = self.pk is None
+        is_new = self._state.adding
         super().save(*args, **kwargs)
         
         # Create activity entry for new comments

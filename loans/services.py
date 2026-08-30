@@ -841,10 +841,6 @@ class LoanService:
             raise ValueError('Only collecting loans can record a received payment.')
         if payment_type not in ('manual', 'etransfer'):
             raise ValueError('Payment type must be manual or Interac e-transfer.')
-        if loan.payments.filter(status='pending').exists():
-            raise ValueError(
-                'Cannot record a received payment while a collection is processing.'
-            )
 
         amount = LoanService.money(amount)
         if amount <= 0:

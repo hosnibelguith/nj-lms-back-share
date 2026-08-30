@@ -2193,6 +2193,11 @@ class SettlementService:
             collection.payment.save(update_fields=["status", "processed_at", "reference"])
 
         collection.loan.apply_payment(collection.amount)
+        from .services import LoanService
+
+        # Manual/Interac credits may have shortened the remaining schedule against
+        # the last settled balance while this PAD was still processing.
+        LoanService._trim_scheduled_payments_to_balance(collection.loan)
         log_activity(
             collection.loan,
             "payment_completed",

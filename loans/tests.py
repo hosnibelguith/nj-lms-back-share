@@ -1238,7 +1238,7 @@ class ZumRailsWorkflowTests(APITestCase):
 
         self.assertIn(response.status_code, [400, 403])
         if response.status_code == 400:
-        self.assertIn("schedule_confirmed", response.data)
+            self.assertIn("schedule_confirmed", response.data)
 
     def test_adjust_schedule_reprices_daily_interest_from_selected_terms(self):
         formula = LoanFormula.objects.create(
@@ -4352,7 +4352,12 @@ class PaymentScheduleIntegrityTests(APITestCase):
             {"amount": "10.00", "type": "etransfer"},
             format="json",
         )
-        self.assertEqual(in_flight.status_code, 400, in_flight.data)
+        self.assertEqual(in_flight.status_code, 200, in_flight.data)
+        pending.refresh_from_db()
+        self.assertEqual(pending.status, "pending")
+        self.assertEqual(pending.amount, Decimal("50.00"))
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.balance, Decimal("187.18"))
         pending.delete()
 
         self.loan.status = "stopped"
@@ -4379,6 +4384,53 @@ class PaymentScheduleIntegrityTests(APITestCase):
         self.assertTrue(
             self.loan.payments.filter(type="etransfer", status="completed").exists()
         )
+
+    def test_record_payment_credits_settled_balance_while_collection_processing(self):
+        nsf = self._add_payment("147.18", status="nsf")
+        pending = self._add_payment("147.18", days=14, status="pending")
+        later = self._add_payment("147.18", days=28)
+        self.loan.balance = Decimal("294.36")
+        self.loan.save(update_fields=["balance", "updated_at"])
+        collection = CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=pending,
+            amount=Decimal("147.18"),
+            status="processing",
+            processor_transaction_id="in-flight-pad-1",
+            settlement_due_at=timezone.now() - timedelta(minutes=1),
+            account_snapshot={},
+        )
+
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/record_payment/",
+            {
+                "amount": "100.00",
+                "type": "etransfer",
+                "notes": "Interac received",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        pending.refresh_from_db()
+        collection.refresh_from_db()
+        nsf.refresh_from_db()
+        later.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(pending.status, "pending")
+        self.assertEqual(collection.status, "processing")
+        self.assertEqual(nsf.status, "nsf")
+        self.assertEqual(self.loan.balance, Decimal("194.36"))
+        self.assertEqual(later.amount, Decimal("194.36"))
+
+        SettlementService.complete_if_eligible(collection)
+        collection.refresh_from_db()
+        pending.refresh_from_db()
+        later.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(collection.status, "completed")
+        self.assertEqual(pending.status, "completed")
+        self.assertEqual(self.loan.balance, Decimal("47.18"))
+        self.assertEqual(later.amount, Decimal("47.18"))
 
     def test_nsf_and_past_due_installments_cannot_be_updated(self):
         nsf = self._add_payment("147.18", status="nsf")
