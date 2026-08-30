@@ -500,7 +500,16 @@ class BackendApiWorkflowTests(APITestCase):
         self.assertIsNotNone(self.loan.contract_signed_at)
         self.assertTrue(self.customer.contract_completed)
 
-    def test_loan_workflow_reminders_send_ibv_and_signature_once_per_day(self):
+    @patch("communications.tasks.send_email.delay")
+    @patch("communications.tasks.send_template_message.delay")
+    def test_loan_workflow_reminders_send_ibv_and_signature_once_per_day(
+        self,
+        send_template_delay,
+        _send_email_delay,
+    ):
+        from communications.tasks import send_template_message
+
+        send_template_delay.side_effect = send_template_message
         CommunicationTemplate.objects.create(
             name="IBV Reminder Template",
             type="email",
@@ -541,8 +550,8 @@ class BackendApiWorkflowTests(APITestCase):
         first_result = send_loan_workflow_reminders()
         second_result = send_loan_workflow_reminders()
 
-        self.assertEqual(first_result, {"ibv_sent": 1, "ibv_expired": 0, "signature_sent": 1})
-        self.assertEqual(second_result, {"ibv_sent": 0, "ibv_expired": 0, "signature_sent": 0})
+        self.assertEqual(first_result, {"ibv_sent": 1, "ibv_expired": 0, "signature_sent": 1, "signature_expired": 0})
+        self.assertEqual(second_result, {"ibv_sent": 0, "ibv_expired": 0, "signature_sent": 0, "signature_expired": 0})
         self.assertEqual(
             self.loan.communications.filter(template_name="IBV Reminder Template").count(),
             1,
@@ -554,7 +563,16 @@ class BackendApiWorkflowTests(APITestCase):
             1,
         )
 
-    def test_loan_workflow_reminders_stop_after_max_days(self):
+    @patch("communications.tasks.send_email.delay")
+    @patch("communications.tasks.send_template_message.delay")
+    def test_loan_workflow_reminders_stop_after_max_days(
+        self,
+        send_template_delay,
+        _send_email_delay,
+    ):
+        from communications.tasks import send_template_message
+
+        send_template_delay.side_effect = send_template_message
         CommunicationTemplate.objects.create(
             name="IBV Reminder Template",
             type="email",
@@ -636,7 +654,7 @@ class BackendApiWorkflowTests(APITestCase):
         result = send_loan_workflow_reminders()
 
         self.loan.refresh_from_db()
-        self.assertEqual(result, {"ibv_sent": 0, "ibv_expired": 1, "signature_sent": 0})
+        self.assertEqual(result, {"ibv_sent": 0, "ibv_expired": 1, "signature_sent": 0, "signature_expired": 0})
         self.assertEqual(self.loan.status, "expired")
         self.assertFalse(self.loan.is_active)
         queue_decision_webhook.assert_called_once_with(self.loan, "declined")
@@ -646,7 +664,7 @@ class BackendApiWorkflowTests(APITestCase):
             1,
         )
 
-    def test_signature_reminders_do_not_auto_expire_missing_contract(self):
+    def test_signature_reminders_auto_expire_missing_contract(self):
         CommunicationTemplate.objects.create(
             name="Contract Signature Reminder Template",
             type="email",
@@ -683,9 +701,11 @@ class BackendApiWorkflowTests(APITestCase):
 
         self.loan.refresh_from_db()
         self.assertEqual(result["signature_sent"], 0)
+        self.assertEqual(result["signature_expired"], 1)
         self.assertEqual(result["ibv_expired"], 0)
-        self.assertEqual(self.loan.status, "pending_funding")
-        self.assertTrue(self.loan.is_active)
+        self.assertEqual(self.loan.status, "expired")
+        self.assertFalse(self.loan.is_active)
+        self.assertEqual(self.loan.decline_reason, "expired")
 
 
 class StartNewApplicationTests(APITestCase):

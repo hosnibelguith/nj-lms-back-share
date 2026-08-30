@@ -16,9 +16,26 @@ from .models import CollectionPayment, FundedPayment, Loan, LoanFormula, Payment
 class LoanService:
     """Service class for loan operations."""
 
+    RECEIVED_PAYMENT_MAX_AGE_DAYS = 3
+
     @staticmethod
     def money(value):
         return value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    @staticmethod
+    def normalize_received_payment_date(received_date=None):
+        """Today by default; staff may backdate at most 3 days, never into the future."""
+        today = timezone.localdate()
+        if received_date is None:
+            return today
+        if received_date > today:
+            raise ValueError('Received date cannot be in the future.')
+        earliest = today - timedelta(days=LoanService.RECEIVED_PAYMENT_MAX_AGE_DAYS)
+        if received_date < earliest:
+            raise ValueError(
+                f'Received date cannot be more than {LoanService.RECEIVED_PAYMENT_MAX_AGE_DAYS} days ago.'
+            )
+        return received_date
 
     @staticmethod
     def get_demo_first_payment_date():
@@ -493,18 +510,20 @@ class LoanService:
     @staticmethod
     @transaction.atomic
     def expire_unsigned_contract(loan: Loan, expired_by=None, comment: str = '') -> Loan:
-        """Cancel an Arrive application whose contract was never signed.
+        """Cancel an approved unsigned contract as expired (not a human decline).
 
-        Landing unsigned contracts stay on reminders + staff decline. Missing IBV
-        still auto-expires after the reminder window.
+        Used by staff Cancel and by the 3-day signature reminder job. Landing and
+        Arrive both use status ``expired`` so Deny is not required.
         """
         loan = Loan.objects.select_for_update().select_related('customer').get(pk=loan.pk)
-        if not LoanService._customer_is_arrive(loan.customer):
-            raise ValueError(
-                'Only Arrive applications can be cancelled as expired for a missing contract.'
-            )
         if loan.status not in ('pending_signature', 'pending_funding'):
-            raise ValueError('Only unsigned Arrive contracts can be cancelled as expired.')
+            raise ValueError('Only unsigned approved contracts can be cancelled as expired.')
+        if (
+            loan.status == 'pending_signature'
+            and not loan.approved_at
+            and not LoanService._customer_is_arrive(loan.customer)
+        ):
+            raise ValueError('Only approved unsigned contracts can be cancelled as expired.')
         if loan.contract_signed:
             raise ValueError('This contract is already signed.')
         if loan.funded_payments.filter(status__in=['processing', 'completed']).exists():
@@ -851,7 +870,7 @@ class LoanService:
                 f'Amount cannot exceed the remaining balance of ${balance}.'
             )
 
-        received_date = received_date or timezone.localdate()
+        received_date = LoanService.normalize_received_payment_date(received_date)
         forgive = LoanService._unused_interest_to_forgive(loan, amount)
         payment_notes = notes or ''
         if forgive > 0:
@@ -1189,7 +1208,9 @@ class LoanService:
             raise ValueError(
                 f'Amount cannot exceed the remaining balance of ${balance}.'
             )
-        next_date = received_date or payment.scheduled_date
+        next_date = payment.scheduled_date
+        if received_date is not None and received_date != payment.scheduled_date:
+            next_date = LoanService.normalize_received_payment_date(received_date)
 
         forgive = (
             Decimal('0.00')

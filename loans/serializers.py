@@ -879,16 +879,24 @@ class LoanFundingConfigurationSerializer(serializers.Serializer):
 
 
 class RecordPaymentSerializer(serializers.Serializer):
-    """Record a received Interac or manual payment."""
+    """Record a received Interac payment."""
     amount = serializers.DecimalField(
         max_digits=10,
         decimal_places=2,
         min_value=Decimal('0.01'),
     )
-    type = serializers.ChoiceField(choices=['manual', 'etransfer'], default='manual')
+    type = serializers.ChoiceField(choices=['manual', 'etransfer'], default='etransfer')
     received_date = serializers.DateField(required=False)
     reference = serializers.CharField(required=False, max_length=100, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_received_date(self, value):
+        from .services import LoanService
+
+        try:
+            return LoanService.normalize_received_payment_date(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc))
 
 
 class ApplyRebateSerializer(serializers.Serializer):

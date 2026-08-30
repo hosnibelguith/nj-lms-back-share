@@ -279,6 +279,7 @@ def send_loan_workflow_reminders():
     ibv_sent = 0
     ibv_expired = 0
     signature_sent = 0
+    signature_expired = 0
 
     ibv_loans = Loan.objects.select_related("customer").filter(
         status="ibv_pending",
@@ -308,13 +309,36 @@ def send_loan_workflow_reminders():
         ):
             ibv_sent += 1
 
+    from loans.services import LoanService
+
     signature_loans = Loan.objects.select_related("customer").filter(
-        status="pending_funding",
+        status__in=["pending_signature", "pending_funding"],
         approved_at__isnull=False,
         contract_signed_at__isnull=True,
         is_active=True,
     )
     for loan in signature_loans:
+        max_days = _setting_int(
+            "LOAN_WORKFLOW_REMINDER_MAX_DAYS",
+            getattr(settings, "LOAN_WORKFLOW_REMINDER_MAX_DAYS", 3),
+        )
+        sent_count = loan.communications.filter(
+            direction="outbound",
+            type="email",
+            template_name="Contract Signature Reminder Template",
+        ).count()
+        if sent_count >= max_days:
+            try:
+                LoanService.expire_unsigned_contract(loan)
+            except ValueError:
+                logger.info(
+                    "Unsigned contract not expired loan_id=%s",
+                    loan.id,
+                )
+                continue
+            signature_expired += 1
+            continue
+
         if _queue_workflow_reminder(
             loan,
             "Contract Signature Reminder Template",
@@ -323,7 +347,12 @@ def send_loan_workflow_reminders():
         ):
             signature_sent += 1
 
-    result = {"ibv_sent": ibv_sent, "ibv_expired": ibv_expired, "signature_sent": signature_sent}
+    result = {
+        "ibv_sent": ibv_sent,
+        "ibv_expired": ibv_expired,
+        "signature_sent": signature_sent,
+        "signature_expired": signature_expired,
+    }
     logger.info("Loan workflow reminders queued: %s", result)
     return result
 

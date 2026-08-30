@@ -919,7 +919,24 @@ class ZumRailsWorkflowTests(APITestCase):
             ).exists()
         )
 
-    def test_landing_unsigned_contract_cannot_be_cancelled_as_expired(self):
+    @patch("accounts.arrive_integration.queue_decision_webhook")
+    def test_arrive_unsigned_pending_signature_can_be_cancelled_as_expired(
+        self,
+        queue_decision_webhook,
+    ):
+        loan = self._arrive_unsigned_loan(status="pending_signature")
+        response = self.client.post(
+            f"/api/loans/{loan.id}/expire-unsigned-contract/",
+            {},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        loan.refresh_from_db()
+        self.assertEqual(loan.status, "expired")
+        self.assertFalse(loan.is_active)
+        queue_decision_webhook.assert_called_once_with(loan, "declined")
+
+    def test_landing_unsigned_contract_can_be_cancelled_as_expired(self):
         landing = Loan.objects.create(
             customer=self.customer,
             principal=Decimal("400.00"),
@@ -932,13 +949,39 @@ class ZumRailsWorkflowTests(APITestCase):
         )
         response = self.client.post(
             f"/api/loans/{landing.id}/expire-unsigned-contract/",
+            {"comment": "No signature after three days"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        landing.refresh_from_db()
+        self.assertEqual(landing.status, "expired")
+        self.assertFalse(landing.is_active)
+        self.assertEqual(landing.decline_reason, "expired")
+        self.assertTrue(
+            landing.state_events.filter(
+                event_type="expired",
+                previous_status="pending_funding",
+            ).exists()
+        )
+
+    def test_unapproved_pending_signature_cannot_be_cancelled_as_expired(self):
+        landing = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("400.00"),
+            fee=Decimal("80.00"),
+            total_amount=Decimal("480.00"),
+            balance=Decimal("480.00"),
+            status="pending_signature",
+            is_active=True,
+        )
+        response = self.client.post(
+            f"/api/loans/{landing.id}/expire-unsigned-contract/",
             {},
             format="json",
         )
         self.assertEqual(response.status_code, 400, response.data)
         landing.refresh_from_db()
-        self.assertEqual(landing.status, "pending_funding")
-        self.assertIn("Arrive", response.data["error"])
+        self.assertEqual(landing.status, "pending_signature")
 
     def test_signed_arrive_contract_cannot_be_cancelled_as_expired(self):
         loan = self._arrive_unsigned_loan()
@@ -4177,7 +4220,7 @@ class PaymentScheduleIntegrityTests(APITestCase):
         last = self._add_payment("147.18", days=28)
         self.loan.balance = Decimal("294.36")
         self.loan.save(update_fields=["balance", "updated_at"])
-        received = timezone.localdate() + timedelta(days=7)
+        received = timezone.localdate()
 
         response = self.client.post(
             f"/api/loans/{self.loan.id}/record_payment/",
@@ -4223,6 +4266,62 @@ class PaymentScheduleIntegrityTests(APITestCase):
         self.assertEqual(balances[str(interac.id)], Decimal("194.36"))
         self.assertEqual(balances[str(scheduled[0].id)], Decimal("47.18"))
         self.assertEqual(balances[str(scheduled[1].id)], Decimal("0.00"))
+
+    def test_record_payment_received_date_must_be_today_or_up_to_three_days_ago(self):
+        self._add_payment("147.18")
+        self.loan.balance = Decimal("147.18")
+        self.loan.save(update_fields=["balance", "updated_at"])
+        today = timezone.localdate()
+
+        future = self.client.post(
+            f"/api/loans/{self.loan.id}/record_payment/",
+            {
+                "amount": "10.00",
+                "type": "etransfer",
+                "received_date": (today + timedelta(days=1)).isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(future.status_code, 400, future.data)
+
+        too_old = self.client.post(
+            f"/api/loans/{self.loan.id}/record_payment/",
+            {
+                "amount": "10.00",
+                "type": "etransfer",
+                "received_date": (today - timedelta(days=4)).isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(too_old.status_code, 400, too_old.data)
+
+        allowed = self.client.post(
+            f"/api/loans/{self.loan.id}/record_payment/",
+            {
+                "amount": "10.00",
+                "type": "etransfer",
+                "received_date": (today - timedelta(days=3)).isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(allowed.status_code, 200, allowed.data)
+        interac = self.loan.payments.get(type="etransfer", status="completed")
+        self.assertEqual(interac.scheduled_date, today - timedelta(days=3))
+
+    def test_normalize_received_payment_date_window(self):
+        from loans.services import LoanService
+
+        today = timezone.localdate()
+        self.assertEqual(LoanService.normalize_received_payment_date(None), today)
+        self.assertEqual(LoanService.normalize_received_payment_date(today), today)
+        self.assertEqual(
+            LoanService.normalize_received_payment_date(today - timedelta(days=3)),
+            today - timedelta(days=3),
+        )
+        with self.assertRaises(ValueError):
+            LoanService.normalize_received_payment_date(today + timedelta(days=1))
+        with self.assertRaises(ValueError):
+            LoanService.normalize_received_payment_date(today - timedelta(days=4))
 
     def test_apply_nsf_rebate_reduces_balance_and_shortens_schedule(self):
         nsf = self._add_payment("147.18", status="nsf")
@@ -4475,7 +4574,7 @@ class PaymentScheduleIntegrityTests(APITestCase):
         last = self._add_payment("147.18", days=28)
         self.loan.balance = Decimal("294.36")
         self.loan.save(update_fields=["balance", "updated_at"])
-        received = timezone.localdate() + timedelta(days=7)
+        received = timezone.localdate()
 
         recorded = self.client.post(
             f"/api/loans/{self.loan.id}/record_payment/",
