@@ -73,6 +73,7 @@ class CollectionPolicyTests(APITestCase):
     def test_classifies_stop_payment_and_nsf_reasons(self):
         self.assertEqual(classify_failure_reason("EftFailedStopPayment"), "stop_payment")
         self.assertEqual(classify_failure_reason("EftFailedInsufficientFunds"), "nsf")
+        self.assertEqual(classify_failure_reason("Non-sufficient funds"), "nsf")
         self.assertEqual(classify_failure_reason("EftFailedAccountClosed"), "account_closed")
         self.assertEqual(classify_failure_reason("EftFailedNoDebitAllowed"), "account_closed")
         self.assertEqual(classify_failure_reason("EftFailedFrozenAccount"), "account_closed")

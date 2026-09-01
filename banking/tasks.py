@@ -141,23 +141,191 @@ def _poll_get_accounts_detail_async(instance, customer_id, request_id, headers):
     return None
 
 
+def _clean_identity_text(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    return None
+
+
+def _clean_identity_email(value):
+    text = _clean_identity_text(value)
+    if text and '@' in text:
+        return text
+    return None
+
+
+def _holder_email(holder):
+    if not isinstance(holder, dict):
+        return None
+    email = _clean_identity_email(holder.get('Email') or holder.get('email'))
+    if email:
+        return email
+    emails = holder.get('Emails') or holder.get('emails') or []
+    if isinstance(emails, str):
+        return _clean_identity_email(emails)
+    if isinstance(emails, list):
+        for item in emails:
+            if isinstance(item, str):
+                email = _clean_identity_email(item)
+            elif isinstance(item, dict):
+                email = _clean_identity_email(
+                    item.get('Email')
+                    or item.get('email')
+                    or item.get('Address')
+                    or item.get('Value')
+                )
+            else:
+                email = None
+            if email:
+                return email
+    return None
+
+
+def _holder_name(holder):
+    if not isinstance(holder, dict):
+        return None
+    name = _clean_identity_text(
+        holder.get('Name')
+        or holder.get('name')
+        or holder.get('FullName')
+        or holder.get('full_name')
+    )
+    if name:
+        return name
+    first = _clean_identity_text(holder.get('FirstName') or holder.get('first_name')) or ''
+    last = _clean_identity_text(holder.get('LastName') or holder.get('last_name')) or ''
+    combined = f'{first} {last}'.strip()
+    return combined or None
+
+
+def _holder_phone(holder):
+    if not isinstance(holder, dict):
+        return None
+    return _clean_identity_text(
+        holder.get('PhoneNumber')
+        or holder.get('phone_number')
+        or holder.get('Phone')
+        or holder.get('phone')
+    )
+
+
 def _extract_holder_identity(accounts_data):
     flinks_email = None
     flinks_phone = None
     flinks_name = None
 
-    for acc in accounts_data:
-        holder = acc.get('Holder') or {}
-        if not flinks_name and holder.get('Name'):
-            flinks_name = holder.get('Name')
-        if not flinks_email and holder.get('Email'):
-            flinks_email = holder.get('Email')
-        if not flinks_phone and holder.get('PhoneNumber'):
-            flinks_phone = holder.get('PhoneNumber')
+    for acc in accounts_data or []:
+        holder = acc.get('Holder') or acc.get('holder') or {}
+        if not flinks_name:
+            flinks_name = _holder_name(holder)
+        if not flinks_email:
+            flinks_email = _holder_email(holder)
+        if not flinks_phone:
+            flinks_phone = _holder_phone(holder)
         if flinks_email and flinks_phone and flinks_name:
             break
 
     return flinks_email, flinks_phone, flinks_name
+
+
+def _identity_from_mapping(data):
+    if not isinstance(data, dict):
+        return None, None, None
+    email = _clean_identity_email(
+        data.get('flinks_email')
+        or data.get('ibv_email')
+        or data.get('holder_email')
+        or data.get('Email')
+    )
+    name = _clean_identity_text(
+        data.get('flinks_name')
+        or data.get('ibv_name')
+        or data.get('holder_name')
+        or data.get('account_holder')
+        or data.get('account_holder_name')
+        or data.get('Name')
+        or data.get('FullName')
+    )
+    phone = _holder_phone(data)
+    nested_holder = data.get('Holder') or data.get('holder') or data.get('kyc')
+    if isinstance(nested_holder, dict):
+        email = email or _holder_email(nested_holder)
+        name = name or _holder_name(nested_holder)
+        phone = phone or _holder_phone(nested_holder)
+    return email, phone, name
+
+
+def extract_identity_from_analysis_payload(payload):
+    """Flinks / Mohawk analysis identity — not the application email."""
+    if not isinstance(payload, dict):
+        return None, None, None
+    email = phone = name = None
+    sources = [
+        payload,
+        payload.get('client'),
+        payload.get('holder'),
+        payload.get('kyc'),
+        payload.get('report') if isinstance(payload.get('report'), dict) else None,
+        (payload.get('report') or {}).get('client')
+        if isinstance(payload.get('report'), dict)
+        else None,
+        payload.get('primary_bank_account'),
+        (payload.get('primary_bank_account') or {}).get('holder')
+        if isinstance(payload.get('primary_bank_account'), dict)
+        else None,
+    ]
+    for source in sources:
+        next_email, next_phone, next_name = _identity_from_mapping(source)
+        email = email or next_email
+        phone = phone or next_phone
+        name = name or next_name
+        if email and name:
+            break
+    accounts = payload.get('Accounts') or payload.get('accounts') or []
+    if isinstance(accounts, list) and (not email or not name):
+        acc_email, acc_phone, acc_name = _extract_holder_identity(accounts)
+        email = email or acc_email
+        phone = phone or acc_phone
+        name = name or acc_name
+    return email, phone, name
+
+
+def portal_missing_flinks_identity(customer) -> bool:
+    user = getattr(customer, 'portal_user', None)
+    if user is None:
+        return True
+    has_email = bool((user.flinks_email or '').strip())
+    has_name = bool((user.flinks_name or '').strip())
+    return not (has_email or has_name)
+
+
+def apply_portal_flinks_identity(
+    customer,
+    flinks_email=None,
+    flinks_phone=None,
+    flinks_name=None,
+) -> bool:
+    portal_user = getattr(customer, 'portal_user', None)
+    if portal_user is None:
+        return False
+    update_fields = []
+    if flinks_email and not (portal_user.flinks_email or '').strip():
+        portal_user.flinks_email = flinks_email
+        update_fields.append('flinks_email')
+    if flinks_phone and not (portal_user.flinks_phone or '').strip():
+        portal_user.flinks_phone = flinks_phone
+        update_fields.append('flinks_phone')
+    if flinks_name and not (portal_user.flinks_name or '').strip():
+        portal_user.flinks_name = flinks_name
+        update_fields.append('flinks_name')
+    if not update_fields:
+        return False
+    update_fields.append('updated_at')
+    portal_user.save(update_fields=update_fields)
+    return True
 
 
 def _count_transactions(accounts_data):
@@ -189,6 +357,19 @@ def _log_banking_failure(customer, title, description, metadata=None):
 
 
 def _mark_banking_failed(connection, customer, reason):
+    if customer.banking_verified:
+        logger.warning(
+            'Flinks sync failed after IBV already complete; leaving verified '
+            'customer_id=%s connection_id=%s reason=%s',
+            customer.id,
+            connection.id,
+            reason,
+        )
+        connection.sync_status = 'synced'
+        connection.sync_error = (reason or '')[:2000]
+        connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
+        return False
+
     logger.warning(
         'Flinks sync marking failed customer_id=%s connection_id=%s login_id=%s reason=%s',
         customer.id,
@@ -313,6 +494,20 @@ def _mark_awaiting_flinks_webhook(connection, reason: str) -> None:
     message = (
         f'Flinks pull timed out; awaiting GetAccountsDetail webhook. ({reason})'
     )[:2000]
+    customer = getattr(connection, 'customer', None)
+    if customer is not None and customer.banking_verified:
+        connection.sync_status = 'synced'
+        connection.sync_error = message
+        connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
+        logger.warning(
+            'Flinks identity backfill timed out; IBV stays verified '
+            'customer_id=%s connection_id=%s login_id=%s reason=%s',
+            connection.customer_id,
+            connection.id,
+            mask_identifier(connection.login_id),
+            reason,
+        )
+        return
     connection.sync_status = 'pending'
     connection.sync_error = message
     connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
@@ -354,6 +549,7 @@ def _try_complete_ibv_from_mohawk_event(connection) -> bool:
         connection,
         primary=primary,
         source_transactions=txs,
+        identity_payload=event.raw_payload or {},
     )
 
 
@@ -483,14 +679,50 @@ def _handle_flinks_transport_error(
 def apply_flinks_accounts_detail(connection, accounts_json) -> bool:
     """Persist a GetAccountsDetail-shaped payload (API pull or Flinks webhook)."""
     customer = connection.customer
+    already_verified = bool(customer.banking_verified)
     accounts_data = (accounts_json or {}).get('Accounts') or []
+    flinks_email, flinks_phone, flinks_name = _extract_holder_identity(accounts_data)
+    if flinks_email or flinks_phone or flinks_name:
+        apply_portal_flinks_identity(
+            customer,
+            flinks_email=flinks_email,
+            flinks_phone=flinks_phone,
+            flinks_name=flinks_name,
+        )
     if not accounts_data:
+        if already_verified:
+            return bool(flinks_email or flinks_name)
         return _mark_banking_failed(connection, customer, NO_ACCOUNTS_MESSAGE)
 
     if _count_transactions(accounts_data) == 0:
+        if already_verified:
+            _persist_accounts(connection, customer, accounts_data)
+            return True
         return _mark_banking_failed(connection, customer, ZERO_TRANSACTIONS_MESSAGE)
 
-    flinks_email, flinks_phone, flinks_name = _extract_holder_identity(accounts_data)
+    if already_verified:
+        _persist_accounts(connection, customer, accounts_data)
+        apply_portal_flinks_identity(
+            customer,
+            flinks_email=flinks_email,
+            flinks_phone=flinks_phone,
+            flinks_name=flinks_name,
+        )
+        connection.last_synced_at = now()
+        connection.sync_status = 'synced'
+        connection.sync_error = None
+        connection.is_active = True
+        connection.save(
+            update_fields=[
+                'last_synced_at',
+                'sync_status',
+                'sync_error',
+                'is_active',
+                'updated_at',
+            ]
+        )
+        return True
+
     _persist_accounts(connection, customer, accounts_data)
     return _mark_banking_success(connection, customer, flinks_email, flinks_phone, flinks_name)
 
@@ -501,9 +733,11 @@ def pending_ibv_repull_targets(*, since=None, customer_id=None, include_syncing=
     Includes Arrive and landing-page customers — source is not filtered.
     Arrive is only the embed channel; GAD still uses the stored Flinks LoginId.
 
-    Includes failed / pending (and inactive post-reapply) connections. Skips
-    verified+synced and manual void-cheque rows. Currently ``syncing`` rows are
-    skipped unless ``include_syncing`` so we do not double-queue a live pull.
+    Includes failed / pending (and inactive post-reapply) connections, plus
+    verified files that never received Flinks holder email/name (Arrive IBV
+    completed from Mohawk analysis). Skips verified files that already have
+    IBV identity. Skips manual void-cheque rows. Currently ``syncing`` rows
+    are skipped unless ``include_syncing`` so we do not double-queue a live pull.
     """
     from django.db.models import Exists, OuterRef, Q
     from loans.models import Loan
@@ -512,12 +746,22 @@ def pending_ibv_repull_targets(*, since=None, customer_id=None, include_syncing=
         customer_id=OuterRef('customer_id'),
         status='ibv_pending',
     )
+    missing_identity = (
+        Q(customer__portal_user__isnull=True)
+        | (
+            (Q(customer__portal_user__flinks_email__isnull=True) | Q(customer__portal_user__flinks_email=''))
+            & (Q(customer__portal_user__flinks_name__isnull=True) | Q(customer__portal_user__flinks_name=''))
+        )
+    )
     qs = (
-        BankConnection.objects.select_related('customer')
+        BankConnection.objects.select_related('customer', 'customer__portal_user')
         .filter(provider='flinks')
         .exclude(login_id='')
-        .filter(Q(customer__banking_verified=False) | Exists(pending_loan))
-        .exclude(customer__banking_verified=True, sync_status='synced')
+        .filter(
+            Q(customer__banking_verified=False)
+            | Exists(pending_loan)
+            | (Q(customer__banking_verified=True) & missing_identity)
+        )
     )
     if customer_id:
         qs = qs.filter(customer_id=customer_id)
@@ -557,7 +801,12 @@ def queue_flinks_gad_repull(
         raise ValueError('Connection has no Flinks LoginId to re-pull.')
 
     customer = connection.customer
-    if customer.banking_verified and connection.sync_status == 'synced':
+    missing_identity = portal_missing_flinks_identity(customer)
+    if (
+        customer.banking_verified
+        and connection.sync_status == 'synced'
+        and not missing_identity
+    ):
         raise ValueError(
             'Banking is already verified; GetAccountsDetail re-pull is not needed.'
         )

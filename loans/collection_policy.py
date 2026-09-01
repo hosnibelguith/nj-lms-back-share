@@ -58,7 +58,11 @@ def classify_failure_reason(reason: str | None) -> str:
         return 'account_closed'
     if 'stoppayment' in compact or 'stop pay' in text:
         return 'stop_payment'
-    if 'nsf' in compact or 'insufficient' in compact:
+    if (
+        'nsf' in compact
+        or 'insufficient' in compact
+        or 'nonsufficient' in compact
+    ):
         return 'nsf'
     return 'other'
 

@@ -151,7 +151,13 @@ def _apply_primary_eft_account(connection: BankConnection, primary: dict):
     return account
 
 
-def _complete_ibv_from_mohawk_analysis(connection, *, primary: dict, source_transactions) -> bool:
+def _complete_ibv_from_mohawk_analysis(
+    connection,
+    *,
+    primary: dict,
+    source_transactions,
+    identity_payload=None,
+) -> bool:
     """Advance stuck IBV when Mohawk analysis proves banking data exists.
 
     Flinks toolbox / Mohawk can finish while LMS Celery sync still failed
@@ -167,10 +173,29 @@ def _complete_ibv_from_mohawk_analysis(connection, *, primary: dict, source_tran
     if not (has_coords or has_txs or has_accounts):
         return False
 
+    from banking.tasks import (
+        apply_portal_flinks_identity,
+        extract_identity_from_analysis_payload,
+    )
+
     customer = connection.customer
+    flinks_email, flinks_phone, flinks_name = extract_identity_from_analysis_payload(
+        identity_payload if isinstance(identity_payload, dict) else {}
+    )
+    if not (flinks_email or flinks_name):
+        flinks_email, flinks_phone, flinks_name = extract_identity_from_analysis_payload(
+            primary if isinstance(primary, dict) else {}
+        )
+    apply_portal_flinks_identity(
+        customer,
+        flinks_email=flinks_email,
+        flinks_phone=flinks_phone,
+        flinks_name=flinks_name,
+    )
+
     pending_loans = list(customer.loans.filter(status='ibv_pending'))
     if customer.banking_verified and not pending_loans:
-        return False
+        return bool(flinks_email or flinks_name)
 
     from loans.services import LoanService
 
@@ -240,6 +265,17 @@ def process_banking_analysis_payload(payload: dict):
             mask_identifier(existing.login_id),
             existing.tag,
         )
+        if existing.connection_id:
+            _complete_ibv_from_mohawk_analysis(
+                existing.connection,
+                primary=existing.primary_bank_account
+                if isinstance(existing.primary_bank_account, dict)
+                else {},
+                source_transactions=existing.source_transactions
+                if isinstance(existing.source_transactions, list)
+                else [],
+                identity_payload=existing.raw_payload or payload,
+            )
         return existing, True
 
     login_id = payload.get('login_id')
@@ -255,7 +291,7 @@ def process_banking_analysis_payload(payload: dict):
     connection = None
     if login_id:
         connection = (
-            BankConnection.objects.select_related('customer')
+            BankConnection.objects.select_related('customer', 'customer__portal_user')
             .filter(login_id=login_id)
             .order_by('-is_active', '-created_at')
             .first()
@@ -352,6 +388,7 @@ def process_banking_analysis_payload(payload: dict):
             connection,
             primary=primary,
             source_transactions=event.source_transactions,
+            identity_payload=payload,
         )
 
     return event, False

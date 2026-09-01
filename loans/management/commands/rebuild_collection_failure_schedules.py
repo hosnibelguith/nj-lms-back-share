@@ -46,6 +46,7 @@ class Command(BaseCommand):
                         collection_payments__status__in=["failed", "returned"],
                         collection_payments__payment__status__in=["failed", "nsf"],
                     )
+                    | models.Q(payments__status__in=["failed", "nsf"])
                 )
                 .distinct()
                 .order_by("created_at", "id")
@@ -57,6 +58,8 @@ class Command(BaseCommand):
 
         changed = 0
         for loan in loans:
+            if not dry_run:
+                LoanService.ensure_failed_collections_for_missed_payments(loan)
             plan = LoanService.rebuild_collection_failure_schedule(
                 loan,
                 dry_run=dry_run,

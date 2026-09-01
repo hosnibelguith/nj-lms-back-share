@@ -1444,7 +1444,28 @@ class PaymentViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def nsf(self, request, pk=None):
         payment = self.get_object()
-        payment.mark_nsf()
+        processing = payment.collection_attempts.filter(status='processing').first()
+        if processing:
+            from .zumrails import apply_collection_failure
+
+            apply_collection_failure(
+                processing,
+                reason=(
+                    request.data.get('reason')
+                    or processing.failure_reason
+                    or payment.failure_reason
+                    or 'Non-sufficient funds'
+                ),
+                status='failed',
+            )
+        else:
+            if payment.status not in ('failed', 'nsf', 'cancelled'):
+                payment.mark_nsf()
+            LoanService.apply_missing_collection_failure_fees(
+                payment.loan,
+                create_missing_collections=True,
+            )
+        payment.refresh_from_db()
         return Response(PaymentSerializer(payment).data)
 
 

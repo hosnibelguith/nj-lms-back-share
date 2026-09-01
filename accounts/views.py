@@ -361,11 +361,31 @@ class CustomerViewSet(viewsets.ModelViewSet):
     def loans(self, request, pk=None):
         customer = self.get_object()
         from loans.serializers import CustomerLoanDetailSerializer
-        loans = (
+        from loans.services import LoanService
+
+        loans = list(
             customer.loans.select_related('formula')
-            .prefetch_related('payments')
+            .prefetch_related('payments', 'collection_payments')
             .order_by('-created_at')
         )
+        healed = False
+        for loan in loans:
+            applied_ids = LoanService._applied_collection_failure_ids(loan)
+            missing = any(
+                str(collection.id) not in applied_ids
+                for collection in loan.collection_payments.all()
+                if collection.status in ('failed', 'returned', 'rejected')
+            )
+            if not missing:
+                continue
+            if LoanService.apply_missing_collection_failure_fees(loan):
+                healed = True
+        if healed:
+            loans = list(
+                customer.loans.select_related('formula')
+                .prefetch_related('payments', 'collection_payments')
+                .order_by('-created_at')
+            )
         serializer = CustomerLoanDetailSerializer(loans, many=True)
         return Response(serializer.data)
 

@@ -3340,6 +3340,69 @@ class LoanService:
             loan.mark_defaulted(notes=f'In collections: {failure_reason or "missed payment"}')
 
         return fee_payment
+
+    @staticmethod
+    def _applied_collection_failure_ids(loan: Loan) -> set[str]:
+        ids = set()
+        for payment in loan.payments.exclude(status='cancelled'):
+            ids.update(LoanService._collection_failure_ids_from_payment(payment))
+        return ids
+
+    @staticmethod
+    def ensure_failed_collections_for_missed_payments(loan: Loan) -> list:
+        """Create local failed collections for NSF/failed rows that have none."""
+        created = []
+        for payment in loan.payments.filter(
+            status__in=['failed', 'nsf']
+        ).order_by('scheduled_date', 'created_at', 'id'):
+            if payment.collection_attempts.exists():
+                continue
+            created.append(
+                CollectionPayment.objects.create(
+                    loan=loan,
+                    payment=payment,
+                    amount=payment.amount or Decimal('0.00'),
+                    status='failed',
+                    failure_reason=payment.failure_reason or 'Non-sufficient funds',
+                    returned_at=timezone.now(),
+                )
+            )
+        return created
+
+    @staticmethod
+    @transaction.atomic
+    def apply_missing_collection_failure_fees(
+        loan: Loan,
+        *,
+        create_missing_collections: bool = False,
+    ) -> list:
+        """Apply $50 NSF extras for returned collections that never received them."""
+        loan = Loan.objects.select_for_update().get(pk=loan.pk)
+        if create_missing_collections:
+            LoanService.ensure_failed_collections_for_missed_payments(loan)
+        applied_ids = LoanService._applied_collection_failure_ids(loan)
+        applied = []
+        collections = list(
+            loan.collection_payments.filter(
+                status__in=['failed', 'returned', 'rejected']
+            ).select_related('payment').order_by(
+                'payment__scheduled_date',
+                'initiated_at',
+                'created_at',
+                'id',
+            )
+        )
+        for collection in collections:
+            if str(collection.id) in applied_ids:
+                continue
+            LoanService.apply_collection_failure_fee(
+                collection,
+                reason=collection.failure_reason or '',
+            )
+            applied.append(collection)
+            applied_ids.update(LoanService._applied_collection_failure_ids(loan))
+        return applied
+
     @staticmethod
     @transaction.atomic
     def mark_deferral_fee_paid(

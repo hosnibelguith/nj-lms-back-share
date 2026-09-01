@@ -1093,6 +1093,195 @@ class MohawkAnalysisIbvHealTests(TestCase):
                 metadata__source='mohawk_banking_analysis',
             ).exists()
         )
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.flinks_email)
+        self.assertFalse(self.user.flinks_name)
+
+    def test_mohawk_analysis_saves_flinks_holder_identity(self):
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay'):
+            response = self.client.post(
+                '/api/integrations/mohawk/banking-analysis/',
+                {
+                    'schema_version': '1.0',
+                    'event': 'banking_analysis.completed',
+                    'event_id': 'adolfo-ibv-identity-1',
+                    'login_id': self.login_id,
+                    'tag': 'Mohawk',
+                    'holder': {
+                        'Name': 'ADOLFO CUEVAS',
+                        'Email': 'adcuevasrios@gmail.com',
+                    },
+                    'primary_bank_account': {
+                        'institution_number': '002',
+                        'transit_number': '20081',
+                        'account_number': '1110586',
+                        'holder_name': 'ADOLFO CUEVAS',
+                    },
+                    'source_transactions': [{'Id': 'tx-1'}],
+                    'report': {},
+                    'final_report_text': 'review',
+                },
+                format='json',
+                HTTP_AUTHORIZATION='Token test-mohawk-key',
+            )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.flinks_name, 'ADOLFO CUEVAS')
+        self.assertEqual(self.user.flinks_email, 'adcuevasrios@gmail.com')
+
+    def test_mohawk_analysis_backfills_identity_when_already_verified(self):
+        self.customer.banking_verified = True
+        self.customer.onboarding_stage = 'contract'
+        self.customer.save(
+            update_fields=['banking_verified', 'onboarding_stage', 'updated_at']
+        )
+        self.connection.sync_status = 'synced'
+        self.connection.save(update_fields=['sync_status', 'updated_at'])
+        self.loan.status = 'pending_signature'
+        self.loan.save(update_fields=['status', 'updated_at'])
+
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            response = self.client.post(
+                '/api/integrations/mohawk/banking-analysis/',
+                {
+                    'schema_version': '1.0',
+                    'event': 'banking_analysis.completed',
+                    'event_id': 'arrive-identity-backfill-1',
+                    'login_id': self.login_id,
+                    'tag': 'Mohawk',
+                    'holder': {
+                        'Name': 'ADOLFO CUEVAS',
+                        'Email': 'adcuevasrios@gmail.com',
+                    },
+                    'primary_bank_account': {
+                        'institution_number': '002',
+                        'transit_number': '20081',
+                        'account_number': '1110586',
+                    },
+                    'source_transactions': [{'Id': 'tx-1'}],
+                    'report': {},
+                    'final_report_text': 'review',
+                },
+                format='json',
+                HTTP_AUTHORIZATION='Token test-mohawk-key',
+            )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.user.refresh_from_db()
+        self.customer.refresh_from_db()
+        self.assertEqual(self.user.flinks_name, 'ADOLFO CUEVAS')
+        self.assertEqual(self.user.flinks_email, 'adcuevasrios@gmail.com')
+        self.assertTrue(self.customer.banking_verified)
+        mocked.assert_not_called()
+
+
+class FlinksHolderIdentityTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email='holder-id@example.com',
+            password='password123',
+            full_name='Holder Customer',
+            user_type='customer',
+        )
+        self.customer = Customer.objects.create(
+            portal_user=self.user,
+            first_name='Holder',
+            last_name='Customer',
+            email='holder-id@example.com',
+            phone='4165550499',
+            phone_normalized='4165550499',
+            province='ON',
+            status='pending',
+            onboarding_stage='banking_verification',
+            banking_verified=False,
+        )
+        self.connection = BankConnection.objects.create(
+            customer=self.customer,
+            login_id=str(uuid4()),
+            provider='flinks',
+            is_active=True,
+            sync_status='pending',
+        )
+
+    def test_extracts_emails_list_and_first_last_name(self):
+        email, phone, name = tasks._extract_holder_identity(
+            [
+                {
+                    'Holder': {
+                        'FirstName': 'Jacob',
+                        'LastName': 'Boos',
+                        'Emails': [{'Address': 'boosevolutionltd@gmail.com'}],
+                        'PhoneNumber': '4033970975',
+                    },
+                    'Transactions': [{'Id': 'tx-1'}],
+                }
+            ]
+        )
+        self.assertEqual(email, 'boosevolutionltd@gmail.com')
+        self.assertEqual(name, 'Jacob Boos')
+        self.assertEqual(phone, '4033970975')
+
+    def test_gad_after_verified_saves_identity_without_unverify(self):
+        self.customer.banking_verified = True
+        self.customer.save(update_fields=['banking_verified', 'updated_at'])
+        self.connection.sync_status = 'synced'
+        self.connection.save(update_fields=['sync_status', 'updated_at'])
+
+        ok = tasks.apply_flinks_accounts_detail(
+            self.connection,
+            {
+                'Accounts': [
+                    {
+                        'Id': 'acct-arrive-1',
+                        'Title': 'Preferred Package',
+                        'Type': 'Chequing',
+                        'Currency': 'CAD',
+                        'InstitutionNumber': '002',
+                        'TransitNumber': '20081',
+                        'AccountNumber': '1110586',
+                        'Holder': {
+                            'Name': 'ADOLFO CUEVAS',
+                            'Email': 'adcuevasrios@gmail.com',
+                        },
+                        'Transactions': [],
+                    }
+                ]
+            },
+        )
+        self.assertTrue(ok)
+        self.customer.refresh_from_db()
+        self.user.refresh_from_db()
+        self.connection.refresh_from_db()
+        self.assertTrue(self.customer.banking_verified)
+        self.assertEqual(self.connection.sync_status, 'synced')
+        self.assertEqual(self.user.flinks_name, 'ADOLFO CUEVAS')
+        self.assertEqual(self.user.flinks_email, 'adcuevasrios@gmail.com')
+        self.assertTrue(
+            BankAccount.objects.filter(
+                customer=self.customer, external_id='acct-arrive-1'
+            ).exists()
+        )
+
+    def test_gad_zero_transactions_still_fails_unverified_ibv(self):
+        with patch('banking.tasks.send_banking_retry_email.delay'):
+            ok = tasks.apply_flinks_accounts_detail(
+                self.connection,
+                {
+                    'Accounts': [
+                        {
+                            'Id': 'acct-empty',
+                            'Title': 'Chequing',
+                            'Type': 'Chequing',
+                            'Holder': {'Name': 'No Tx'},
+                            'Transactions': [],
+                        }
+                    ]
+                },
+            )
+        self.assertFalse(ok)
+        self.customer.refresh_from_db()
+        self.assertFalse(self.customer.banking_verified)
+        self.connection.refresh_from_db()
+        self.assertEqual(self.connection.sync_status, 'failed')
 
 
 @override_settings(
@@ -1198,6 +1387,9 @@ class FlinksWebhookAndTimeoutTests(TestCase):
             BankTransaction.objects.filter(customer=self.customer).count(),
             1,
         )
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.flinks_email, 'flinks-webhook@example.com')
+        self.assertEqual(self.user.flinks_name, 'Webhook Customer')
 
     def test_flinks_kyc_webhook_is_ignored(self):
         response = self.client.post(
@@ -1458,6 +1650,9 @@ class FlinksGadRepullTests(TestCase):
     def test_staff_repull_rejected_when_already_verified(self):
         self.customer.banking_verified = True
         self.customer.save(update_fields=['banking_verified', 'updated_at'])
+        self.customer_user.flinks_email = 'already-have@example.com'
+        self.customer_user.flinks_name = 'GAD Customer'
+        self.customer_user.save(update_fields=['flinks_email', 'flinks_name', 'updated_at'])
         self.connection.sync_status = 'synced'
         self.connection.sync_error = None
         self.connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
@@ -1471,6 +1666,23 @@ class FlinksGadRepullTests(TestCase):
             )
         self.assertEqual(response.status_code, 400)
         mocked.assert_not_called()
+
+    def test_staff_repull_allowed_when_verified_missing_flinks_identity(self):
+        self.customer.banking_verified = True
+        self.customer.save(update_fields=['banking_verified', 'updated_at'])
+        self.connection.sync_status = 'synced'
+        self.connection.sync_error = None
+        self.connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
+
+        self.client.force_authenticate(user=self.staff)
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            response = self.client.post(
+                f'/api/bank-connections/{self.connection.id}/repull/',
+                {},
+                format='json',
+            )
+        self.assertEqual(response.status_code, 200, response.data)
+        mocked.assert_called_once_with(str(self.connection.id))
 
     def test_portal_retry_sync_queues_gad(self):
         self.client.force_authenticate(user=self.customer_user)
@@ -1564,7 +1776,7 @@ class FlinksGadRepullTests(TestCase):
 
 @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
 class RepullPendingIbvCommandTests(TestCase):
-    """Ops command / script only queues stuck Flinks IBV — never verified+synced."""
+    """Ops command queues stuck Flinks IBV, plus verified files missing IBV identity."""
 
     def setUp(self):
         from loans.models import Loan
@@ -1643,6 +1855,9 @@ class RepullPendingIbvCommandTests(TestCase):
     def test_skips_verified_synced_connection(self):
         self.customer.banking_verified = True
         self.customer.save(update_fields=['banking_verified', 'updated_at'])
+        self.user.flinks_email = 'already-have@example.com'
+        self.user.flinks_name = 'Stuck IBV'
+        self.user.save(update_fields=['flinks_email', 'flinks_name', 'updated_at'])
         self.connection.sync_status = 'synced'
         self.connection.sync_error = None
         self.connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
@@ -1652,6 +1867,19 @@ class RepullPendingIbvCommandTests(TestCase):
         with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
             call_command('repull_pending_ibv', apply=True, stdout=StringIO())
         mocked.assert_not_called()
+
+    def test_includes_verified_synced_missing_flinks_identity(self):
+        self.customer.banking_verified = True
+        self.customer.save(update_fields=['banking_verified', 'updated_at'])
+        self.connection.sync_status = 'synced'
+        self.connection.sync_error = None
+        self.connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
+        self.loan.status = 'pending_signature'
+        self.loan.save(update_fields=['status', 'updated_at'])
+
+        with patch('banking.tasks.fetch_flinks_accounts_only.delay') as mocked:
+            call_command('repull_pending_ibv', apply=True, stdout=StringIO())
+        mocked.assert_called_once_with(str(self.connection.id))
 
     def test_skips_manual_connection(self):
         self.connection.provider = 'manual'

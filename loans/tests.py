@@ -400,6 +400,36 @@ class CollectionExportTests(APITestCase):
         self.assertEqual(collection.status, "returned")
         self.assertIsNotNone(collection.returned_at)
 
+    def test_apply_collection_failure_marks_nsf_for_non_sufficient_funds(self):
+        from loans.zumrails import apply_collection_failure
+
+        missed = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("175.25"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+        )
+        collection = CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=missed,
+            amount=missed.amount,
+            status="processing",
+        )
+        apply_collection_failure(
+            collection,
+            reason="Non-sufficient funds",
+            status="failed",
+        )
+        missed.refresh_from_db()
+        self.assertEqual(missed.status, "nsf")
+        self.assertEqual(missed.failure_reason, "Non-sufficient funds")
+        self.assertTrue(
+            self.loan.payments.filter(
+                notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+                notes__contains=f"Collection failure id: {collection.id}",
+            ).exists()
+        )
+
     def test_returned_collections_includes_processing_with_zum_failed_status(self):
         missed_at = timezone.now() - timedelta(days=11)
         hidden_processing = CollectionPayment.objects.create(
@@ -4106,6 +4136,138 @@ class PaymentScheduleIntegrityTests(APITestCase):
         self.assertEqual(fee.amount, leftover)
         self.assertEqual(self.loan.balance, Decimal("746.80"))
         self.assertEqual(self.loan.total_amount, Decimal("923.41"))
+
+    def test_collections_nsf_rows_get_missing_fifty_dollar_fees(self):
+        """In-collections NSF history without extras gets $50 NSF + remainder fill."""
+        first = self._add_payment("175.25", status="nsf")
+        second = self._add_payment("175.25", days=14, status="nsf")
+        self._add_payment("175.25", days=28)
+        self._add_payment("175.25", days=42)
+        self._add_payment("175.25", days=56)
+        remainder = self._add_payment("147.69", days=70)
+        self._add_payment("175.25", days=84)
+        self._add_payment("175.25", days=98)
+        first.failure_reason = "Non-sufficient funds"
+        first.save(update_fields=["failure_reason"])
+        second.failure_reason = "Non-sufficient funds"
+        second.save(update_fields=["failure_reason"])
+        self.loan.status = "defaulted"
+        self.loan.is_active = False
+        self.loan.balance = Decimal("1023.94")
+        self.loan.total_amount = Decimal("1374.44")
+        self.loan.fee = Decimal("874.44")
+        self.loan.save(
+            update_fields=["status", "is_active", "balance", "total_amount", "fee"]
+        )
+
+        applied = LoanService.apply_missing_collection_failure_fees(
+            self.loan,
+            create_missing_collections=True,
+        )
+
+        remainder.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(len(applied), 2)
+        self.assertEqual(remainder.amount, Decimal("175.25"))
+        extras = list(
+            self.loan.payments.filter(
+                notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+            ).order_by("scheduled_date", "created_at", "id")
+        )
+        self.assertGreaterEqual(len(extras), 1)
+        self.assertTrue(
+            all("NSF fee: $50.00" in (row.notes or "") for row in extras)
+        )
+        self.assertEqual(
+            self.loan.payments.filter(
+                notes__startswith=LoanService.COLLECTION_FAILURE_RECOVERY_NOTE,
+            ).count(),
+            2,
+        )
+        self.assertGreater(self.loan.balance, Decimal("1023.94"))
+        balances = self._balance_after_map()
+        last = (
+            self.loan.payments.exclude(status="cancelled")
+            .order_by("scheduled_date", "created_at", "id")
+            .last()
+        )
+        self.assertEqual(balances[str(first.id)], self.loan.balance)
+        self.assertEqual(balances[str(second.id)], self.loan.balance)
+        self.assertEqual(balances[str(last.id)], Decimal("0.00"))
+
+        again = LoanService.apply_missing_collection_failure_fees(
+            self.loan,
+            create_missing_collections=True,
+        )
+        self.assertEqual(again, [])
+        self.assertEqual(
+            self.loan.payments.filter(
+                notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+            ).count(),
+            len(extras),
+        )
+
+    def test_staff_nsf_endpoint_adds_collection_failure_fee(self):
+        missed = self._add_payment("175.25")
+        remainder = self._add_payment("147.69", days=14)
+        self._add_payment("175.25", days=28)
+        self.loan.balance = Decimal("498.19")
+        self.loan.total_amount = Decimal("498.19")
+        self.loan.save(update_fields=["balance", "total_amount"])
+
+        response = self.client.post(f"/api/payments/{missed.id}/nsf/")
+        self.assertEqual(response.status_code, 200, response.data)
+        missed.refresh_from_db()
+        remainder.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(missed.status, "nsf")
+        self.assertEqual(remainder.amount, Decimal("175.25"))
+        self.assertTrue(
+            self.loan.payments.filter(
+                notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+            ).exists()
+        )
+        self.assertGreater(self.loan.balance, Decimal("498.19"))
+
+    def test_customer_loans_applies_missing_nsf_fees_for_failed_collections(self):
+        missed = self._add_payment("175.25", status="nsf")
+        remainder = self._add_payment("147.69", days=14)
+        self._add_payment("175.25", days=28)
+        collection = CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=missed,
+            amount=missed.amount,
+            status="failed",
+            failure_reason="EftFailedInsufficientFunds",
+        )
+        self.loan.status = "defaulted"
+        self.loan.is_active = False
+        self.loan.balance = Decimal("322.94")
+        self.loan.total_amount = Decimal("498.19")
+        self.loan.save(
+            update_fields=["status", "is_active", "balance", "total_amount"]
+        )
+
+        response = self.client.get(f"/api/customers/{self.customer.id}/loans/")
+        self.assertEqual(response.status_code, 200, response.data)
+        remainder.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(remainder.amount, Decimal("175.25"))
+        payload = next(
+            item for item in response.data if item["id"] == str(self.loan.id)
+        )
+        extra_rows = [
+            row
+            for row in payload["paymentSchedule"]
+            if row.get("is_collection_failure_extra")
+        ]
+        self.assertGreaterEqual(len(extra_rows), 1)
+        self.assertTrue(
+            self.loan.payments.filter(
+                notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+                notes__contains=f"Collection failure id: {collection.id}",
+            ).exists()
+        )
 
     def test_edit_rejects_payment_with_processing_collection(self):
         payment = self._add_payment("147.18")
