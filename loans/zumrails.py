@@ -749,7 +749,10 @@ def funding_configuration_ready(loan: Loan) -> dict:
     }
 
 
+@transaction.atomic
 def apply_collection_failure(collection: CollectionPayment, *, reason: str, status: str = "failed"):
+    from .collection_policy import classify_failure_reason
+
     was_settled = collection.status == "completed"
     collection.status = status
     collection.failure_reason = reason
@@ -761,7 +764,7 @@ def apply_collection_failure(collection: CollectionPayment, *, reason: str, stat
 
     payment = collection.payment
     if payment and payment.status not in ("failed", "nsf", "cancelled"):
-        if "InsufficientFunds" in reason:
+        if classify_failure_reason(reason) == "nsf":
             payment.mark_nsf()
         else:
             payment.fail(reason)
