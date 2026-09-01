@@ -3243,19 +3243,17 @@ class LoanService:
         fee_amount = LoanService.money(LoanService.COLLECTION_FAILURE_FEE_AMOUNT)
         collection_id = str(collection.id)
 
-        already_applied = loan.payments.filter(
+        existing_fee = loan.payments.filter(
+            notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
             notes__contains=f'Collection failure id: {collection_id}',
-        ).first()
-        if already_applied:
-            existing_bucket = loan.payments.filter(
-                notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
-                notes__contains=f'Collection failure id: {collection_id}',
-            ).order_by('scheduled_date', 'created_at', 'id').first()
-            if existing_bucket:
-                return existing_bucket
-            return loan.payments.filter(
-                notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
-            ).order_by('scheduled_date', 'created_at', 'id').first()
+        ).order_by('scheduled_date', 'created_at', 'id').first()
+        if existing_fee:
+            return existing_fee
+
+        recovery_exists = loan.payments.filter(
+            notes__startswith=LoanService.COLLECTION_FAILURE_RECOVERY_NOTE,
+            notes__contains=f'Collection failure id: {collection_id}',
+        ).exists()
 
         frequency_days = LoanService._schedule_frequency_days(loan)
         last_schedule_date = (
@@ -3294,7 +3292,7 @@ class LoanService:
         extra_interest = LoanService._deferral_extra_interest(loan, extension_days)
 
         recovery_payment = None
-        if missed_amount > 0:
+        if missed_amount > 0 and not recovery_exists:
             date_fields = business_calendar.payment_date_fields(missed_date)
             recovery_payment = Payment.objects.create(
                 loan=loan,
@@ -3352,6 +3350,16 @@ class LoanService:
         return ids
 
     @staticmethod
+    def _applied_collection_failure_fee_ids(loan: Loan) -> set[str]:
+        """Collection ids that already have an NSF extra row, not just recovery."""
+        ids = set()
+        for payment in loan.payments.exclude(status='cancelled'):
+            if not LoanService.is_collection_failure_extra_payment(payment):
+                continue
+            ids.update(LoanService._collection_failure_ids_from_payment(payment))
+        return ids
+
+    @staticmethod
     def _unlinked_nsf_extra_count(loan: Loan) -> int:
         """Fee extra rows that have no collection-failure id (already-healed orphans)."""
         count = 0
@@ -3370,16 +3378,17 @@ class LoanService:
     @staticmethod
     def loan_needs_collection_failure_fee_heal(loan: Loan) -> bool:
         """True when NSF/failed history is missing the $50 extra application."""
-        applied_ids = LoanService._applied_collection_failure_ids(loan)
+        fee_ids = LoanService._applied_collection_failure_fee_ids(loan)
         for collection in loan.collection_payments.all():
-            if str(collection.id) in applied_ids:
+            if collection.status == 'cancelled':
+                continue
+            if str(collection.id) in fee_ids:
                 continue
             if collection.status in ('failed', 'returned', 'rejected'):
                 return True
-            if collection.status == 'processing':
-                payment = collection.payment
-                if payment is not None and payment.status in ('failed', 'nsf'):
-                    return True
+            payment = collection.payment
+            if payment is not None and payment.status in ('failed', 'nsf'):
+                return True
         unlinked_missed = 0
         for payment in loan.payments.exclude(status='cancelled'):
             if payment.status not in ('failed', 'nsf'):
@@ -3444,7 +3453,7 @@ class LoanService:
     ) -> list:
         """Apply $50 NSF extras for returned collections that never received them."""
         loan = Loan.objects.select_for_update().get(pk=loan.pk)
-        applied_ids = LoanService._applied_collection_failure_ids(loan)
+        fee_ids = LoanService._applied_collection_failure_fee_ids(loan)
         applied = []
 
         from .zumrails import apply_collection_failure
@@ -3455,7 +3464,7 @@ class LoanService:
             processing = payment.collection_attempts.filter(
                 status='processing',
             ).order_by('initiated_at', 'created_at', 'id').first()
-            if processing is None or str(processing.id) in applied_ids:
+            if processing is None or str(processing.id) in fee_ids:
                 continue
             apply_collection_failure(
                 processing,
@@ -3467,15 +3476,19 @@ class LoanService:
                 status='failed',
             )
             applied.append(processing)
-            applied_ids.update(LoanService._applied_collection_failure_ids(loan))
+            fee_ids.update(LoanService._applied_collection_failure_fee_ids(loan))
 
         if create_missing_collections:
             LoanService.ensure_failed_collections_for_missed_payments(loan)
 
         collections = list(
             loan.collection_payments.filter(
-                status__in=['failed', 'returned', 'rejected']
-            ).select_related('payment').order_by(
+                models.Q(status__in=['failed', 'returned', 'rejected'])
+                | models.Q(payment__status__in=['failed', 'nsf'])
+            )
+            .exclude(status='cancelled')
+            .select_related('payment')
+            .order_by(
                 'payment__scheduled_date',
                 'initiated_at',
                 'created_at',
@@ -3483,14 +3496,14 @@ class LoanService:
             )
         )
         for collection in collections:
-            if str(collection.id) in applied_ids:
+            if str(collection.id) in fee_ids:
                 continue
             LoanService.apply_collection_failure_fee(
                 collection,
                 reason=collection.failure_reason or '',
             )
             applied.append(collection)
-            applied_ids.update(LoanService._applied_collection_failure_ids(loan))
+            fee_ids.update(LoanService._applied_collection_failure_fee_ids(loan))
         return applied
 
     @staticmethod
