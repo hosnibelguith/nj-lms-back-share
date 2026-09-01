@@ -6,7 +6,7 @@ from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from accounts.models import Customer, User
-from loans.models import Loan, LoanFormula, Payment
+from loans.models import CollectionPayment, Loan, LoanFormula, Payment
 from loans.services import LoanService
 
 
@@ -203,3 +203,52 @@ class InterestBreakdownFailedPaymentTests(APITestCase):
         self.assertIsNone(response.data["collection_failure_fees"])
         self.assertIsNone(response.data["updated_interest"])
         self.assertEqual(response.data["planned_interest"], "33.09")
+
+    def test_interest_breakdown_api_heals_arrive_nsf_fees(self):
+        self.customer.source = Customer.SOURCE_ARRIVE
+        self.customer.arrive_application_id = "arrive-interest-nsf"
+        self.customer.save(
+            update_fields=["source", "arrive_application_id", "updated_at"]
+        )
+        missed = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("175.25"),
+            scheduled_date=timezone.localdate() - timedelta(days=14),
+            status="nsf",
+            type="scheduled",
+            failure_reason="EftFailedInsufficientFunds",
+        )
+        remainder = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("147.69"),
+            scheduled_date=timezone.localdate() + timedelta(days=14),
+            status="scheduled",
+            type="scheduled",
+        )
+        CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=missed,
+            amount=missed.amount,
+            status="failed",
+            failure_reason="EftFailedInsufficientFunds",
+        )
+        self.loan.status = "defaulted"
+        self.loan.is_active = False
+        self.loan.balance = Decimal("322.94")
+        self.loan.total_amount = Decimal("498.19")
+        self.loan.save(
+            update_fields=["status", "is_active", "balance", "total_amount"]
+        )
+
+        response = self.client.get(f"/api/loans/{self.loan.id}/interest-breakdown/")
+        self.assertEqual(response.status_code, 200, response.data)
+        remainder.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertTrue(response.data["has_failed_payments"])
+        self.assertEqual(response.data["collection_failure_fees"], "50.00")
+        self.assertEqual(remainder.amount, Decimal("175.25"))
+        self.assertTrue(
+            self.loan.payments.filter(
+                notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+            ).exists()
+        )

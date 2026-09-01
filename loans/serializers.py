@@ -314,6 +314,8 @@ class CollectionExportRowSerializer(serializers.Serializer):
     customer_name = serializers.CharField()
     customer_email = serializers.CharField(allow_blank=True)
     customer_phone = serializers.CharField(allow_blank=True)
+    customer_source = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    is_arrive = serializers.BooleanField(required=False, default=False)
     reason = serializers.CharField(allow_blank=True, allow_null=True)
     missed_amount = serializers.DecimalField(
         max_digits=10,

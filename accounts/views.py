@@ -373,15 +373,7 @@ class CustomerViewSet(viewsets.ModelViewSet):
             )
             .order_by('-created_at')
         )
-        healed = False
-        for loan in loans:
-            if not LoanService.loan_needs_collection_failure_fee_heal(loan):
-                continue
-            if LoanService.apply_missing_collection_failure_fees(
-                loan,
-                create_missing_collections=True,
-            ):
-                healed = True
+        healed = LoanService.heal_missing_collection_failure_fees_for_loans(loans)
         if healed:
             loans = list(
                 customer.loans.select_related('formula')

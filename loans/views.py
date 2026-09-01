@@ -207,6 +207,17 @@ class LoanViewSet(viewsets.ModelViewSet):
         return qs.order_by('-effective_returned_at', '-created_at')
 
     @staticmethod
+    def _customer_source_fields(customer):
+        source = (getattr(customer, 'source', None) or '').strip()
+        return {
+            'customer_source': source,
+            'is_arrive': (
+                source == 'arrive'
+                or bool(getattr(customer, 'arrive_application_id', None))
+            ),
+        }
+
+    @staticmethod
     def _collection_export_row(collection):
         customer = collection.loan.customer
         name = (
@@ -219,6 +230,7 @@ class LoanViewSet(viewsets.ModelViewSet):
             'customer_name': name or (customer.email or ''),
             'customer_email': customer.email or '',
             'customer_phone': customer.phone or '',
+            **LoanViewSet._customer_source_fields(customer),
             'reason': collection.failure_reason or '',
             'missed_amount': collection.amount,
             'balance': collection.loan.balance,
@@ -833,6 +845,53 @@ class LoanViewSet(viewsets.ModelViewSet):
         payments = loan.collection_payments.all().order_by('-initiated_at', '-created_at')
         return Response(CollectionPaymentSerializer(payments, many=True).data)
 
+    @classmethod
+    def _heal_returned_collection_items(cls, items):
+        from .services import LoanService
+
+        loan_ids = []
+        seen = set()
+        for item in items:
+            loan_id = item.loan_id
+            if loan_id in seen:
+                continue
+            seen.add(loan_id)
+            loan_ids.append(loan_id)
+        if not loan_ids:
+            return
+        loans = list(
+            Loan.objects.filter(id__in=loan_ids)
+            .select_related('customer', 'formula')
+            .prefetch_related(
+                'payments',
+                'payments__collection_attempts',
+                'collection_payments',
+                'collection_payments__payment',
+            )
+        )
+        try:
+            LoanService.heal_missing_collection_failure_fees_for_loans(loans)
+        except Exception:
+            logger.exception(
+                "Unable to apply missing NSF extras before listing collections"
+            )
+
+    @classmethod
+    def _returned_collection_rows(cls, items):
+        ids = [item.pk for item in items]
+        refreshed = {
+            row.pk: row
+            for row in CollectionPayment.objects.filter(pk__in=ids).select_related(
+                'loan',
+                'loan__customer',
+                'payment',
+            )
+        }
+        ordered = [refreshed[item.pk] for item in items if item.pk in refreshed]
+        return cls._with_collection_risk(
+            [cls._collection_export_row(item) for item in ordered]
+        )
+
     @action(detail=False, methods=['get'], url_path='returned-collections')
     def returned_collections(self, request):
         """Returned/failed collection attempts, filterable by returned date."""
@@ -847,20 +906,32 @@ class LoanViewSet(viewsets.ModelViewSet):
             'yes',
             'csv',
         )
-        rows = self._with_collection_risk(
-            [self._collection_export_row(item) for item in qs]
-        )
         if export:
-            return Response(CollectionExportRowSerializer(rows, many=True).data)
+            items = list(qs)
+            self._heal_returned_collection_items(items)
+            return Response(
+                CollectionExportRowSerializer(
+                    self._returned_collection_rows(items),
+                    many=True,
+                ).data
+            )
         page = self.paginate_queryset(qs)
         if page is not None:
-            page_rows = self._with_collection_risk(
-                [self._collection_export_row(item) for item in page]
-            )
+            self._heal_returned_collection_items(page)
             return self.get_paginated_response(
-                CollectionExportRowSerializer(page_rows, many=True).data
+                CollectionExportRowSerializer(
+                    self._returned_collection_rows(page),
+                    many=True,
+                ).data
             )
-        return Response(CollectionExportRowSerializer(rows, many=True).data)
+        items = list(qs)
+        self._heal_returned_collection_items(items)
+        return Response(
+            CollectionExportRowSerializer(
+                self._returned_collection_rows(items),
+                many=True,
+            ).data
+        )
 
     @action(detail=False, methods=['get', 'patch'], url_path='collection-settings')
     def collection_settings(self, request):
@@ -956,6 +1027,7 @@ class LoanViewSet(viewsets.ModelViewSet):
                 'customer_name': name or (customer.email or ''),
                 'customer_email': customer.email or '',
                 'customer_phone': customer.phone or '',
+                **LoanViewSet._customer_source_fields(customer),
                 'reason': loan.missed_reason or '',
                 'missed_amount': loan.missed_amount,
                 'balance': loan.balance,
@@ -1073,6 +1145,8 @@ class LoanViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'], url_path='interest-breakdown')
     def interest_breakdown(self, request, pk=None):
         loan = self.get_object()
+        LoanService.heal_missing_collection_failure_fees_for_loans([loan])
+        loan.refresh_from_db()
         as_of_param = request.query_params.get('as_of')
         as_of = parse_date(as_of_param) if as_of_param else None
         return Response(LoanService.get_interest_breakdown(loan, as_of_date=as_of))

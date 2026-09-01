@@ -290,10 +290,32 @@ class CollectionExportTests(APITestCase):
             reason="EftFailedInsufficientFunds",
             returned_at=inside,
         )
-        self._add_returned_collection(
+        outside = self._add_returned_collection(
             amount="50.00",
             reason="EftFailedAccountClosed",
             returned_at=outside,
+        )
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("50.00"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+            notes=(
+                f"{LoanService.COLLECTION_FAILURE_FEE_NOTE}\n"
+                f"Collection failure id: {matching.id}\n"
+                "NSF fee: $50.00"
+            ),
+        )
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("50.00"),
+            scheduled_date=timezone.localdate() + timedelta(days=14),
+            status="scheduled",
+            notes=(
+                f"{LoanService.COLLECTION_FAILURE_FEE_NOTE}\n"
+                f"Collection failure id: {outside.id}\n"
+                "NSF fee: $50.00"
+            ),
         )
         CollectionPayment.objects.create(
             loan=self.loan,
@@ -318,6 +340,199 @@ class CollectionExportTests(APITestCase):
         self.assertEqual(Decimal(str(row["missed_amount"])), Decimal("176.61"))
         self.assertEqual(Decimal(str(row["balance"])), Decimal("423.39"))
         self.assertTrue(row["returned_at"].startswith("2026-08-10"))
+        self.assertEqual(row["customer_source"], "organic")
+        self.assertFalse(row["is_arrive"])
+
+    def test_returned_collections_includes_arrive_and_landing_source(self):
+        inside = timezone.make_aware(datetime(2026, 8, 10, 12, 0))
+        self._add_returned_collection(
+            amount="176.61",
+            reason="EftFailedInsufficientFunds",
+            returned_at=inside,
+        )
+        arrive_customer = Customer.objects.create(
+            first_name="Marvin",
+            last_name="Bade",
+            email="marvinbade125@gmail.com",
+            phone="3067375928",
+            phone_normalized="3067375928",
+            province="SK",
+            status="active",
+            source="arrive",
+            arrive_application_id="arrive-marvin-1",
+        )
+        arrive_loan = Loan.objects.create(
+            customer=arrive_customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("100.00"),
+            total_amount=Decimal("600.00"),
+            balance=Decimal("1023.94"),
+            status="defaulted",
+            is_active=False,
+            funded_at=timezone.now() - timedelta(days=20),
+        )
+        CollectionPayment.objects.create(
+            loan=arrive_loan,
+            amount=Decimal("175.25"),
+            status="returned",
+            failure_reason="EftFailedInsufficientFunds",
+            initiated_at=inside,
+            returned_at=inside,
+        )
+
+        response = self.client.get(
+            "/api/loans/returned-collections/",
+            {"export": "1"},
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        by_email = {row["customer_email"]: row for row in response.data}
+        self.assertEqual(by_email["riley.cole@example.com"]["customer_source"], "organic")
+        self.assertFalse(by_email["riley.cole@example.com"]["is_arrive"])
+        self.assertEqual(by_email["marvinbade125@gmail.com"]["customer_source"], "arrive")
+        self.assertTrue(by_email["marvinbade125@gmail.com"]["is_arrive"])
+
+    def test_returned_collections_applies_nsf_fees_for_arrive_like_landing(self):
+        """Arrive In Collections files get the same $50 NSF extras as Landing."""
+        inside = timezone.make_aware(datetime(2026, 8, 10, 12, 0))
+        arrive_customer = Customer.objects.create(
+            first_name="Marvin",
+            last_name="Bade",
+            email="marvin.nsf@example.com",
+            phone="3067375928",
+            phone_normalized="3067375928",
+            province="SK",
+            status="active",
+            source="arrive",
+            arrive_application_id="arrive-marvin-nsf",
+        )
+        arrive_loan = Loan.objects.create(
+            customer=arrive_customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("874.44"),
+            total_amount=Decimal("1374.44"),
+            balance=Decimal("1023.94"),
+            status="defaulted",
+            is_active=False,
+            funded_at=timezone.now() - timedelta(days=20),
+        )
+        first = Payment.objects.create(
+            loan=arrive_loan,
+            amount=Decimal("175.25"),
+            scheduled_date=timezone.localdate() - timedelta(days=28),
+            status="nsf",
+            failure_reason="EftFailedInsufficientFunds",
+        )
+        second = Payment.objects.create(
+            loan=arrive_loan,
+            amount=Decimal("175.25"),
+            scheduled_date=timezone.localdate() - timedelta(days=14),
+            status="nsf",
+            failure_reason="EftFailedInsufficientFunds",
+        )
+        remainder = Payment.objects.create(
+            loan=arrive_loan,
+            amount=Decimal("147.69"),
+            scheduled_date=timezone.localdate() + timedelta(days=14),
+            status="scheduled",
+        )
+        CollectionPayment.objects.create(
+            loan=arrive_loan,
+            payment=first,
+            amount=first.amount,
+            status="returned",
+            failure_reason="EftFailedInsufficientFunds",
+            initiated_at=inside,
+            returned_at=inside,
+        )
+        CollectionPayment.objects.create(
+            loan=arrive_loan,
+            payment=second,
+            amount=second.amount,
+            status="failed",
+            failure_reason="EftFailedInsufficientFunds",
+            initiated_at=inside,
+            returned_at=inside,
+        )
+        landing_missed = Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("176.61"),
+            scheduled_date=timezone.localdate() - timedelta(days=7),
+            status="nsf",
+            failure_reason="EftFailedInsufficientFunds",
+        )
+        extra_id = uuid.uuid4()
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("50.00"),
+            scheduled_date=timezone.localdate() + timedelta(days=21),
+            status="scheduled",
+            notes=(
+                f"{LoanService.COLLECTION_FAILURE_FEE_NOTE}\n"
+                f"Collection failure id: {extra_id}\n"
+                "NSF fee: $50.00\n"
+                "Extension interest: $0.00"
+            ),
+        )
+        CollectionPayment.objects.create(
+            id=extra_id,
+            loan=self.loan,
+            payment=landing_missed,
+            amount=landing_missed.amount,
+            status="returned",
+            failure_reason="EftFailedInsufficientFunds",
+            initiated_at=inside,
+            returned_at=inside,
+        )
+
+        response = self.client.get(
+            "/api/loans/returned-collections/",
+            {"export": "1"},
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+
+        arrive_loan.refresh_from_db()
+        remainder.refresh_from_db()
+        self.loan.refresh_from_db()
+        extra_count = arrive_loan.payments.filter(
+            notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+        ).count()
+        self.assertGreater(arrive_loan.balance, Decimal("1023.94"))
+        self.assertEqual(remainder.amount, Decimal("175.25"))
+        self.assertGreaterEqual(extra_count, 1)
+        self.assertTrue(
+            all(
+                "NSF fee: $50.00" in (row.notes or "")
+                for row in arrive_loan.payments.filter(
+                    notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+                )
+            )
+        )
+        self.assertEqual(
+            self.loan.payments.filter(
+                notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+            ).count(),
+            1,
+        )
+        arrive_row = next(
+            row
+            for row in response.data
+            if row["customer_email"] == "marvin.nsf@example.com"
+        )
+        self.assertTrue(arrive_row["is_arrive"])
+        self.assertGreater(Decimal(str(arrive_row["balance"])), Decimal("1023.94"))
+
+        again = self.client.get(
+            "/api/loans/returned-collections/",
+            {"export": "1"},
+        )
+        self.assertEqual(again.status_code, 200, again.data)
+        arrive_loan.refresh_from_db()
+        self.assertEqual(
+            arrive_loan.payments.filter(
+                notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+            ).count(),
+            extra_count,
+        )
 
     def test_status_summary_defaulted_counts_failed_collection_payments(self):
         inside = timezone.make_aware(datetime(2026, 8, 10, 12, 0))
@@ -4381,6 +4596,79 @@ class PaymentScheduleIntegrityTests(APITestCase):
         ]
         self.assertEqual(len(extra_rows), 1)
         self.assertEqual(Decimal(str(extra_rows[0]["amount"])), Decimal("66.37"))
+
+    def test_customer_loans_heals_arrive_nsf_like_landing(self):
+        """Arrive customer GET applies the same leftover NSF extra as Landing."""
+        self.customer.source = Customer.SOURCE_ARRIVE
+        self.customer.arrive_application_id = "arrive-schedule-nsf"
+        self.customer.save(
+            update_fields=["source", "arrive_application_id", "updated_at"]
+        )
+        first = self._add_payment("175.25", status="nsf")
+        second = self._add_payment("175.25", days=14, status="nsf")
+        self._add_payment("175.25", days=28)
+        remainder = self._add_payment("147.69", days=42)
+        first.failure_reason = "EftFailedInsufficientFunds"
+        first.save(update_fields=["failure_reason"])
+        second.failure_reason = "EftFailedInsufficientFunds"
+        second.save(update_fields=["failure_reason"])
+        CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=first,
+            amount=first.amount,
+            status="returned",
+            failure_reason="EftFailedInsufficientFunds",
+        )
+        CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=second,
+            amount=second.amount,
+            status="failed",
+            failure_reason="EftFailedInsufficientFunds",
+        )
+        self.loan.status = "defaulted"
+        self.loan.is_active = False
+        self.loan.balance = Decimal("673.44")
+        self.loan.total_amount = Decimal("1023.94")
+        self.loan.save(
+            update_fields=["status", "is_active", "balance", "total_amount"]
+        )
+
+        response = self.client.get(f"/api/customers/{self.customer.id}/loans/")
+        self.assertEqual(response.status_code, 200, response.data)
+        remainder.refresh_from_db()
+        self.loan.refresh_from_db()
+        payload = next(
+            item for item in response.data if item["id"] == str(self.loan.id)
+        )
+        extra_rows = [
+            row
+            for row in payload["paymentSchedule"]
+            if row.get("is_collection_failure_extra")
+        ]
+        self.assertGreaterEqual(len(extra_rows), 1)
+        self.assertEqual(remainder.amount, Decimal("175.25"))
+        self.assertGreater(self.loan.balance, Decimal("673.44"))
+        self.assertTrue(
+            any(
+                "NSF fee: $50.00" in (row.get("notes") or "")
+                for row in extra_rows
+            )
+        )
+
+        second_response = self.client.get(f"/api/customers/{self.customer.id}/loans/")
+        self.assertEqual(second_response.status_code, 200, second_response.data)
+        second_payload = next(
+            item for item in second_response.data if item["id"] == str(self.loan.id)
+        )
+        self.assertEqual(
+            len([
+                row
+                for row in second_payload["paymentSchedule"]
+                if row.get("is_collection_failure_extra")
+            ]),
+            len(extra_rows),
+        )
 
     def test_customer_loans_heals_nsf_when_collection_still_processing(self):
         missed = self._add_payment("175.25", status="nsf")

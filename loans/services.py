@@ -3,6 +3,7 @@
 Business logic services for loan operations.
 Called by views and celery tasks.
 """
+import logging
 import re
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import timedelta
@@ -11,6 +12,8 @@ from django.utils import timezone
 from accounts.models import Customer
 from . import business_calendar
 from .models import CollectionPayment, FundedPayment, Loan, LoanFormula, Payment
+
+logger = logging.getLogger(__name__)
 
 
 class LoanService:
@@ -3385,6 +3388,26 @@ class LoanService:
                 continue
             unlinked_missed += 1
         return unlinked_missed > LoanService._unlinked_nsf_extra_count(loan)
+
+    @staticmethod
+    def heal_missing_collection_failure_fees_for_loans(loans) -> int:
+        """Apply missing NSF extras for each loan that still needs them."""
+        healed = 0
+        for loan in loans:
+            try:
+                if not LoanService.loan_needs_collection_failure_fee_heal(loan):
+                    continue
+                if LoanService.apply_missing_collection_failure_fees(
+                    loan,
+                    create_missing_collections=True,
+                ):
+                    healed += 1
+            except Exception:
+                logger.exception(
+                    "Unable to apply missing NSF extras for loan %s",
+                    getattr(loan, 'pk', None),
+                )
+        return healed
 
     @staticmethod
     def ensure_failed_collections_for_missed_payments(loan: Loan) -> list:
