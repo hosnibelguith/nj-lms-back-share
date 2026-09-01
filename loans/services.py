@@ -3349,13 +3349,56 @@ class LoanService:
         return ids
 
     @staticmethod
+    def _unlinked_nsf_extra_count(loan: Loan) -> int:
+        """Fee extra rows that have no collection-failure id (already-healed orphans)."""
+        count = 0
+        for payment in loan.payments.exclude(status='cancelled'):
+            if not LoanService.is_collection_failure_extra_payment(payment):
+                continue
+            if LoanService._collection_failure_ids_from_payment(payment):
+                continue
+            nsf = LoanService.collection_failure_nsf_fee_amount(payment)
+            if nsf <= 0 and LoanService.is_collection_failure_fee_payment(payment):
+                nsf = LoanService.COLLECTION_FAILURE_FEE_AMOUNT
+            if nsf > 0:
+                count += 1
+        return count
+
+    @staticmethod
+    def loan_needs_collection_failure_fee_heal(loan: Loan) -> bool:
+        """True when NSF/failed history is missing the $50 extra application."""
+        applied_ids = LoanService._applied_collection_failure_ids(loan)
+        for collection in loan.collection_payments.all():
+            if str(collection.id) in applied_ids:
+                continue
+            if collection.status in ('failed', 'returned', 'rejected'):
+                return True
+            if collection.status == 'processing':
+                payment = collection.payment
+                if payment is not None and payment.status in ('failed', 'nsf'):
+                    return True
+        unlinked_missed = 0
+        for payment in loan.payments.exclude(status='cancelled'):
+            if payment.status not in ('failed', 'nsf'):
+                continue
+            if payment.collection_attempts.exists():
+                continue
+            unlinked_missed += 1
+        return unlinked_missed > LoanService._unlinked_nsf_extra_count(loan)
+
+    @staticmethod
     def ensure_failed_collections_for_missed_payments(loan: Loan) -> list:
         """Create local failed collections for NSF/failed rows that have none."""
         created = []
+        skipped_covered = 0
+        covered = LoanService._unlinked_nsf_extra_count(loan)
         for payment in loan.payments.filter(
             status__in=['failed', 'nsf']
         ).order_by('scheduled_date', 'created_at', 'id'):
             if payment.collection_attempts.exists():
+                continue
+            if skipped_covered < covered:
+                skipped_covered += 1
                 continue
             created.append(
                 CollectionPayment.objects.create(
@@ -3378,10 +3421,34 @@ class LoanService:
     ) -> list:
         """Apply $50 NSF extras for returned collections that never received them."""
         loan = Loan.objects.select_for_update().get(pk=loan.pk)
-        if create_missing_collections:
-            LoanService.ensure_failed_collections_for_missed_payments(loan)
         applied_ids = LoanService._applied_collection_failure_ids(loan)
         applied = []
+
+        from .zumrails import apply_collection_failure
+
+        for payment in loan.payments.filter(
+            status__in=['failed', 'nsf']
+        ).order_by('scheduled_date', 'created_at', 'id'):
+            processing = payment.collection_attempts.filter(
+                status='processing',
+            ).order_by('initiated_at', 'created_at', 'id').first()
+            if processing is None or str(processing.id) in applied_ids:
+                continue
+            apply_collection_failure(
+                processing,
+                reason=(
+                    processing.failure_reason
+                    or payment.failure_reason
+                    or 'Non-sufficient funds'
+                ),
+                status='failed',
+            )
+            applied.append(processing)
+            applied_ids.update(LoanService._applied_collection_failure_ids(loan))
+
+        if create_missing_collections:
+            LoanService.ensure_failed_collections_for_missed_payments(loan)
+
         collections = list(
             loan.collection_payments.filter(
                 status__in=['failed', 'returned', 'rejected']

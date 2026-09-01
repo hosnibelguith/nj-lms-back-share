@@ -4269,6 +4269,145 @@ class PaymentScheduleIntegrityTests(APITestCase):
             ).exists()
         )
 
+    def test_customer_loans_heals_nsf_rows_without_collection_records(self):
+        """Marvin-style In Collections: NSF history, no extras, no CollectionPayment."""
+        first = self._add_payment("175.25", status="nsf")
+        second = self._add_payment("175.25", days=14, status="nsf")
+        self._add_payment("175.25", days=28)
+        remainder = self._add_payment("147.69", days=42)
+        self._add_payment("175.25", days=56)
+        first.failure_reason = "Non-sufficient funds"
+        first.save(update_fields=["failure_reason"])
+        second.failure_reason = "Non-sufficient funds"
+        second.save(update_fields=["failure_reason"])
+        self.loan.status = "defaulted"
+        self.loan.is_active = False
+        self.loan.balance = Decimal("673.44")
+        self.loan.total_amount = Decimal("1023.94")
+        self.loan.save(
+            update_fields=["status", "is_active", "balance", "total_amount"]
+        )
+
+        response = self.client.get(f"/api/customers/{self.customer.id}/loans/")
+        self.assertEqual(response.status_code, 200, response.data)
+        remainder.refresh_from_db()
+        self.loan.refresh_from_db()
+        payload = next(
+            item for item in response.data if item["id"] == str(self.loan.id)
+        )
+        extra_rows = [
+            row
+            for row in payload["paymentSchedule"]
+            if row.get("is_collection_failure_extra")
+        ]
+        self.assertGreaterEqual(len(extra_rows), 1)
+        self.assertEqual(remainder.amount, Decimal("175.25"))
+        self.assertGreater(self.loan.balance, Decimal("673.44"))
+        self.assertEqual(
+            self.loan.payments.filter(status="nsf").count(),
+            2,
+        )
+
+        second_response = self.client.get(f"/api/customers/{self.customer.id}/loans/")
+        self.assertEqual(second_response.status_code, 200, second_response.data)
+        second_payload = next(
+            item for item in second_response.data if item["id"] == str(self.loan.id)
+        )
+        self.assertEqual(
+            len([
+                row
+                for row in second_payload["paymentSchedule"]
+                if row.get("is_collection_failure_extra")
+            ]),
+            len(extra_rows),
+        )
+
+    def test_customer_loans_does_not_reapply_existing_nsf_extra_row(self):
+        """Vipan-style: leftover NSF extra already on the schedule stays untouched."""
+        completed = self._add_payment("147.18", days=-14, status="completed")
+        missed = self._add_payment("147.18", status="nsf")
+        self._add_payment("147.18", days=14)
+        extra_id = uuid.UUID("11111111-1111-1111-1111-111111111111")
+        extra = self._add_payment(
+            "66.37",
+            days=28,
+            notes=(
+                f"{LoanService.COLLECTION_FAILURE_FEE_NOTE}\n"
+                f"Collection failure id: {extra_id}\n"
+                "NSF fee: $50.00\n"
+                "Extension interest: $16.37"
+            ),
+        )
+        CollectionPayment.objects.create(
+            id=extra_id,
+            loan=self.loan,
+            payment=missed,
+            amount=missed.amount,
+            status="failed",
+            failure_reason="EftFailedInsufficientFunds",
+        )
+        self.loan.status = "defaulted"
+        self.loan.is_active = False
+        self.loan.balance = Decimal("802.28")
+        self.loan.total_amount = Decimal("949.46")
+        self.loan.fee = Decimal("449.46")
+        self.loan.save(
+            update_fields=["status", "is_active", "balance", "total_amount", "fee"]
+        )
+
+        response = self.client.get(f"/api/customers/{self.customer.id}/loans/")
+        self.assertEqual(response.status_code, 200, response.data)
+        extra.refresh_from_db()
+        missed.refresh_from_db()
+        completed.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(extra.amount, Decimal("66.37"))
+        self.assertEqual(missed.status, "nsf")
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(self.loan.balance, Decimal("802.28"))
+        self.assertEqual(
+            self.loan.payments.filter(
+                notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+            ).count(),
+            1,
+        )
+        payload = next(
+            item for item in response.data if item["id"] == str(self.loan.id)
+        )
+        extra_rows = [
+            row
+            for row in payload["paymentSchedule"]
+            if row.get("is_collection_failure_extra")
+        ]
+        self.assertEqual(len(extra_rows), 1)
+        self.assertEqual(Decimal(str(extra_rows[0]["amount"])), Decimal("66.37"))
+
+    def test_customer_loans_heals_nsf_when_collection_still_processing(self):
+        missed = self._add_payment("175.25", status="nsf")
+        remainder = self._add_payment("147.69", days=14)
+        CollectionPayment.objects.create(
+            loan=self.loan,
+            payment=missed,
+            amount=missed.amount,
+            status="processing",
+            failure_reason="EftFailedInsufficientFunds",
+            zum_status="Failed",
+        )
+        self.loan.status = "defaulted"
+        self.loan.is_active = False
+        self.loan.balance = Decimal("322.94")
+        self.loan.save(update_fields=["status", "is_active", "balance"])
+
+        response = self.client.get(f"/api/customers/{self.customer.id}/loans/")
+        self.assertEqual(response.status_code, 200, response.data)
+        remainder.refresh_from_db()
+        self.assertEqual(remainder.amount, Decimal("175.25"))
+        self.assertTrue(
+            self.loan.payments.filter(
+                notes__startswith=LoanService.COLLECTION_FAILURE_FEE_NOTE,
+            ).exists()
+        )
+
     def test_edit_rejects_payment_with_processing_collection(self):
         payment = self._add_payment("147.18")
         CollectionPayment.objects.create(
