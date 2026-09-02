@@ -36,7 +36,19 @@ FLINKS_TRANSIENT_CODES = frozenset({
     'CARD_IN_USE',
     'RETRY_LATER',
     'CONCURRENT_SESSION',
+    # Special refresh / nightly refresh still running (CIBC 010, EQ-style 703).
+    'AGGREGATION_ERROR',
+    'SESSION_EXPIRED',
+    'BANK_MAINTENANCE_RETRY_LATER',
 })
+FLINKS_EXISTING_SESSION_MARKERS = (
+    'ALREADY EXIST',
+    'SPECIAL REFRESH',
+    'SESSION EXISTS',
+    'DUPLICATE CARD',
+    'LOGIN ALREADY',
+    'CARD ALREADY',
+)
 FLINKS_TERMINAL_CODES = frozenset({
     'INVALID_LOGIN',
     'INVALID_PASSWORD',
@@ -420,13 +432,37 @@ def _flinks_code_from_response(response) -> str:
     return _extract_flinks_code(body)
 
 
+def _response_text_blob(response) -> str:
+    if response is None:
+        return ''
+    parts = [str(getattr(response, 'text', '') or '')]
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        parts.append(str(body.get('Message') or ''))
+        parts.append(str(body.get('FlinksCode') or ''))
+    return ' '.join(parts).upper()
+
+
+def _is_existing_or_refresh_in_progress(response) -> bool:
+    """Login already aggregated, or Connect already started a special refresh."""
+    text = _response_text_blob(response)
+    if not text:
+        return False
+    return any(marker in text for marker in FLINKS_EXISTING_SESSION_MARKERS)
+
+
 def _is_transient_flinks_api_error(response) -> bool:
     """Flinks codes that mean the LoginId is valid but aggregation is still running."""
     if response is None:
         return False
     if getattr(response, 'status_code', None) == 202:
         return True
-    return _flinks_code_from_response(response) in FLINKS_TRANSIENT_CODES
+    if _flinks_code_from_response(response) in FLINKS_TRANSIENT_CODES:
+        return True
+    return _is_existing_or_refresh_in_progress(response)
 
 
 def _is_mfa_awaiting_error(sync_error: str) -> bool:
@@ -524,6 +560,22 @@ def _connection_has_transactions(connection) -> bool:
     return BankTransaction.objects.filter(account__connection=connection).exists()
 
 
+def _complete_ibv_from_existing_data(connection, customer) -> bool:
+    """Finish IBV when this LoginId was already fetched (exists already / reconnect)."""
+    if connection.accounts.exists() and _connection_has_transactions(connection):
+        return _mark_banking_success(connection, customer)
+    from banking.repair import apply_synced_ibv_repair, find_repairable_synced_ibv
+
+    plan = find_repairable_synced_ibv(
+        customer,
+        login_id=str(connection.login_id or '') or None,
+    )
+    if plan is None:
+        return False
+    apply_synced_ibv_repair(plan)
+    return True
+
+
 def _try_complete_ibv_from_mohawk_event(connection) -> bool:
     """If Mohawk already posted analysis for this login, finish IBV without Flinks pull."""
     from banking.models import BankingAnalysisEvent
@@ -609,9 +661,15 @@ def _try_cached_flinks_detail(connection, instance, flinks_customer_id, headers,
             connection.id,
         )
         return False
-    if acct_resp.status_code != 200:
+    payload = None
+    if acct_resp.status_code == 200:
+        payload = acct_resp.json() or {}
+    elif acct_resp.status_code == 202:
+        payload = _poll_get_accounts_detail_async(
+            instance, flinks_customer_id, request_id, headers
+        )
+    if not isinstance(payload, dict):
         return False
-    payload = acct_resp.json() or {}
     if _count_transactions(payload.get('Accounts') or []) == 0:
         return False
     logger.info(
@@ -636,8 +694,8 @@ def _recover_ibv_without_live_pull(
     """Do not fail IBV when live Authorize timed out or asked for MFA."""
     if _try_complete_ibv_from_mohawk_event(connection):
         return True
-    if connection.accounts.exists() and _connection_has_transactions(connection):
-        return _mark_banking_success(connection, customer)
+    if _complete_ibv_from_existing_data(connection, customer):
+        return True
     if _try_cached_flinks_detail(
         connection, instance, flinks_customer_id, headers, login_id
     ):
@@ -1107,6 +1165,16 @@ def fetch_flinks_accounts_only(self, connection_id):
         mask_identifier(login_id),
         getattr(self.request, 'id', None),
     )
+    if _complete_ibv_from_existing_data(connection, customer):
+        logger.info(
+            'Flinks sync skipped live pull; existing IBV data completed '
+            'customer_id=%s connection_id=%s login_id=%s',
+            customer.id,
+            connection.id,
+            mask_identifier(login_id),
+        )
+        return True
+
     BankConnection.objects.filter(id=connection.id).update(
         sync_status='syncing',
         sync_error=None,
@@ -1321,6 +1389,10 @@ def fetch_flinks_accounts_only(self, connection_id):
 
     accounts_data = accounts_json.get('Accounts') or []
     if not accounts_data:
+        if _try_cached_flinks_detail(
+            connection, instance, customer_id, headers, login_id
+        ):
+            return True
         if connection.attempted_syncs < FLINKS_GAD_AUTOMATED_MAX_ATTEMPTS:
             _mark_awaiting_flinks_webhook(connection, NO_ACCOUNTS_MESSAGE)
             return False
@@ -1375,10 +1447,15 @@ def fetch_flinks_accounts_only(self, connection_id):
 
     # 621/623/703 are persisted like any other bank. Agents may decline with
     # "Unsupported bank"; funding UI shows a non-blocking risk warning.
-    if total_transactions == 0 and connection.attempted_syncs < FLINKS_GAD_AUTOMATED_MAX_ATTEMPTS:
-        _mark_awaiting_flinks_webhook(
-            connection,
-            'NO_TRANSACTION: Flinks returned accounts before history was ready.',
-        )
-        return False
+    if total_transactions == 0:
+        if _try_cached_flinks_detail(
+            connection, instance, customer_id, headers, login_id
+        ):
+            return True
+        if connection.attempted_syncs < FLINKS_GAD_AUTOMATED_MAX_ATTEMPTS:
+            _mark_awaiting_flinks_webhook(
+                connection,
+                'NO_TRANSACTION: Flinks returned accounts before history was ready.',
+            )
+            return False
     return apply_flinks_accounts_detail(connection, {'Accounts': accounts_data})

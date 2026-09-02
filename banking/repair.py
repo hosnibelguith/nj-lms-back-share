@@ -49,8 +49,8 @@ def connection_has_synced_ibv_data(
     *,
     require_transactions: bool = True,
 ) -> bool:
-    if connection.sync_status != "synced":
-        return False
+    # Accounts + history are enough even when Flinks left the row pending
+    # (special refresh / "exists already") and never flipped sync_status.
     if not BankAccount.objects.filter(connection=connection).exists():
         return False
     if require_transactions and not BankTransaction.objects.filter(

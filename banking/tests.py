@@ -161,6 +161,63 @@ class BankingConnectTests(TestCase):
             ).exists()
         )
 
+    def test_connect_reuses_pending_connection_that_already_has_ibv_data(self):
+        loan = Loan.objects.create(
+            customer=self.customer_a,
+            principal=500,
+            fee=100,
+            total_amount=600,
+            balance=600,
+            status='ibv_pending',
+            is_active=True,
+        )
+        fetched_connection = BankConnection.objects.create(
+            customer=self.customer_a,
+            login_id=self.login_id,
+            provider='flinks',
+            is_active=True,
+            sync_status='pending',
+            sync_error='NO_TRANSACTION: Flinks returned accounts before history was ready.',
+        )
+        account = BankAccount.objects.create(
+            customer=self.customer_a,
+            connection=fetched_connection,
+            external_id='acct-fetched',
+            name='Already Fetched Checking',
+            type='checking',
+            balance=80,
+            is_primary=True,
+        )
+        BankTransaction.objects.create(
+            customer=self.customer_a,
+            account=account,
+            external_id='tx-fetched',
+            date=timezone.localdate(),
+            description='Payroll',
+            credit=80,
+            balance=80,
+        )
+
+        self.client.force_authenticate(user=self.user_a)
+        with patch('banking.views.fetch_flinks_accounts_only.delay') as mocked:
+            response = self.client.post(
+                '/api/banking/connect/',
+                {'login_id': self.login_id},
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['status'], 'COMPLETED')
+        mocked.assert_not_called()
+        fetched_connection.refresh_from_db()
+        self.customer_a.refresh_from_db()
+        loan.refresh_from_db()
+        self.assertTrue(fetched_connection.is_active)
+        self.assertEqual(fetched_connection.sync_status, 'synced')
+        self.assertTrue(self.customer_a.banking_verified)
+        self.assertEqual(loan.status, 'pending_signature')
+        self.assertEqual(loan.bank_account_id, account.id)
+
     def test_repair_command_restores_expired_loan_with_existing_ibv(self):
         loan = Loan.objects.create(
             customer=self.customer_a,
@@ -2105,6 +2162,9 @@ class FlinksGadAutoRepullTests(TestCase):
             ]
         }
         with patch('banking.tasks.time.sleep'), patch(
+            'banking.tasks._try_cached_flinks_detail',
+            return_value=False,
+        ), patch(
             'banking.tasks.fetch_flinks_accounts_only.apply_async'
         ) as scheduled, patch(
             'banking.tasks.requests.post',
@@ -2129,7 +2189,9 @@ class FlinksGadAutoRepullTests(TestCase):
         self.assertEqual(len(mail.outbox), 0)
 
     def test_empty_accounts_stays_pending_instead_of_failing(self):
-        with patch('banking.tasks.fetch_flinks_accounts_only.apply_async') as scheduled, patch(
+        with patch('banking.tasks._try_cached_flinks_detail', return_value=False), patch(
+            'banking.tasks.fetch_flinks_accounts_only.apply_async'
+        ) as scheduled, patch(
             'banking.tasks.requests.post',
             side_effect=[
                 _flinks_json_response(200, {'RequestId': 'req-empty'}),
@@ -2357,3 +2419,178 @@ class FlinksGadAutoRepullTests(TestCase):
 
         delayed.assert_not_called()
         applied.assert_called_once_with(args=[str(self.connection.id)])
+
+    def _history_payload(self, institution='703'):
+        return {
+            'Accounts': [
+                {
+                    'Id': f'acct-{institution}',
+                    'Title': 'Chequing',
+                    'Type': 'Chequing',
+                    'Currency': 'CAD',
+                    'InstitutionNumber': institution,
+                    'TransitNumber': '12345',
+                    'AccountNumber': '9999999',
+                    'Transactions': [
+                        {
+                            'Id': f'tx-{institution}',
+                            'Date': '2026-01-01',
+                            'Description': 'Payroll',
+                            'Credit': 100,
+                        }
+                    ],
+                }
+            ]
+        }
+
+    def test_existing_local_history_completes_ibv_without_flinks(self):
+        account = BankAccount.objects.create(
+            customer=self.customer,
+            connection=self.connection,
+            external_id='acct-local',
+            name='Fetched Checking',
+            type='checking',
+            balance=50,
+            is_primary=True,
+        )
+        BankTransaction.objects.create(
+            customer=self.customer,
+            account=account,
+            external_id='tx-local',
+            date=timezone.localdate(),
+            description='Payroll',
+            credit=50,
+            balance=50,
+        )
+
+        with patch('banking.tasks.requests.post') as mocked_post:
+            result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        self.assertTrue(result)
+        mocked_post.assert_not_called()
+        self.connection.refresh_from_db()
+        self.customer.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(self.connection.sync_status, 'synced')
+        self.assertTrue(self.customer.banking_verified)
+        self.assertEqual(self.loan.status, 'pending_signature')
+        self.assertEqual(self.connection.attempted_syncs, 0)
+
+    def test_card_in_use_recovers_from_cached_history(self):
+        payload = self._history_payload('703')
+        with patch(
+            'banking.tasks.requests.post',
+            side_effect=[
+                _flinks_json_response(
+                    400,
+                    {
+                        'HttpStatusCode': 400,
+                        'FlinksCode': 'CARD_IN_USE',
+                        'Message': 'Special refresh requested (initiated)',
+                    },
+                ),
+                _flinks_json_response(200, {'RequestId': 'cached-req'}),
+                _flinks_json_response(
+                    202,
+                    {'HttpStatusCode': 202, 'FlinksCode': 'OPERATION_PENDING'},
+                ),
+            ],
+        ), patch(
+            'banking.tasks.requests.get',
+            return_value=_flinks_json_response(200, payload),
+        ):
+            result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        self.assertTrue(result)
+        self.connection.refresh_from_db()
+        self.customer.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(self.connection.sync_status, 'synced')
+        self.assertTrue(self.customer.banking_verified)
+        self.assertEqual(self.loan.status, 'pending_signature')
+        self.assertEqual(len(mail.outbox), 0)
+        self.assertEqual(
+            BankAccount.objects.filter(connection=self.connection).count(),
+            1,
+        )
+
+    def test_zero_transactions_recovers_from_cached_cibc_history(self):
+        empty = {
+            'Accounts': [
+                {
+                    'Id': 'acct-010',
+                    'Title': 'CIBC',
+                    'Type': 'Chequing',
+                    'Currency': 'CAD',
+                    'InstitutionNumber': '010',
+                    'TransitNumber': '11111',
+                    'AccountNumber': '2222',
+                    'Transactions': [],
+                }
+            ]
+        }
+        cached = self._history_payload('010')
+        with patch('banking.tasks.time.sleep'), patch(
+            'banking.tasks.requests.post',
+            side_effect=[
+                _flinks_json_response(200, {'RequestId': 'live-1'}),
+                _flinks_json_response(200, empty),
+                _flinks_json_response(200, {'RequestId': 'live-2'}),
+                _flinks_json_response(200, empty),
+                _flinks_json_response(200, {'RequestId': 'live-3'}),
+                _flinks_json_response(200, empty),
+                _flinks_json_response(200, {'RequestId': 'live-4'}),
+                _flinks_json_response(200, empty),
+                _flinks_json_response(200, {'RequestId': 'cached-req'}),
+                _flinks_json_response(200, cached),
+            ],
+        ):
+            result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        self.assertTrue(result)
+        self.customer.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertTrue(self.customer.banking_verified)
+        self.assertEqual(self.loan.status, 'pending_signature')
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_already_exists_stays_pending_without_failing_ibv(self):
+        with patch('banking.tasks._try_cached_flinks_detail', return_value=False), patch(
+            'banking.tasks.requests.post',
+            return_value=_flinks_json_response(
+                400,
+                {
+                    'HttpStatusCode': 400,
+                    'Message': 'This login already exists',
+                },
+            ),
+        ):
+            result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        self.assertFalse(result)
+        self.connection.refresh_from_db()
+        self.customer.refresh_from_db()
+        self.assertEqual(self.connection.sync_status, 'pending')
+        self.assertIn('awaiting GetAccountsDetail webhook', self.connection.sync_error)
+        self.assertFalse(self.customer.banking_verified)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_session_expired_stays_pending_without_failing_ibv(self):
+        with patch('banking.tasks._try_cached_flinks_detail', return_value=False), patch(
+            'banking.tasks.requests.post',
+            return_value=_flinks_json_response(
+                400,
+                {
+                    'HttpStatusCode': 400,
+                    'FlinksCode': 'SESSION_EXPIRED',
+                    'Message': 'Session expired',
+                },
+            ),
+        ):
+            result = tasks.fetch_flinks_accounts_only(str(self.connection.id))
+
+        self.assertFalse(result)
+        self.connection.refresh_from_db()
+        self.assertEqual(self.connection.sync_status, 'pending')
+        self.assertFalse(self.customer.banking_verified)
+        self.assertEqual(len(mail.outbox), 0)
