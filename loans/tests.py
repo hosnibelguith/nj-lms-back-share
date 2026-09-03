@@ -5154,14 +5154,7 @@ class PaymentScheduleIntegrityTests(APITestCase):
         self.assertEqual(stopped.status_code, 400, stopped.data)
         self.assertFalse(self.loan.payments.filter(type="rebate").exists())
 
-        cash = self.client.post(
-            f"/api/loans/{self.loan.id}/record_payment/",
-            {"amount": "10.00", "type": "etransfer"},
-            format="json",
-        )
-        self.assertEqual(cash.status_code, 400, cash.data)
-
-    def test_record_payment_rejects_overpay_pending_and_stopped_loans(self):
+    def test_record_payment_rejects_overpay_and_pending_loans(self):
         self._add_payment("147.18")
         self.loan.balance = Decimal("147.18")
         self.loan.save(update_fields=["balance", "updated_at"])
@@ -5172,6 +5165,17 @@ class PaymentScheduleIntegrityTests(APITestCase):
             format="json",
         )
         self.assertEqual(overpay.status_code, 400, overpay.data)
+
+        self.loan.status = "pending"
+        self.loan.save(update_fields=["status", "updated_at"])
+        pending_loan = self.client.post(
+            f"/api/loans/{self.loan.id}/record_payment/",
+            {"amount": "10.00", "type": "etransfer"},
+            format="json",
+        )
+        self.assertEqual(pending_loan.status_code, 400, pending_loan.data)
+        self.loan.status = "active"
+        self.loan.save(update_fields=["status", "updated_at"])
 
         pending = self._add_payment("50.00", days=14, status="pending")
         self.loan.balance = Decimal("197.18")
@@ -5189,19 +5193,10 @@ class PaymentScheduleIntegrityTests(APITestCase):
         self.assertEqual(self.loan.balance, Decimal("187.18"))
         pending.delete()
 
-        self.loan.status = "stopped"
+        self.loan.status = "defaulted"
         self.loan.is_active = False
         self.loan.balance = Decimal("147.18")
         self.loan.save(update_fields=["status", "is_active", "balance", "updated_at"])
-        stopped = self.client.post(
-            f"/api/loans/{self.loan.id}/record_payment/",
-            {"amount": "10.00", "type": "etransfer"},
-            format="json",
-        )
-        self.assertEqual(stopped.status_code, 400, stopped.data)
-
-        self.loan.status = "defaulted"
-        self.loan.save(update_fields=["status", "updated_at"])
         allowed = self.client.post(
             f"/api/loans/{self.loan.id}/record_payment/",
             {"amount": "47.18", "type": "etransfer", "notes": "Interac received"},
@@ -5212,6 +5207,117 @@ class PaymentScheduleIntegrityTests(APITestCase):
         self.assertEqual(self.loan.balance, Decimal("100.00"))
         self.assertTrue(
             self.loan.payments.filter(type="etransfer", status="completed").exists()
+        )
+
+    def test_record_interac_on_stopped_loan_credits_balance_without_restarting_pad(self):
+        failed = self._add_payment("131.05", status="failed")
+        failed.failure_reason = "EftFailedAccountClosed"
+        failed.save(update_fields=["failure_reason"])
+        later = self._add_payment("131.05", days=14)
+        last = self._add_payment("61.64", days=28)
+        self.loan.balance = Decimal("192.69")
+        self.loan.status = "stopped"
+        self.loan.is_active = False
+        self.loan.save(update_fields=["status", "is_active", "balance", "updated_at"])
+        self.loan.unschedule_remaining_payments()
+        later.refresh_from_db()
+        last.refresh_from_db()
+        self.assertEqual(later.status, "unscheduled")
+        self.assertEqual(last.status, "unscheduled")
+
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/record_payment/",
+            {
+                "amount": "100.00",
+                "type": "etransfer",
+                "notes": "Interac received",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.loan.refresh_from_db()
+        later.refresh_from_db()
+        interac = self.loan.payments.get(type="etransfer", status="completed")
+        self.assertEqual(self.loan.status, "stopped")
+        self.assertFalse(self.loan.is_active)
+        self.assertEqual(self.loan.balance, Decimal("92.69"))
+        self.assertEqual(interac.amount, Decimal("100.00"))
+        self.assertFalse(self.loan.payments.filter(status="scheduled").exists())
+        remaining = list(
+            self.loan.payments.filter(status="unscheduled").order_by("scheduled_date", "id")
+        )
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0].id, later.id)
+        self.assertEqual(remaining[0].amount, Decimal("92.69"))
+        self.assertFalse(Payment.objects.filter(id=last.id).exists())
+
+        revert = self.client.post(
+            f"/api/payments/{interac.id}/revert-recorded/",
+            {},
+            format="json",
+        )
+        self.assertEqual(revert.status_code, 200, revert.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "stopped")
+        self.assertFalse(self.loan.is_active)
+        self.assertEqual(self.loan.balance, Decimal("192.69"))
+        self.assertFalse(self.loan.payments.filter(status="scheduled").exists())
+        self.assertEqual(
+            sum(
+                (p.amount for p in self.loan.payments.filter(status="unscheduled")),
+                Decimal("0.00"),
+            ),
+            Decimal("192.69"),
+        )
+        self.assertTrue(Payment.objects.filter(pk=failed.pk, status="failed").exists())
+
+    def test_record_interac_payoff_on_stopped_loan_marks_paid_off(self):
+        self._add_payment("131.05", status="failed")
+        leftover = self._add_payment("92.69", days=14)
+        self.loan.balance = Decimal("92.69")
+        self.loan.status = "stopped"
+        self.loan.is_active = False
+        self.loan.save(update_fields=["status", "is_active", "balance", "updated_at"])
+        self.loan.unschedule_remaining_payments()
+
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/record_payment/",
+            {
+                "amount": "92.69",
+                "type": "etransfer",
+                "notes": "Interac received",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "paid_off")
+        self.assertEqual(self.loan.balance, Decimal("0.00"))
+        self.assertFalse(
+            self.loan.payments.filter(status__in=["scheduled", "unscheduled"]).exists()
+        )
+        self.assertFalse(Payment.objects.filter(id=leftover.id).exists())
+
+        interac = self.loan.payments.get(type="etransfer", status="completed")
+        revert = self.client.post(
+            f"/api/payments/{interac.id}/revert-recorded/",
+            {},
+            format="json",
+        )
+        self.assertEqual(revert.status_code, 200, revert.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "stopped")
+        self.assertFalse(self.loan.is_active)
+        self.assertEqual(self.loan.balance, Decimal("92.69"))
+        self.assertFalse(self.loan.payments.filter(status="scheduled").exists())
+        self.assertEqual(
+            sum(
+                (p.amount for p in self.loan.payments.filter(status="unscheduled")),
+                Decimal("0.00"),
+            ),
+            Decimal("92.69"),
         )
 
     def test_record_payment_credits_settled_balance_while_collection_processing(self):

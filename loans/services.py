@@ -20,6 +20,9 @@ class LoanService:
     """Service class for loan operations."""
 
     RECEIVED_PAYMENT_MAX_AGE_DAYS = 3
+    # Stopped loans still accept Interac/manual credits when PAD cannot run
+    # (account closed / inactive). Do not reactivate; only reduce balance.
+    STAFF_CREDIT_LOAN_STATUSES = ('active', 'defaulted', 'stopped')
 
     @staticmethod
     def money(value):
@@ -859,8 +862,10 @@ class LoanService:
     ) -> Payment:
         """Record a received Interac/manual payment and shorten remaining PAD rows."""
         loan = Loan.objects.select_for_update().get(pk=loan.pk)
-        if loan.status not in ('active', 'defaulted'):
-            raise ValueError('Only collecting loans can record a received payment.')
+        if loan.status not in LoanService.STAFF_CREDIT_LOAN_STATUSES:
+            raise ValueError(
+                'Only collecting or stopped loans can record a received payment.'
+            )
         if payment_type not in ('manual', 'etransfer'):
             raise ValueError('Payment type must be manual or Interac e-transfer.')
 
@@ -1090,7 +1095,7 @@ class LoanService:
             .order_by('-created_at')
             .first()
         )
-        if event and event.previous_status in ('active', 'defaulted'):
+        if event and event.previous_status in LoanService.STAFF_CREDIT_LOAN_STATUSES:
             return event.previous_status
         if loan.payments.filter(status__in=('nsf', 'failed')).exists():
             return 'defaulted'
@@ -1102,7 +1107,7 @@ class LoanService:
             raise ValueError(
                 'Only recorded Interac, manual, or rebate rows can be reverted or updated.'
             )
-        if loan.status not in ('active', 'defaulted', 'paid_off'):
+        if loan.status not in LoanService.STAFF_CREDIT_LOAN_STATUSES + ('paid_off',):
             raise ValueError(
                 'This recorded payment can no longer be reverted or updated.'
             )
@@ -1280,12 +1285,12 @@ class LoanService:
         return payment
 
     @staticmethod
-    def _trim_scheduled_payments_to_balance(loan: Loan) -> None:
-        """Drop or shrink future scheduled rows so they match remaining balance."""
+    def _trim_scheduled_payments_to_balance(loan: Loan, *, statuses=('scheduled',)) -> None:
+        """Drop or shrink remaining installment rows so they match remaining balance."""
         money = LoanService.money
         target = money(loan.balance or Decimal('0.00'))
         scheduled = list(
-            loan.payments.filter(status='scheduled').order_by(
+            loan.payments.filter(status__in=statuses).order_by(
                 '-scheduled_date', '-created_at', '-id'
             )
         )
@@ -1309,14 +1314,14 @@ class LoanService:
             extra = Decimal('0.00')
 
     @staticmethod
-    def _expand_scheduled_payments_by_amount(loan: Loan, amount: Decimal) -> None:
-        """Add amount back onto the last scheduled installment (or create one)."""
+    def _expand_scheduled_payments_by_amount(loan: Loan, amount: Decimal, *, status='scheduled') -> None:
+        """Add amount back onto the last matching installment (or create one)."""
         money = LoanService.money
         amount = money(amount)
         if amount <= 0:
             return
         last = (
-            loan.payments.filter(status='scheduled')
+            loan.payments.filter(status=status)
             .order_by('-scheduled_date', '-created_at', '-id')
             .first()
         )
@@ -1340,7 +1345,7 @@ class LoanService:
             loan=loan,
             amount=amount,
             type='scheduled',
-            status='scheduled',
+            status=status,
             **date_fields,
         )
 
@@ -1348,6 +1353,41 @@ class LoanService:
     def _align_scheduled_payments_to_balance(loan: Loan) -> None:
         money = LoanService.money
         target = money(loan.balance or Decimal('0.00'))
+        if loan.status == 'stopped':
+            # Closed/inactive account: keep remaining rows unscheduled. Never
+            # create live PAD; Reactivate Loan is what restarts collections.
+            LoanService._trim_scheduled_payments_to_balance(
+                loan,
+                statuses=('scheduled', 'unscheduled'),
+            )
+            current = money(
+                sum(
+                    (
+                        money(row.amount or Decimal('0.00'))
+                        for row in loan.payments.filter(
+                            status__in=('scheduled', 'unscheduled')
+                        )
+                    ),
+                    Decimal('0.00'),
+                )
+            )
+            shortfall = money(target - current)
+            if shortfall > 0:
+                LoanService._expand_scheduled_payments_by_amount(
+                    loan,
+                    shortfall,
+                    status='unscheduled',
+                )
+            loan.unschedule_remaining_payments()
+            return
+        if target == 0:
+            # Payoff (including Interac on a previously stopped loan): drop
+            # leftover installment rows without creating scheduled PAD.
+            LoanService._trim_scheduled_payments_to_balance(
+                loan,
+                statuses=('scheduled', 'unscheduled'),
+            )
+            return
         current = money(
             sum(
                 (

@@ -1042,9 +1042,9 @@ class LoanViewSet(viewsets.ModelViewSet):
     def record_payment(self, request, pk=None):
         loan = self.get_object()
 
-        if loan.status not in ('active', 'defaulted'):
+        if loan.status not in LoanService.STAFF_CREDIT_LOAN_STATUSES:
             return Response(
-                {'error': 'Only collecting loans can record a received payment'},
+                {'error': 'Only collecting or stopped loans can record a received payment'},
                 status=400,
             )
 
