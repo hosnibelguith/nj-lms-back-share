@@ -1,5 +1,6 @@
 """
-Render the Mohawk / Arrive loan agreement with dynamic variables.
+Render the Mohawk loan agreement with dynamic variables.
+Landing and Arrive share one template; funding language follows the channel.
 Customer address fields are omitted until IBV provides them.
 """
 from __future__ import annotations
@@ -10,10 +11,110 @@ from typing import Any
 
 from django.utils import timezone
 
-from accounts.models import GlobalSetting
+from accounts.models import Customer, GlobalSetting
 
 
-AGREEMENT_VERSION = "mohawk-arrive-v1"
+AGREEMENT_VERSION = "mohawk-channel-v2"
+
+
+def is_arrive_customer(customer) -> bool:
+    """Same rule as loan/staff flows: Arrive source or Arrive application id."""
+    return bool(
+        getattr(customer, "source", None) == Customer.SOURCE_ARRIVE
+        or getattr(customer, "arrive_application_id", None)
+    )
+
+
+def _channel_copy(customer) -> dict[str, str]:
+    """Landing vs Arrive funding language. Shared legal body stays one template."""
+    if is_arrive_customer(customer):
+        return {
+            "application_channel": "Arrive",
+            "funding_authorization_heading": (
+                "Amount Financed and Secured Card Funding Authorization"
+            ),
+            "funding_disbursement_terms": (
+                "THE BORROWER WILL NOT RECEIVE THE PRINCIPAL AMOUNT AS A CASH "
+                "DEPOSIT OR DEPOSIT INTO THE BORROWER'S BANK ACCOUNT. Instead, "
+                "upon approval and completion of all required documentation, the "
+                "applicable funds will be paid or applied directly to fund the "
+                "Borrower's secured card account (the \"Secured Card Funding\"). "
+                "The date on which the funds are applied to the secured card "
+                "account is referred to as the \"Funding Date.\" The Borrower "
+                "expressly authorizes the Lender and its service providers to "
+                "direct the applicable financed amount to the secured card "
+                "program for this purpose."
+            ),
+            "funding_repayment_ack": (
+                "The Borrower acknowledges that this financing creates a "
+                "repayment obligation even though the financed funds are not "
+                "deposited into the Borrower's bank account. The Borrower's bank "
+                "account information is collected and used for identity and "
+                "account verification and for repayment by Pre-Authorized Debit, "
+                "as described in this Agreement and the annexed PAD Agreement."
+            ),
+            "funding_principal_components": "secured card funding amount",
+            "funding_example_disbursement_label": (
+                "Amount applied to fund the secured card"
+            ),
+            "funding_example_disbursement_total_label": "Secured card funding",
+            "rescission_return_terms": (
+                "the full Secured Card Funding is returned, reversed, or "
+                "otherwise made available to Us in accordance with instructions "
+                "provided by Us. Exercising this right may require cancellation "
+                "or reversal of the corresponding secured card funding transaction."
+            ),
+            "funding_amount_label": "secured card funding amount",
+            "principal_funding_component": (
+                "the amount applied to fund the Borrower's secured card account"
+            ),
+            "principal_deposit_disclaimer": (
+                "No portion of the Principal Amount is required to be deposited "
+                "into the Borrower's bank account."
+            ),
+        }
+    return {
+        "application_channel": "Landing",
+        "funding_authorization_heading": (
+            "Amount Financed and Bank Account Funding Authorization"
+        ),
+        "funding_disbursement_terms": (
+            "Upon approval and completion of all required documentation, the "
+            "applicable funds will be paid or deposited to the Borrower's "
+            "designated bank account by electronic funds transfer (EFT) or "
+            "Interac e-Transfer (the \"Bank Account Funding\"). The date on "
+            "which the funds are deposited or sent is referred to as the "
+            "\"Funding Date.\" The Borrower expressly authorizes the Lender and "
+            "its service providers to direct the applicable financed amount to "
+            "the Borrower's designated bank account for this purpose."
+        ),
+        "funding_repayment_ack": (
+            "The Borrower acknowledges that this financing creates a repayment "
+            "obligation. The Borrower's bank account information is collected "
+            "and used for identity and account verification, for disbursement of "
+            "the Principal Amount, and for repayment by Pre-Authorized Debit, as "
+            "described in this Agreement and the annexed PAD Agreement."
+        ),
+        "funding_principal_components": "bank account funding amount",
+        "funding_example_disbursement_label": (
+            "Amount deposited to the borrower's bank account"
+        ),
+        "funding_example_disbursement_total_label": "Bank account funding",
+        "rescission_return_terms": (
+            "the full Bank Account Funding is returned, reversed, or otherwise "
+            "made available to Us in accordance with instructions provided by "
+            "Us. Exercising this right may require reversal of the corresponding "
+            "bank account funding transaction."
+        ),
+        "funding_amount_label": "bank account funding amount",
+        "principal_funding_component": (
+            "the amount disbursed to the Borrower's bank account"
+        ),
+        "principal_deposit_disclaimer": (
+            "The Principal Amount, less any financed cosigner or third-party "
+            "service fee, is disbursed to the Borrower's designated bank account."
+        ),
+    }
 
 
 def _money(value) -> str:
@@ -131,6 +232,7 @@ def build_agreement_context(customer, loan) -> dict[str, str]:
 
     return {
         **lender,
+        **_channel_copy(customer),
         "customer_name": customer.full_name or f"{customer.first_name} {customer.last_name}".strip(),
         "customer_phone_number": phone,
         "customer_mobile_phone": phone,
@@ -167,6 +269,7 @@ AGREEMENT_HTML = """
     <p><strong>BORROWER NAME:</strong> {customer_name}</p>
     <p><strong>BORROWER'S TELEPHONE NUMBER:</strong> {customer_phone_number}</p>
     <p><strong>ORIGINATION DATE:</strong> {date_today}</p>
+    <p><strong>APPLICATION CHANNEL:</strong> {application_channel}</p>
   </header>
 
   <p>In this High-Cost Installment Loan Agreement ("Loan Agreement" or "Agreement"), the words "You" and "Your" mean the Borrower identified above. The words "We", "Us", "Our" and "Lender" mean MohawkLoans, a business operating on the Mohawk Territory of Kanehsatake in the Province of Quebec.</p>
@@ -193,11 +296,11 @@ AGREEMENT_HTML = """
 
   <p><strong>Alternative Forms of Credit:</strong> This Loan has a high interest rate and is not intended to provide a solution for longer term credit or other financial needs. Alternative forms of credit may be less expensive and more suitable for your financial needs. Please consider Your ability to repay the loan and if You are having financial difficulties, You should seek the assistance of financial counselors. Please carefully read the terms of this Agreement before executing.</p>
 
-  <p><strong>Amount Financed and Secured Card Funding Authorization:</strong> The Lender agrees to provide financing in the amount of {amount_financed} dollars ({amount_financed} CAD) (the "Principal Amount"). THE BORROWER WILL NOT RECEIVE THE PRINCIPAL AMOUNT AS A CASH DEPOSIT OR DEPOSIT INTO THE BORROWER'S BANK ACCOUNT. Instead, upon approval and completion of all required documentation, the applicable funds will be paid or applied directly to fund the Borrower's secured card account (the "Secured Card Funding"). The date on which the funds are applied to the secured card account is referred to as the "Funding Date." The Borrower expressly authorizes the Lender and its service providers to direct the applicable financed amount to the secured card program for this purpose.</p>
+  <p><strong>{funding_authorization_heading}:</strong> The Lender agrees to provide financing in the amount of {amount_financed} dollars ({amount_financed} CAD) (the "Principal Amount"). {funding_disbursement_terms}</p>
 
-  <p>The Borrower acknowledges that this financing creates a repayment obligation even though the financed funds are not deposited into the Borrower's bank account. The Borrower's bank account information is collected and used for identity and account verification and for repayment by Pre-Authorized Debit, as described in this Agreement and the annexed PAD Agreement.</p>
+  <p>{funding_repayment_ack}</p>
 
-  <p>Interest at the annual rate disclosed in this Agreement is calculated on the outstanding Principal Amount using a daily periodic rate equal to the annual rate divided by 365. The Principal Amount may consist of the secured card funding amount and financed third-party or cosigner service fees, if applicable. Interest begins to accrue on the Funding Date and continues until all principal, fees, and accrued interest are paid in full.</p>
+  <p>Interest at the annual rate disclosed in this Agreement is calculated on the outstanding Principal Amount using a daily periodic rate equal to the annual rate divided by 365. The Principal Amount may consist of the {funding_principal_components} and financed third-party or cosigner service fees, if applicable. Interest begins to accrue on the Funding Date and continues until all principal, fees, and accrued interest are paid in full.</p>
 
   <p><strong>Consideration:</strong> The Lender and the Borrower agree on a payment plan of {loan_number_of_payments} of payments of {loan_first_payment_amount} dollars ($CAD) each. The payment period is effective upon signature of this contract and the first of these payments is due on {loan_first_payment_date}. The Payment Schedule is established as follows:</p>
 
@@ -208,7 +311,7 @@ AGREEMENT_HTML = """
     <p>The following calendar is provided solely to illustrate how financed fees and daily interest may affect repayment. It is not an offer, approval, promise, or statement of the Borrower's actual loan terms. The Borrower's binding Principal Amount, annual interest rate, Funding Date, payment frequency, payment amounts, fees, and due dates are those stated elsewhere in the completed Agreement and Payment Schedule.</p>
     <p><strong>Example assumptions:</strong></p>
     <ul>
-      <li>Amount applied to fund the secured card: $500.00</li>
+      <li>{funding_example_disbursement_label}: $500.00</li>
       <li>Financed service/cosigner fee: 70% of $500.00 = $350.00</li>
       <li>Example Principal Amount: $500.00 + $350.00 = $850.00</li>
       <li>Example annual interest rate: 35.00%</li>
@@ -237,7 +340,7 @@ AGREEMENT_HTML = """
     </div>
     <p><strong>Example totals:</strong></p>
     <ul>
-      <li>Secured card funding: $500.00</li>
+      <li>{funding_example_disbursement_total_label}: $500.00</li>
       <li>Financed 70% service/cosigner fee: $350.00</li>
       <li>Total example Principal Amount: $850.00</li>
       <li>Total example interest over the six scheduled periods: $39.94</li>
@@ -256,7 +359,7 @@ AGREEMENT_HTML = """
   <p>A fee of forty ($40 CAD) dollars will be charged to the Borrower for any postponing of planned payments included in this contract ("Deferral Fee").</p>
   <p>The Borrower must notify the lender about postponing automatic payments at least four business days before the date of said payment.</p>
 
-  <p><strong>Right of Rescission:</strong> You have the right to rescind this financing without incurring a fee if, on or before the close of the next business day following the Funding Date, You provide written notice to Us at {lending_license_holder_address} and the full Secured Card Funding is returned, reversed, or otherwise made available to Us in accordance with instructions provided by Us. Exercising this right may require cancellation or reversal of the corresponding secured card funding transaction.</p>
+  <p><strong>Right of Rescission:</strong> You have the right to rescind this financing without incurring a fee if, on or before the close of the next business day following the Funding Date, You provide written notice to Us at {lending_license_holder_address} and {rescission_return_terms}</p>
 
   <h2>Automatic Payment Authorizations</h2>
   <p>By signing this Agreement, You authorize Your payments to Us via electronic fund transfers as indicated below by Pre-Authorized Debit (PAD) or as mutually agreed upon outside of this Loan Agreement.</p>
@@ -294,7 +397,7 @@ AGREEMENT_HTML = """
 
   <h2>Cosigners – Cosigns.ca</h2>
   <p>The Borrower acknowledges and agrees that, as part of the loan approval and risk mitigation process, the Lender may engage third-party cosigner facilitation services, including but not limited to Cosigns.ca (“Cosigner Service”). The purpose of such Cosigner Service is to support the approval of the Borrower’s loan application by introducing a qualified cosigner profile; however, such cosigner shall not be responsible for repayment of the Loan, and assumes no liability, obligation, or guarantee with respect to the Borrower’s repayment obligations under this Agreement.</p>
-  <p>The Borrower hereby expressly authorizes the Lender to allocate and pay a cosigner service fee equal to up to seventy percent (70%) of the secured card funding amount, which fee may be financed and included in the Principal Amount. The Borrower understands and agrees that the Principal Amount may include both (i) the amount applied to fund the Borrower's secured card account and (ii) any financed cosigner or third-party service fee. No portion of the Principal Amount is required to be deposited into the Borrower's bank account.</p>
+  <p>The Borrower hereby expressly authorizes the Lender to allocate and pay a cosigner service fee equal to up to seventy percent (70%) of the {funding_amount_label}, which fee may be financed and included in the Principal Amount. The Borrower understands and agrees that the Principal Amount may include both (i) {principal_funding_component} and (ii) any financed cosigner or third-party service fee. {principal_deposit_disclaimer}</p>
   <p>The Borrower further acknowledges that the engagement, compensation, and contractual relationship with any cosigner or Cosigner Service is solely between the Lender and such third party. The Borrower shall have no claim, recourse, or rights against the cosigner or Cosigner Service in relation to this Agreement.</p>
   <p>The Borrower may propose their own cosigner for consideration; however, the Lender reserves the sole and absolute right to accept, reject, or further verify any proposed cosigner in accordance with the Lender's underwriting, identity-verification, and risk requirements. Acceptance of a proposed cosigner does not alter the Borrower's obligations unless the Lender expressly agrees otherwise in writing.</p>
 

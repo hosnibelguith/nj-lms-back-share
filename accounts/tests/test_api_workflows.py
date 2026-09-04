@@ -480,6 +480,9 @@ class BackendApiWorkflowTests(APITestCase):
         preview_response = self.client.get("/api/portal/me/contract-preview/")
         self.assertEqual(preview_response.status_code, 200, preview_response.data)
         self.assertEqual(str(preview_response.data["loan"]), str(self.loan.id))
+        self.assertIn("APPLICATION CHANNEL:</strong> Landing", preview_response.data["agreement_text"])
+        self.assertIn("Bank Account Funding", preview_response.data["agreement_text"])
+        self.assertNotIn("Secured Card Funding", preview_response.data["agreement_text"])
 
         sign_response = self.client.post(
             "/api/portal/me/sign-contract/",

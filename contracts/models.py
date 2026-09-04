@@ -18,7 +18,7 @@ class Contract(models.Model):
         ('void', 'Void'),
     ]
 
-    AGREEMENT_VERSION = 'mohawk-arrive-v1'
+    AGREEMENT_VERSION = 'mohawk-channel-v2'
 
     DEFAULT_AGREEMENT_TEXT = (
         'Loan agreement content is generated dynamically at preview/sign time.'
