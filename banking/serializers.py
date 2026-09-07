@@ -114,3 +114,4 @@ class CustomerPortalBankingStatusSerializer(serializers.Serializer):
     failure_message = serializers.CharField(allow_null=True, required=False)
     failure_reason_code = serializers.CharField(allow_null=True, required=False)
     requires_ibv_refill = serializers.BooleanField(required=False)
+    ibv_refill_requested = serializers.BooleanField(required=False)

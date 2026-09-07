@@ -89,6 +89,8 @@ class CustomerAdmin(admin.ModelAdmin):
             "fields": (
                 "onboarding_stage",
                 "banking_verified",
+                "ibv_source",
+                "ibv_refill_requested",
                 "references_completed",
                 "contract_completed",
                 "phone_verified",

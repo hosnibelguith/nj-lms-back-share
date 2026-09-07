@@ -140,7 +140,7 @@ class ConnectBankView(CustomerPortalBaseView):
         )
 
         existing_ibv_plan = find_repairable_synced_ibv(customer, login_id=login_id)
-        if existing_ibv_plan is not None:
+        if existing_ibv_plan is not None and not customer.ibv_refill_requested:
             result = apply_synced_ibv_repair(existing_ibv_plan)
             logger.info(
                 'Flinks connect restored existing synced IBV customer_id=%s '
@@ -187,7 +187,7 @@ class ResetPendingBankConnectionView(CustomerPortalBaseView):
 
     def post(self, request):
         customer = self.get_customer(request)
-        if customer.banking_verified:
+        if customer.banking_verified and not customer.ibv_refill_requested:
             return Response(
                 {"error": "Banking is already verified."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -222,7 +222,7 @@ class RetryFlinksSyncView(CustomerPortalBaseView):
 
     def post(self, request):
         customer = self.get_customer(request)
-        if customer.banking_verified:
+        if customer.banking_verified and not customer.ibv_refill_requested:
             return Response(
                 {"error": "Banking is already verified."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -302,6 +302,7 @@ class CustomerPortalBankingStatusView(CustomerPortalBaseView):
                 and customer.onboarding_stage == 'banking_verification'
                 and failure_reason_code == UNSUPPORTED_IBV_REASON_CODE
             ),
+            'ibv_refill_requested': bool(customer.ibv_refill_requested),
         }
 
         serializer = CustomerPortalBankingStatusSerializer(payload)

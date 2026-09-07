@@ -369,7 +369,7 @@ def _log_banking_failure(customer, title, description, metadata=None):
 
 
 def _mark_banking_failed(connection, customer, reason):
-    if customer.banking_verified:
+    if customer.banking_verified and not customer.ibv_refill_requested:
         logger.warning(
             'Flinks sync failed after IBV already complete; leaving verified '
             'customer_id=%s connection_id=%s reason=%s',
@@ -392,6 +392,18 @@ def _mark_banking_failed(connection, customer, reason):
     connection.sync_status = 'failed'
     connection.sync_error = reason
     connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
+
+    if customer.banking_verified:
+        logger.warning(
+            'Staff IBV refill failed; leaving funded file verified '
+            'customer_id=%s connection_id=%s reason=%s',
+            customer.id,
+            connection.id,
+            reason,
+        )
+        _log_banking_failure(customer, 'Banking Verification Failed', reason)
+        send_banking_retry_email.delay(str(customer.id), reason)
+        return False
 
     customer.banking_verified = False
     if customer.onboarding_stage != 'banking_verification':
@@ -531,7 +543,7 @@ def _mark_awaiting_flinks_webhook(connection, reason: str) -> None:
         f'Flinks pull timed out; awaiting GetAccountsDetail webhook. ({reason})'
     )[:2000]
     customer = getattr(connection, 'customer', None)
-    if customer is not None and customer.banking_verified:
+    if customer is not None and customer.banking_verified and not customer.ibv_refill_requested:
         connection.sync_status = 'synced'
         connection.sync_error = message
         connection.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
@@ -564,6 +576,8 @@ def _complete_ibv_from_existing_data(connection, customer) -> bool:
     """Finish IBV when this LoginId was already fetched (exists already / reconnect)."""
     if connection.accounts.exists() and _connection_has_transactions(connection):
         return _mark_banking_success(connection, customer)
+    if customer.ibv_refill_requested:
+        return False
     from banking.repair import apply_synced_ibv_repair, find_repairable_synced_ibv
 
     plan = find_repairable_synced_ibv(
@@ -738,6 +752,7 @@ def apply_flinks_accounts_detail(connection, accounts_json) -> bool:
     """Persist a GetAccountsDetail-shaped payload (API pull or Flinks webhook)."""
     customer = connection.customer
     already_verified = bool(customer.banking_verified)
+    refill_requested = bool(customer.ibv_refill_requested)
     accounts_data = (accounts_json or {}).get('Accounts') or []
     flinks_email, flinks_phone, flinks_name = _extract_holder_identity(accounts_data)
     if flinks_email or flinks_phone or flinks_name:
@@ -748,17 +763,17 @@ def apply_flinks_accounts_detail(connection, accounts_json) -> bool:
             flinks_name=flinks_name,
         )
     if not accounts_data:
-        if already_verified:
+        if already_verified and not refill_requested:
             return bool(flinks_email or flinks_name)
         return _mark_banking_failed(connection, customer, NO_ACCOUNTS_MESSAGE)
 
     if _count_transactions(accounts_data) == 0:
-        if already_verified:
+        if already_verified and not refill_requested:
             _persist_accounts(connection, customer, accounts_data)
             return True
         return _mark_banking_failed(connection, customer, ZERO_TRANSACTIONS_MESSAGE)
 
-    if already_verified:
+    if already_verified and not refill_requested:
         _persist_accounts(connection, customer, accounts_data)
         apply_portal_flinks_identity(
             customer,
@@ -1064,7 +1079,17 @@ def _mark_banking_success(connection, customer, flinks_email=None, flinks_phone=
         customer.banking_verified = True
         if customer.onboarding_stage == 'banking_verification':
             customer.onboarding_stage = 'contract'
-        customer.save(update_fields=['banking_verified', 'onboarding_stage', 'updated_at'])
+        customer.ibv_source = 'flinks'
+        customer.ibv_refill_requested = False
+        customer.save(
+            update_fields=[
+                'banking_verified',
+                'onboarding_stage',
+                'ibv_source',
+                'ibv_refill_requested',
+                'updated_at',
+            ]
+        )
 
         from loans.services import LoanService
         for loan in customer.loans.filter(status='ibv_pending'):

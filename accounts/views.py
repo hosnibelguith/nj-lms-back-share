@@ -428,6 +428,28 @@ class CustomerViewSet(viewsets.ModelViewSet):
             return Response(status=status.HTTP_204_NO_CONTENT)
         return _serve_customer_document(document)
 
+    @action(detail=True, methods=['post'], url_path='request-ibv')
+    def request_ibv(self, request, pk=None):
+        from banking.ibv_request import request_ibv
+
+        customer = self.get_object()
+        try:
+            payload = request_ibv(customer, user=request.user)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(payload)
+
+    @action(detail=True, methods=['post'], url_path='mark-ibv-received')
+    def mark_ibv_received(self, request, pk=None):
+        from banking.ibv_request import mark_ibv_received_syncdata
+
+        customer = self.get_object()
+        try:
+            payload = mark_ibv_received_syncdata(customer, user=request.user)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(payload)
+
 
 def _serve_customer_document(document):
     document.file.open('rb')

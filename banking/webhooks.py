@@ -194,7 +194,11 @@ def _complete_ibv_from_mohawk_analysis(
     )
 
     pending_loans = list(customer.loans.filter(status='ibv_pending'))
-    if customer.banking_verified and not pending_loans:
+    if (
+        customer.banking_verified
+        and not pending_loans
+        and not customer.ibv_refill_requested
+    ):
         return bool(flinks_email or flinks_name)
 
     from loans.services import LoanService
@@ -217,7 +221,17 @@ def _complete_ibv_from_mohawk_analysis(
         customer.banking_verified = True
         if customer.onboarding_stage == 'banking_verification':
             customer.onboarding_stage = 'contract'
-        customer.save(update_fields=['banking_verified', 'onboarding_stage', 'updated_at'])
+        customer.ibv_source = 'flinks'
+        customer.ibv_refill_requested = False
+        customer.save(
+            update_fields=[
+                'banking_verified',
+                'onboarding_stage',
+                'ibv_source',
+                'ibv_refill_requested',
+                'updated_at',
+            ]
+        )
 
         for loan in pending_loans:
             LoanService.mark_pending_signature(loan)

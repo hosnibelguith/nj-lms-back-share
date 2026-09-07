@@ -311,6 +311,155 @@ class BankingConnectTests(TestCase):
         response = self.client.post('/api/banking/reset-pending/', {}, format='json')
         self.assertEqual(response.status_code, 400, response.data)
 
+    def test_reset_pending_allowed_when_staff_ibv_refill_requested(self):
+        self.customer_a.banking_verified = True
+        self.customer_a.ibv_refill_requested = True
+        self.customer_a.save(
+            update_fields=['banking_verified', 'ibv_refill_requested', 'updated_at']
+        )
+        connection = BankConnection.objects.create(
+            customer=self.customer_a,
+            login_id=self.login_id,
+            provider='flinks',
+            is_active=True,
+            sync_status='pending',
+        )
+        self.client.force_authenticate(user=self.user_a)
+        response = self.client.post('/api/banking/reset-pending/', {}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        connection.refresh_from_db()
+        self.assertFalse(connection.is_active)
+
+        status = self.client.get('/api/portal/me/banking/')
+        self.assertEqual(status.status_code, 200, status.data)
+        self.assertTrue(status.data['ibv_refill_requested'])
+        self.assertTrue(status.data['banking_verified'])
+
+    def test_connect_skips_ibv_repair_when_staff_requested_refill(self):
+        loan = Loan.objects.create(
+            customer=self.customer_a,
+            principal=500,
+            fee=100,
+            total_amount=600,
+            balance=600,
+            status='ibv_pending',
+            is_active=True,
+        )
+        old_connection = BankConnection.objects.create(
+            customer=self.customer_a,
+            login_id=self.login_id,
+            provider='flinks',
+            is_active=False,
+            sync_status='synced',
+            last_synced_at=timezone.now(),
+        )
+        account = BankAccount.objects.create(
+            customer=self.customer_a,
+            connection=old_connection,
+            external_id='acct-refill',
+            name='Primary Checking',
+            type='checking',
+            balance=100,
+            is_primary=True,
+        )
+        BankTransaction.objects.create(
+            customer=self.customer_a,
+            account=account,
+            external_id='tx-refill',
+            date=timezone.localdate(),
+            description='Payroll',
+            credit=100,
+            balance=100,
+        )
+        self.customer_a.ibv_refill_requested = True
+        self.customer_a.save(update_fields=['ibv_refill_requested', 'updated_at'])
+
+        self.client.force_authenticate(user=self.user_a)
+        with patch('banking.views.fetch_flinks_accounts_only.delay') as mocked:
+            response = self.client.post(
+                '/api/banking/connect/',
+                {'login_id': self.login_id},
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['status'], 'SYNCING')
+        mocked.assert_called_once()
+        old_connection.refresh_from_db()
+        self.customer_a.refresh_from_db()
+        loan.refresh_from_db()
+        self.assertFalse(old_connection.is_active)
+        self.assertTrue(self.customer_a.ibv_refill_requested)
+        self.assertEqual(loan.status, 'ibv_pending')
+        self.assertEqual(
+            BankConnection.objects.filter(
+                customer=self.customer_a,
+                is_active=True,
+                login_id=self.login_id,
+            ).count(),
+            1,
+        )
+
+    def test_flinks_detail_clears_staff_refill_on_already_verified_file(self):
+        self.customer_a.banking_verified = True
+        self.customer_a.ibv_refill_requested = True
+        self.customer_a.ibv_source = 'syncdata'
+        self.customer_a.onboarding_stage = 'portal_active'
+        self.customer_a.save(
+            update_fields=[
+                'banking_verified',
+                'ibv_refill_requested',
+                'ibv_source',
+                'onboarding_stage',
+                'updated_at',
+            ]
+        )
+        Loan.objects.create(
+            customer=self.customer_a,
+            principal=500,
+            fee=100,
+            total_amount=600,
+            balance=600,
+            status='active',
+            is_active=True,
+        )
+        connection = BankConnection.objects.create(
+            customer=self.customer_a,
+            login_id=str(uuid4()),
+            provider='flinks',
+            is_active=True,
+            sync_status='pending',
+        )
+        accounts_payload = {
+            'Accounts': [
+                {
+                    'Id': 'acct-refill-verified',
+                    'Title': 'Chequing',
+                    'Type': 'Chequing',
+                    'Currency': 'CAD',
+                    'Balance': {'Current': 800},
+                    'InstitutionNumber': '003',
+                    'TransitNumber': '12345',
+                    'AccountNumber': '1112223',
+                    'Transactions': [{
+                        'Id': 'tx-refill-verified',
+                        'Date': '2026-01-01',
+                        'Description': 'Pay',
+                        'Credit': 50,
+                    }],
+                }
+            ]
+        }
+        result = tasks.apply_flinks_accounts_detail(connection, accounts_payload)
+        self.assertTrue(result)
+        self.customer_a.refresh_from_db()
+        connection.refresh_from_db()
+        self.assertFalse(self.customer_a.ibv_refill_requested)
+        self.assertTrue(self.customer_a.banking_verified)
+        self.assertEqual(self.customer_a.ibv_source, 'flinks')
+        self.assertEqual(self.customer_a.onboarding_stage, 'portal_active')
+        self.assertEqual(connection.sync_status, 'synced')
+
     def test_sync_task_uses_connection_id_not_shared_login_id(self):
         connection_a = BankConnection.objects.create(
             customer=self.customer_a,

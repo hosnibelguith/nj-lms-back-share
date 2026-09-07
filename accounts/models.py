@@ -155,6 +155,25 @@ class Customer(models.Model):
     )
     password_setup_token = models.UUIDField(default=uuid.uuid4, editable=False, unique=True, null=True, blank=True)
     banking_verified = models.BooleanField(default=False)
+    IBV_SOURCE_FLINKS = 'flinks'
+    IBV_SOURCE_SYNCDATA = 'syncdata'
+    IBV_SOURCE_CHOICES = [
+        ('', 'Not set'),
+        (IBV_SOURCE_FLINKS, 'Flinks'),
+        (IBV_SOURCE_SYNCDATA, 'SyncData'),
+    ]
+    ibv_source = models.CharField(
+        max_length=20,
+        choices=IBV_SOURCE_CHOICES,
+        blank=True,
+        default='',
+        help_text='How IBV was completed: Flinks in this LMS, or marked received from SyncData.',
+    )
+    ibv_refill_requested = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text='Staff asked the client to complete a new IBV in the portal.',
+    )
     references_completed = models.BooleanField(default=False)
     contract_completed = models.BooleanField(default=False)
 
