@@ -58,6 +58,21 @@ urlpatterns = [
         name='customer-portal-start-new-application',
     ),
     path(
+        'portal/me/start-early-renewal/',
+        views.CustomerPortalStartEarlyRenewalView.as_view(),
+        name='customer-portal-start-early-renewal',
+    ),
+    path(
+        'portal/me/documents/',
+        views.CustomerPortalDocumentsView.as_view(),
+        name='customer-portal-documents',
+    ),
+    path(
+        'portal/me/documents/<uuid:document_id>/file/',
+        views.CustomerPortalDocumentFileView.as_view(),
+        name='customer-portal-document-file',
+    ),
+    path(
         'portal/me/contract-preview/',
         views.CustomerPortalContractPreviewView.as_view(),
         name='customer-portal-contract-preview',

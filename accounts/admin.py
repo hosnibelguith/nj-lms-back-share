@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User, Customer, GlobalSetting
+from .models import User, Customer, GlobalSetting, CustomerDocument
 
 @admin.register(GlobalSetting)
 class GlobalSettingAdmin(admin.ModelAdmin):
@@ -97,3 +97,12 @@ class CustomerAdmin(admin.ModelAdmin):
         }),
         ("Timestamps", {"fields": ("created_at", "updated_at")}),
     )
+
+
+@admin.register(CustomerDocument)
+class CustomerDocumentAdmin(admin.ModelAdmin):
+    list_display = ("id", "customer", "document_type", "original_filename", "created_at")
+    list_filter = ("document_type", "created_at")
+    search_fields = ("customer__first_name", "customer__last_name", "customer__email", "original_filename")
+    readonly_fields = ("id", "created_at")
+    raw_id_fields = ("customer", "uploaded_by")

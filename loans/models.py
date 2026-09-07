@@ -228,6 +228,21 @@ class Loan(models.Model):
     
     # Notes
     notes = models.TextField(blank=True, null=True, help_text="Internal notes")
+    previous_loan = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='renewal_loans',
+        help_text='Active loan being paid off by this early renewal',
+    )
+    renewal_payoff_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text='Old-loan balance applied at funding (new principal minus this is sent)',
+    )
     schedule_frequency = models.CharField(
         max_length=20,
         blank=True,

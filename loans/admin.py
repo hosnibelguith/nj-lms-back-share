@@ -40,7 +40,7 @@ class LoanAdmin(admin.ModelAdmin):
     search_fields = ("customer__first_name", "customer__last_name", "customer__email")
     ordering = ("-created_at",)
     readonly_fields = ("id", "total_amount", "created_at", "updated_at", "approved_at", "funded_at", "contract_sent_at", "contract_signed_at", "declined_at")
-    raw_id_fields = ("customer", "bank_account", "collections_account", "approved_by")
+    raw_id_fields = ("customer", "bank_account", "collections_account", "approved_by", "previous_loan")
     date_hierarchy = "created_at"
     inlines = [PaymentInline, FundedPaymentInline, CollectionPaymentInline]
 

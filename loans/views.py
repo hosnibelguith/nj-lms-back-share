@@ -491,6 +491,28 @@ class LoanViewSet(viewsets.ModelViewSet):
 
         return Response(LoanSerializer(loan).data)
 
+    @action(detail=True, methods=['post'], url_path='start-early-renewal')
+    def start_early_renewal(self, request, pk=None):
+        loan = self.get_object()
+        from loans.renewal import eligible_early_renewal_loan
+
+        eligible = eligible_early_renewal_loan(loan.customer)
+        if eligible is None or eligible.id != loan.id:
+            return Response(
+                {'error': 'This loan is not eligible for early renewal.'},
+                status=400,
+            )
+        requested_amount = request.data.get('requested_amount')
+        try:
+            new_loan = LoanService.start_early_renewal(
+                loan.customer,
+                user=request.user,
+                requested_amount=requested_amount,
+            )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=400)
+        return Response(LoanSerializer(new_loan).data, status=201)
+
     @action(detail=True, methods=['patch'], url_path='approved-amount')
     def update_approved_amount(self, request, pk=None):
         loan = self.get_object()
@@ -731,8 +753,27 @@ class LoanViewSet(viewsets.ModelViewSet):
             recommended_method = 'eft'
         collections_account = loan.collections_account or loan.bank_account
         readiness = funding_configuration_ready(loan)
+        try:
+            disbursement = LoanService.disbursement_amount(loan)
+        except ValueError:
+            disbursement = loan.principal
+        previous = getattr(loan, 'previous_loan', None)
+        old_balance = None
+        amount_deducted = None
+        if previous is not None:
+            old_balance = previous.balance
+            amount_deducted = loan.renewal_payoff_amount
+            if amount_deducted is None:
+                amount_deducted = old_balance
         return Response({
-            'amount': loan.principal,
+            'amount': disbursement,
+            'principal': loan.principal,
+            'previous_loan_id': str(previous.id) if previous else None,
+            'old_balance': old_balance,
+            'remaining_balance': old_balance,
+            'amount_deducted': amount_deducted,
+            'renewal_payoff_amount': loan.renewal_payoff_amount,
+            'net_to_client': disbursement,
             'recommended_method': recommended_method,
             'selected_method': loan.funding_method,
             'funding_destination': loan.funding_destination,

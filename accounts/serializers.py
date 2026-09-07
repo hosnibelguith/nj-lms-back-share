@@ -2,7 +2,7 @@ from rest_framework import serializers
 from django.contrib.auth import authenticate
 from django.db import transaction, IntegrityError
 from django.db.models import Q
-from .models import User, Customer, AuthOTPChallenge, GlobalSetting
+from .models import User, Customer, AuthOTPChallenge, GlobalSetting, CustomerDocument
 from .utils.phone import normalize_ca_phone
 from .services.otp import create_otp_challenge, verify_otp_challenge
 from .tasks import send_sms_otp_task, send_email_otp_task
@@ -721,6 +721,7 @@ class CustomerPortalDashboardSerializer(serializers.Serializer):
     can_renew = serializers.BooleanField()
     can_refinance = serializers.BooleanField()
     can_start_new_application = serializers.BooleanField()
+    early_renewal = serializers.DictField(allow_null=True, required=False)
 
     banking = serializers.DictField()
 
@@ -825,3 +826,71 @@ class ApiIntegrationsSerializer(serializers.Serializer):
                     key=key,
                     defaults={'value': data[field]}
                 )
+
+
+class CustomerDocumentSerializer(serializers.ModelSerializer):
+    document_type_display = serializers.CharField(
+        source='get_document_type_display', read_only=True
+    )
+    uploaded_by_name = serializers.CharField(
+        source='uploaded_by.full_name', read_only=True, allow_null=True, default=None
+    )
+    download_url = serializers.SerializerMethodField()
+    file = serializers.FileField(write_only=True)
+
+    class Meta:
+        model = CustomerDocument
+        fields = [
+            'id',
+            'document_type',
+            'document_type_display',
+            'original_filename',
+            'content_type',
+            'file',
+            'download_url',
+            'uploaded_by_name',
+            'created_at',
+        ]
+        read_only_fields = [
+            'id',
+            'document_type_display',
+            'original_filename',
+            'content_type',
+            'download_url',
+            'uploaded_by_name',
+            'created_at',
+        ]
+
+    def validate_document_type(self, value):
+        allowed = self.context.get('allowed_types') or CustomerDocument.STAFF_DOCUMENT_TYPES
+        if value not in allowed:
+            raise serializers.ValidationError('This document type is not available.')
+        return value
+
+    def validate_file(self, value):
+        import os
+
+        name = getattr(value, 'name', '') or ''
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in CustomerDocument.ALLOWED_EXTENSIONS:
+            raise serializers.ValidationError('Upload a PDF, JPG, PNG, or WebP file.')
+        size = getattr(value, 'size', 0) or 0
+        if size > CustomerDocument.MAX_BYTES:
+            raise serializers.ValidationError('File must be 10 MB or smaller.')
+        content_type = getattr(value, 'content_type', '') or ''
+        if content_type and content_type not in CustomerDocument.ALLOWED_CONTENT_TYPES:
+            raise serializers.ValidationError('Upload a PDF, JPG, PNG, or WebP file.')
+        return value
+
+    def get_download_url(self, obj):
+        if self.context.get('portal'):
+            return f'/portal/me/documents/{obj.id}/file/'
+        return f'/customers/{obj.customer_id}/documents/{obj.id}/file/'
+
+    def create(self, validated_data):
+        upload = validated_data['file']
+        validated_data['original_filename'] = (upload.name or 'document')[:255]
+        validated_data['content_type'] = getattr(upload, 'content_type', '') or ''
+        validated_data['uploaded_by'] = self.context.get('uploaded_by')
+        validated_data['customer'] = self.context['customer']
+        return super().create(validated_data)

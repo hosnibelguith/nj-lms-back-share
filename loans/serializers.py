@@ -91,6 +91,27 @@ def _loan_collected_amount(obj):
     )
 
 
+def _loan_disbursement_amount(obj):
+    from .services import LoanService
+
+    try:
+        return LoanService.disbursement_amount(obj)
+    except ValueError:
+        return obj.principal
+
+
+def _loan_early_renewal(obj):
+    from loans.renewal import early_renewal_offer, eligible_early_renewal_loan
+
+    eligible = eligible_early_renewal_loan(obj.customer)
+    if eligible is None or eligible.id != obj.id:
+        return None
+    offer = early_renewal_offer(obj)
+    if not offer.get('new_amount_covers_balance'):
+        return None
+    return offer
+
+
 class LoanFormulaSerializer(serializers.ModelSerializer):
     brokerage_fee = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     subtotal = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
@@ -366,8 +387,10 @@ class CurrentApplicationSerializer(serializers.ModelSerializer):
     ai_decision_display = serializers.CharField(source='get_ai_decision_display', read_only=True)
     formula = LoanFormulaSerializer(read_only=True)
     contract_signed = serializers.BooleanField(read_only=True)
-
     collected_amount = serializers.SerializerMethodField()
+    previous_loan = serializers.UUIDField(source='previous_loan_id', read_only=True, allow_null=True)
+    disbursement_amount = serializers.SerializerMethodField()
+    early_renewal = serializers.SerializerMethodField()
 
     class Meta:
         model = Loan
@@ -385,6 +408,10 @@ class CurrentApplicationSerializer(serializers.ModelSerializer):
             'total_amount',
             'balance',
             'collected_amount',
+            'previous_loan',
+            'renewal_payoff_amount',
+            'disbursement_amount',
+            'early_renewal',
             'is_active',
             'funded_at',
             'approved_at',
@@ -400,6 +427,12 @@ class CurrentApplicationSerializer(serializers.ModelSerializer):
 
     def get_collected_amount(self, obj):
         return _loan_collected_amount(obj)
+
+    def get_disbursement_amount(self, obj):
+        return _loan_disbursement_amount(obj)
+
+    def get_early_renewal(self, obj):
+        return _loan_early_renewal(obj)
 
 
 class CustomerLoanDetailSerializer(serializers.ModelSerializer):
@@ -418,6 +451,9 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
     holiday_warnings = serializers.SerializerMethodField()
     payoff_today = serializers.SerializerMethodField()
     unused_daily_interest = serializers.SerializerMethodField()
+    previous_loan = serializers.UUIDField(source='previous_loan_id', read_only=True, allow_null=True)
+    disbursement_amount = serializers.SerializerMethodField()
+    early_renewal = serializers.SerializerMethodField()
 
     class Meta:
         model = Loan
@@ -436,6 +472,10 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
             'balance',
             'collected_amount',
             'collectedAmount',
+            'previous_loan',
+            'renewal_payoff_amount',
+            'disbursement_amount',
+            'early_renewal',
             'funded_at',
             'fundedAt',
             'frequency',
@@ -490,6 +530,12 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
         _payoff, unused = self._payoff_today_pair(obj)
         return unused
 
+    def get_disbursement_amount(self, obj):
+        return _loan_disbursement_amount(obj)
+
+    def get_early_renewal(self, obj):
+        return _loan_early_renewal(obj)
+
 
 class LoanSerializer(serializers.ModelSerializer):
     """Full loan serializer with nested data."""
@@ -504,6 +550,9 @@ class LoanSerializer(serializers.ModelSerializer):
     type_display = serializers.CharField(source='get_type_display', read_only=True)
     contract_signed = serializers.BooleanField(read_only=True)
     holiday_warnings = serializers.SerializerMethodField()
+    previous_loan = serializers.UUIDField(source='previous_loan_id', read_only=True, allow_null=True)
+    disbursement_amount = serializers.SerializerMethodField()
+    early_renewal = serializers.SerializerMethodField()
 
     class Meta:
         model = Loan
@@ -522,6 +571,7 @@ class LoanSerializer(serializers.ModelSerializer):
             'contract_id', 'contract_sent_at', 'contract_signed', 'contract_signed_at',
             'approved_at', 'approved_by', 'declined_at', 'decline_reason',
             'notes', 'payments', 'holiday_warnings',
+            'previous_loan', 'renewal_payoff_amount', 'disbursement_amount', 'early_renewal',
             'schedule_frequency', 'twice_monthly_day_1', 'twice_monthly_day_2',
             'created_at', 'updated_at'
         ]
@@ -536,6 +586,12 @@ class LoanSerializer(serializers.ModelSerializer):
 
     def get_holiday_warnings(self, obj):
         return _loan_holiday_warnings(obj)
+
+    def get_disbursement_amount(self, obj):
+        return _loan_disbursement_amount(obj)
+
+    def get_early_renewal(self, obj):
+        return _loan_early_renewal(obj)
 
 
 class LoanListSerializer(serializers.ModelSerializer):

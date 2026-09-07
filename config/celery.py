@@ -63,6 +63,12 @@ app.conf.beat_schedule = {
         'task': 'contracts.tasks.check_expired_contracts',
         'schedule': crontab(hour=0, minute=0),
     },
+
+    # Offer early renewal to eligible collecting clients daily at 11 AM
+    'send-early-renewal-offers': {
+        'task': 'loans.tasks.send_early_renewal_offers',
+        'schedule': crontab(hour=11, minute=0),
+    },
     
     # Cleanup old activities monthly on the 1st at 2 AM
     'cleanup-old-activities': {

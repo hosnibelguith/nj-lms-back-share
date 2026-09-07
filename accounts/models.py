@@ -348,3 +348,74 @@ class ArriveHandoffToken(models.Model):
     def mark_consumed(self):
         self.consumed_at = timezone.now()
         self.save(update_fields=['consumed_at'])
+
+
+def customer_document_upload_to(instance, filename):
+    import os
+
+    ext = os.path.splitext(filename)[1].lower()
+    return f'customer_documents/{instance.customer_id}/{uuid.uuid4().hex}{ext}'
+
+
+class CustomerDocument(models.Model):
+    """Supporting files uploaded by the customer portal or staff.
+
+    Government ID is staff-only until an automatic capture path exists.
+    """
+
+    TYPE_VOID_CHEQUE = 'void_cheque'
+    TYPE_PAY_STUB = 'pay_stub'
+    TYPE_BANK_STATEMENT = 'bank_statement'
+    TYPE_OTHER = 'other'
+    TYPE_GOVERNMENT_ID = 'government_id'
+
+    PORTAL_DOCUMENT_TYPES = (
+        TYPE_VOID_CHEQUE,
+        TYPE_PAY_STUB,
+        TYPE_BANK_STATEMENT,
+        TYPE_OTHER,
+    )
+    STAFF_DOCUMENT_TYPES = PORTAL_DOCUMENT_TYPES + (TYPE_GOVERNMENT_ID,)
+
+    DOCUMENT_TYPE_CHOICES = [
+        (TYPE_VOID_CHEQUE, 'Void cheque'),
+        (TYPE_PAY_STUB, 'Pay stub'),
+        (TYPE_BANK_STATEMENT, 'Bank statement'),
+        (TYPE_OTHER, 'Other'),
+        (TYPE_GOVERNMENT_ID, 'Government ID'),
+    ]
+
+    MAX_BYTES = 10 * 1024 * 1024
+    ALLOWED_EXTENSIONS = ('.pdf', '.jpg', '.jpeg', '.png', '.webp')
+    ALLOWED_CONTENT_TYPES = (
+        'application/pdf',
+        'image/jpeg',
+        'image/png',
+        'image/webp',
+    )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    customer = models.ForeignKey(
+        Customer,
+        on_delete=models.CASCADE,
+        related_name='documents',
+    )
+    document_type = models.CharField(max_length=32, choices=DOCUMENT_TYPE_CHOICES)
+    file = models.FileField(upload_to=customer_document_upload_to)
+    original_filename = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=100, blank=True)
+    uploaded_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='uploaded_customer_documents',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'accounts_customer_document'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.get_document_type_display()} for {self.customer_id}"

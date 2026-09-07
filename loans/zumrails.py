@@ -479,6 +479,9 @@ def apply_funded_payment_zum_status(
                 method=funding.method,
                 reference=funding.processor_transaction_id or "",
             )
+        from loans.services import LoanService
+
+        LoanService.finalize_early_renewal_funding(funding.loan)
         if was_incomplete or loan_was_inactive:
             log_activity(
                 funding.loan,
@@ -1310,7 +1313,9 @@ class FundingService:
     def initiate(loan: Loan, *, method: str, schedule_confirmed: bool, user, destination=None, collections_account=None):
         try:
             with transaction.atomic():
-                loan = Loan.objects.select_for_update().select_related("customer").get(pk=loan.pk)
+                loan = Loan.objects.select_for_update().select_related(
+                    "customer", "previous_loan"
+                ).get(pk=loan.pk)
                 arrive_loan = is_arrive_funded_loan(loan)
 
                 if arrive_loan and method in ("eft", "etransfer"):
@@ -1391,9 +1396,14 @@ class FundingService:
                     if incomplete_funding:
                         raise ValueError(incomplete_funding)
 
+                from loans.services import LoanService
+
+                LoanService.assert_renewal_ready_to_fund(loan)
+                disbursement = LoanService.disbursement_amount(loan)
+
                 funding = FundedPayment.objects.create(
                     loan=loan,
-                    amount=loan.principal,
+                    amount=disbursement,
                     method=method,
                     status="processing",
                     destination_snapshot=destination_snapshot,
@@ -1498,6 +1508,9 @@ class FundingService:
             reference=processor_id,
             user=user,
         )
+        from loans.services import LoanService
+
+        LoanService.finalize_early_renewal_funding(loan, user=user)
 
         from activity.services import actor_label, resolve_funding_failure_alerts
 
@@ -1666,9 +1679,13 @@ class FundingService:
             "arrive_application_id": getattr(loan.customer, "arrive_application_id", None),
             "zum_user_id": getattr(loan.customer, "arrive_zum_user_id", None),
         }
+        from loans.services import LoanService
+
+        LoanService.assert_renewal_ready_to_fund(loan)
+        disbursement = LoanService.disbursement_amount(loan)
         funding = FundedPayment.objects.create(
             loan=loan,
-            amount=loan.principal,
+            amount=disbursement,
             method="card_issuance",
             status="completed",
             destination_snapshot=destination_snapshot,
@@ -1702,6 +1719,7 @@ class FundingService:
             reference=funding.reference,
             user=user,
         )
+        LoanService.finalize_early_renewal_funding(loan, user=user)
         from activity.services import actor_label, resolve_funding_failure_alerts
 
         resolve_funding_failure_alerts(loan, reason="funding_completed")

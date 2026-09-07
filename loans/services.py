@@ -268,9 +268,25 @@ class LoanService:
         if existing_loan:
             return existing_loan
 
+        return LoanService._create_priced_application(
+            customer,
+            status='ibv_pending',
+            notes='Initial application loan created automatically after customer signup.',
+        )
+
+    @staticmethod
+    def _create_priced_application(
+        customer: Customer,
+        *,
+        status: str,
+        notes: str,
+        previous_loan: Loan = None,
+    ) -> Loan:
         principal = customer.requested_loan_amount or Decimal('0.00')
         if not isinstance(principal, Decimal):
             principal = Decimal(str(principal))
+        if previous_loan is not None and principal <= 0:
+            principal = LoanService.money(previous_loan.principal or Decimal('0.00'))
         formula = LoanService.get_formula_for_amount(principal)
 
         if formula:
@@ -299,9 +315,10 @@ class LoanService:
             fee=fee,
             total_amount=total_amount,
             balance=total_amount,
-            status='ibv_pending',
+            status=status,
             is_active=True,
-            notes='Initial application loan created automatically after customer signup.',
+            previous_loan=previous_loan,
+            notes=notes,
         )
 
         if formula:
@@ -386,6 +403,185 @@ class LoanService:
             metadata={'action': 'start_new_application'},
         )
         return loan
+
+    @staticmethod
+    def can_start_early_renewal(customer: Customer) -> bool:
+        from loans.renewal import eligible_early_renewal_loan
+
+        return eligible_early_renewal_loan(customer) is not None
+
+    @staticmethod
+    def early_renewal_offer_for_customer(customer: Customer):
+        from loans.renewal import early_renewal_offer, eligible_early_renewal_loan
+
+        loan = eligible_early_renewal_loan(customer)
+        if loan is None:
+            return None
+        return early_renewal_offer(loan)
+
+    @staticmethod
+    def disbursement_amount(loan: Loan) -> Decimal:
+        from loans.renewal import disbursement_amount
+
+        return disbursement_amount(loan)
+
+    @staticmethod
+    @transaction.atomic
+    def start_early_renewal(customer: Customer, *, user=None, requested_amount=None) -> Loan:
+        """Open a new application that will pay off the current active loan at funding."""
+        from activity.services import actor_label, log_staff_action
+        from loans.renewal import (
+            early_renewal_ineligible_reason,
+            eligible_early_renewal_loan,
+            IN_PROGRESS_APPLICATION_STATUSES,
+        )
+
+        old_loan = eligible_early_renewal_loan(customer)
+        if old_loan is None:
+            in_progress = customer.loans.filter(
+                status__in=IN_PROGRESS_APPLICATION_STATUSES
+            ).order_by('-created_at').first()
+            if in_progress:
+                raise ValueError(
+                    'An application is already in progress. Finish or cancel it first.'
+                )
+            active = (
+                customer.loans.filter(status='active').order_by('-created_at').first()
+            )
+            if active is None:
+                raise ValueError('No active loan is available for early renewal.')
+            raise ValueError(
+                early_renewal_ineligible_reason(active)
+                or 'This loan is not eligible for early renewal.'
+            )
+
+        if requested_amount is not None:
+            customer.requested_loan_amount = LoanService.money(requested_amount)
+            customer.save(update_fields=['requested_loan_amount', 'updated_at'])
+
+        customer.contract_completed = False
+        customer.onboarding_stage = (
+            'contract' if customer.banking_verified else 'banking_verification'
+        )
+        customer.save(
+            update_fields=['contract_completed', 'onboarding_stage', 'updated_at']
+        )
+
+        principal = customer.requested_loan_amount or Decimal('0.00')
+        if not isinstance(principal, Decimal):
+            principal = Decimal(str(principal))
+        if principal <= 0:
+            principal = LoanService.money(old_loan.principal or Decimal('0.00'))
+        old_balance = LoanService.money(old_loan.balance or Decimal('0.00'))
+        if principal <= old_balance:
+            raise ValueError(
+                'New loan amount must be greater than the old loan balance.'
+            )
+
+        status = 'pending_signature' if customer.banking_verified else 'ibv_pending'
+        loan = LoanService._create_priced_application(
+            customer,
+            status=status,
+            previous_loan=old_loan,
+            notes=f'Early renewal of loan {old_loan.id}.',
+        )
+
+        actor = actor_label(user) if user else 'Customer'
+        log_staff_action(
+            customer=customer,
+            loan=loan,
+            user=user if getattr(user, 'is_authenticated', False) else getattr(
+                customer, 'portal_user', None
+            ),
+            type_value='loan_renewed',
+            title='Early Renewal Started',
+            description=(
+                f'{actor} started an early renewal. New loan ${loan.principal} will '
+                f'pay off remaining ${LoanService.money(old_loan.balance)} on the '
+                'current loan at funding. The client receives the difference.'
+            ),
+            metadata={
+                'action': 'start_early_renewal',
+                'previous_loan_id': str(old_loan.id),
+                'old_balance': str(LoanService.money(old_loan.balance)),
+                'new_principal': str(loan.principal),
+            },
+        )
+        return loan
+
+    @staticmethod
+    def finalize_early_renewal_funding(loan: Loan, *, user=None) -> Decimal:
+        if not getattr(loan, 'previous_loan_id', None):
+            return Decimal('0.00')
+        return LoanService.complete_early_renewal_payoff(loan, user=user)
+
+    @staticmethod
+    def assert_renewal_ready_to_fund(loan: Loan) -> None:
+        previous = getattr(loan, 'previous_loan', None)
+        if previous is None:
+            return
+        if previous.payments.filter(status='pending').exists():
+            raise ValueError(
+                'Cannot fund this renewal while a collection is processing on the previous loan.'
+            )
+        LoanService.disbursement_amount(loan)
+
+    @staticmethod
+    @transaction.atomic
+    def complete_early_renewal_payoff(loan: Loan, *, user=None) -> Decimal:
+        """Apply the new loan's withheld amount to close the previous loan."""
+        from activity.services import log_staff_action
+
+        previous = getattr(loan, 'previous_loan', None)
+        if previous is None:
+            return Decimal('0.00')
+
+        previous = Loan.objects.select_for_update().get(pk=previous.pk)
+        note = f'Early renewal payoff from loan {loan.id}'
+        existing = previous.payments.filter(type='manual', notes=note).first()
+        if existing:
+            stored = LoanService.money(loan.renewal_payoff_amount or existing.amount)
+            return stored
+
+        payoff = LoanService.money(previous.balance or Decimal('0.00'))
+        if payoff <= 0:
+            if loan.renewal_payoff_amount is None:
+                loan.renewal_payoff_amount = Decimal('0.00')
+                loan.save(update_fields=['renewal_payoff_amount', 'updated_at'])
+            return Decimal('0.00')
+
+        Payment.objects.create(
+            loan=previous,
+            amount=payoff,
+            type='manual',
+            status='completed',
+            scheduled_date=timezone.localdate(),
+            original_date=timezone.localdate(),
+            processed_at=timezone.now(),
+            notes=note,
+            created_by=user if getattr(user, 'is_authenticated', False) else None,
+        )
+        previous.apply_payment(payoff, user=user)
+        LoanService._align_scheduled_payments_to_balance(previous)
+        loan.renewal_payoff_amount = payoff
+        loan.save(update_fields=['renewal_payoff_amount', 'updated_at'])
+        log_staff_action(
+            customer=loan.customer,
+            loan=loan,
+            user=user if getattr(user, 'is_authenticated', False) else None,
+            type_value='loan_renewed',
+            title='Previous Loan Paid Off',
+            description=(
+                f'${payoff} from this renewal paid off loan {previous.id}. '
+                'The previous loan is closed.'
+            ),
+            metadata={
+                'action': 'early_renewal_payoff',
+                'previous_loan_id': str(previous.id),
+                'payoff_amount': str(payoff),
+            },
+        )
+        return payoff
 
     @staticmethod
     @transaction.atomic
@@ -665,7 +861,7 @@ class LoanService:
     @staticmethod
     @transaction.atomic
     def update_approved_amount(loan: Loan, principal: Decimal, user=None, notes: str = '') -> Loan:
-        loan = Loan.objects.select_for_update().get(pk=loan.pk)
+        loan = Loan.objects.select_for_update().select_related('previous_loan').get(pk=loan.pk)
 
         if loan.status not in ['ibv_pending', 'pending_signature', 'pending', 'pending_funding']:
             raise ValueError(f"Cannot update approved amount in status: {loan.status}")
@@ -678,6 +874,15 @@ class LoanService:
         principal = LoanService.money(principal)
         if principal <= 0:
             raise ValueError('Approved amount must be greater than zero.')
+        if loan.previous_loan_id:
+            old_balance = LoanService.money(
+                (loan.previous_loan.balance if loan.previous_loan else Decimal('0.00'))
+                or Decimal('0.00')
+            )
+            if principal <= old_balance:
+                raise ValueError(
+                    'New loan amount must be greater than the old loan balance.'
+                )
 
         loan.principal = principal
         loan.save(update_fields=['principal', 'updated_at'])
@@ -727,18 +932,21 @@ class LoanService:
 
         previous_display = loan.get_status_display()
         ref = reference or f"{method.upper()}-{timezone.now().strftime('%Y%m%d')}-{str(loan.id)[:8].upper()}"
+        LoanService.assert_renewal_ready_to_fund(loan)
+        disbursement = LoanService.disbursement_amount(loan)
 
         loan.fund(method, ref, user=user)
 
         FundedPayment.objects.create(
             loan=loan,
-            amount=loan.principal,
+            amount=disbursement,
             method=method,
             status='completed',
             reference=ref,
             completed_at=timezone.now(),
             notes='Funding created from staff portal.',
         )
+        LoanService.finalize_early_renewal_funding(loan, user=user)
 
         actor = actor_label(user)
         log_staff_action(

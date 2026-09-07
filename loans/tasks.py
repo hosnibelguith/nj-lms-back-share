@@ -196,3 +196,70 @@ def process_collection_settlements():
     completed = SettlementService.process_due()
     logger.info("Completed %s collection settlements", completed)
     return {"completed": completed}
+
+
+@shared_task
+def send_early_renewal_offers():
+    """Email eligible collecting clients once per loan."""
+    from django.conf import settings
+
+    from communications.models import Communication, CommunicationTemplate
+    from communications.tasks import send_template_message
+    from loans.models import Loan
+    from loans.renewal import (
+        EARLY_RENEWAL_TEMPLATE_NAME,
+        early_renewal_offer,
+        eligible_early_renewal_loan,
+    )
+
+    template = CommunicationTemplate.objects.filter(
+        name=EARLY_RENEWAL_TEMPLATE_NAME,
+        type='email',
+        is_active=True,
+    ).first()
+    if template is None:
+        logger.warning('Early renewal email skipped: template %s missing', EARLY_RENEWAL_TEMPLATE_NAME)
+        return {'sent': 0, 'skipped': 0}
+
+    frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:3000').rstrip('/')
+    sent = 0
+    skipped = 0
+    loans = (
+        Loan.objects.filter(status='active')
+        .select_related('customer')
+        .order_by('created_at')
+    )
+    for loan in loans:
+        eligible = eligible_early_renewal_loan(loan.customer)
+        if eligible is None or eligible.id != loan.id:
+            skipped += 1
+            continue
+        offer = early_renewal_offer(loan)
+        if not offer.get('new_amount_covers_balance'):
+            skipped += 1
+            continue
+        already_sent = Communication.objects.filter(
+            loan=loan,
+            direction='outbound',
+            template_name=EARLY_RENEWAL_TEMPLATE_NAME,
+        ).exists()
+        if already_sent:
+            skipped += 1
+            continue
+        send_template_message.delay(
+            str(loan.customer_id),
+            str(template.id),
+            str(loan.id),
+            extra_context={
+                'old_balance': offer['old_balance'],
+                'remaining_balance': offer['remaining_balance'],
+                'amount_deducted': offer['amount_deducted'],
+                'new_loan_amount': offer['new_loan_amount'],
+                'net_to_client': offer['net_to_client'],
+                'remaining_payments': str(offer['remaining_payments']),
+                'portal_url': f'{frontend_url}/customer/loans',
+            },
+        )
+        sent += 1
+    logger.info('Early renewal offers sent=%s skipped=%s', sent, skipped)
+    return {'sent': sent, 'skipped': skipped}

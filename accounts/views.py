@@ -9,9 +9,10 @@ from django.contrib.auth.models import update_last_login
 from django.conf import settings
 from django.db import transaction
 from django.db.models import Count, Q
-from django.middleware.csrf import get_token
+from django.http import FileResponse
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from .models import User, Customer, GlobalSetting
+from .models import User, Customer, GlobalSetting, CustomerDocument
 from .serializers import (
     UserSerializer, UserCreateSerializer, LoginSerializer,
     CustomerSerializer, CustomerListSerializer, CustomerCreateSerializer,
@@ -26,6 +27,7 @@ from .serializers import (
     CustomerPasswordResetVerifySerializer,
     CustomerPasswordResetConfirmSerializer,
     ApiIntegrationsSerializer,
+    CustomerDocumentSerializer,
 )
 
 
@@ -388,6 +390,55 @@ class CustomerViewSet(viewsets.ModelViewSet):
         serializer = CustomerLoanDetailSerializer(loans, many=True)
         return Response(serializer.data)
 
+    @action(detail=True, methods=['get', 'post'])
+    def documents(self, request, pk=None):
+        customer = self.get_object()
+        if request.method == 'GET':
+            serializer = CustomerDocumentSerializer(
+                customer.documents.all(), many=True
+            )
+            return Response(serializer.data)
+
+        serializer = CustomerDocumentSerializer(
+            data=request.data,
+            context={
+                'customer': customer,
+                'uploaded_by': request.user,
+                'allowed_types': CustomerDocument.STAFF_DOCUMENT_TYPES,
+            },
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(
+        detail=True,
+        methods=['get', 'delete'],
+        url_path='documents/(?P<document_id>[^/.]+)/file',
+    )
+    def document_file(self, request, pk=None, document_id=None):
+        customer = self.get_object()
+        document = get_object_or_404(
+            CustomerDocument, pk=document_id, customer=customer
+        )
+        if request.method == 'DELETE':
+            document.file.delete(save=False)
+            document.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        return _serve_customer_document(document)
+
+
+def _serve_customer_document(document):
+    document.file.open('rb')
+    response = FileResponse(
+        document.file,
+        as_attachment=True,
+        filename=document.original_filename or 'document',
+    )
+    if document.content_type:
+        response['Content-Type'] = document.content_type
+    return response
+
 
 # --- Customer Portal Views ---
 
@@ -708,6 +759,7 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
         can_renew = False
         can_refinance = False
         can_start_new_application = LoanService.can_start_new_application(customer)
+        early_renewal = None
 
         if not loan:
             portal_state = 'no_application'
@@ -735,6 +787,11 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
             portal_state = 'active_loan'
             next_step = 'loans'
             next_url = '/customer/loans'
+            if loan.status == 'active':
+                offer = LoanService.early_renewal_offer_for_customer(customer)
+                if offer and offer.get('eligible') and offer.get('new_amount_covers_balance'):
+                    can_renew = True
+                    early_renewal = offer
 
         elif not customer.banking_verified:
             if connection and connection.sync_status in ['pending', 'syncing']:
@@ -790,6 +847,7 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
             'can_renew': can_renew,
             'can_refinance': can_refinance,
             'can_start_new_application': can_start_new_application,
+            'early_renewal': early_renewal,
             'banking': banking,
         }
 
@@ -825,6 +883,103 @@ class CustomerPortalStartNewApplicationView(CustomerPortalBaseView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+class CustomerPortalStartEarlyRenewalView(CustomerPortalBaseView):
+    """Eligible collecting customers: open a new loan that pays off the current one at funding."""
+
+    def post(self, request):
+        customer, error_response = self.get_customer(request)
+        if error_response:
+            return error_response
+
+        from loans.services import LoanService
+
+        requested_amount = request.data.get('requested_amount')
+        try:
+            loan = LoanService.start_early_renewal(
+                customer,
+                user=request.user,
+                requested_amount=requested_amount,
+            )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        customer.refresh_from_db()
+        next_url = (
+            '/customer/contracts' if customer.banking_verified else '/customer/banking'
+        )
+        return Response(
+            {
+                'message': (
+                    'Early renewal started. Sign the new agreement. At funding, '
+                    'the old balance is taken from the new loan and the rest is sent to you.'
+                ),
+                'loan_id': str(loan.id),
+                'next_url': next_url,
+                'current_application': CurrentApplicationSerializer(loan).data,
+                'can_renew': False,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class CustomerPortalDocumentsView(CustomerPortalBaseView):
+    def get(self, request):
+        customer, error_response = self.get_customer(request)
+        if error_response:
+            return error_response
+        serializer = CustomerDocumentSerializer(
+            customer.documents.all(),
+            many=True,
+            context={'portal': True},
+        )
+        return Response(serializer.data)
+
+    def post(self, request):
+        customer, error_response = self.get_customer(request)
+        if error_response:
+            return error_response
+        serializer = CustomerDocumentSerializer(
+            data=request.data,
+            context={
+                'customer': customer,
+                'uploaded_by': request.user,
+                'allowed_types': CustomerDocument.PORTAL_DOCUMENT_TYPES,
+                'portal': True,
+            },
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class CustomerPortalDocumentFileView(CustomerPortalBaseView):
+    def get(self, request, document_id):
+        customer, error_response = self.get_customer(request)
+        if error_response:
+            return error_response
+        document = customer.documents.filter(pk=document_id).first()
+        if document is None:
+            return Response(
+                {'error': 'Document not found'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return _serve_customer_document(document)
+
+    def delete(self, request, document_id):
+        customer, error_response = self.get_customer(request)
+        if error_response:
+            return error_response
+        document = customer.documents.filter(pk=document_id).first()
+        if document is None:
+            return Response(
+                {'error': 'Document not found'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        document.file.delete(save=False)
+        document.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class CustomerPortalContractPreviewView(CustomerPortalBaseView):
