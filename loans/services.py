@@ -861,7 +861,9 @@ class LoanService:
     @staticmethod
     @transaction.atomic
     def update_approved_amount(loan: Loan, principal: Decimal, user=None, notes: str = '') -> Loan:
-        loan = Loan.objects.select_for_update().select_related('previous_loan').get(pk=loan.pk)
+        # Lock only this row. select_related('previous_loan') is a nullable
+        # outer join; PostgreSQL rejects FOR UPDATE on that join (Heroku 500).
+        loan = Loan.objects.select_for_update().get(pk=loan.pk)
 
         if loan.status not in ['ibv_pending', 'pending_signature', 'pending', 'pending_funding']:
             raise ValueError(f"Cannot update approved amount in status: {loan.status}")

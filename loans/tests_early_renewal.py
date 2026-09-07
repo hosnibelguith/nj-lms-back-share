@@ -383,3 +383,46 @@ class EarlyRenewalTests(APITestCase):
         self.assertEqual(first["sent"], 1)
         self.assertEqual(second["sent"], 0)
         self.assertEqual(str(send_delay.call_args.args[1]), str(template.id))
+
+    def test_staff_can_update_approved_amount_on_early_renewal_application(self):
+        new_loan = LoanService.start_early_renewal(self.customer, user=self.staff)
+        LoanFormula.objects.create(
+            name="Early Renewal 700",
+            principal_amount=Decimal("700.00"),
+            brokerage_percent=Decimal("70.00"),
+            repayment_percent=Decimal("29.00"),
+            default_number_of_payments=6,
+            default_frequency_days=14,
+            is_active=True,
+            is_default=True,
+        )
+
+        response = self.client.patch(
+            f"/api/loans/{new_loan.id}/approved-amount/",
+            {"principal": "700", "notes": ""},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        new_loan.refresh_from_db()
+        self.loan.refresh_from_db()
+        self.assertEqual(new_loan.principal, Decimal("700.00"))
+        self.assertEqual(self.loan.status, "active")
+        self.assertGreater(new_loan.principal, self.loan.balance)
+        self.assertTrue(
+            new_loan.state_events.filter(event_type="amount_updated").exists()
+        )
+
+    def test_approved_amount_rejected_when_below_old_renewal_balance(self):
+        new_loan = LoanService.start_early_renewal(self.customer, user=self.staff)
+
+        response = self.client.patch(
+            f"/api/loans/{new_loan.id}/approved-amount/",
+            {"principal": "50.00", "notes": ""},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("old loan balance", response.data["error"])
+        new_loan.refresh_from_db()
+        self.assertEqual(new_loan.principal, Decimal("500.00"))
