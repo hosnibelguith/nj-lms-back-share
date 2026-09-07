@@ -1313,9 +1313,7 @@ class FundingService:
     def initiate(loan: Loan, *, method: str, schedule_confirmed: bool, user, destination=None, collections_account=None):
         try:
             with transaction.atomic():
-                loan = Loan.objects.select_for_update().select_related(
-                    "customer", "previous_loan"
-                ).get(pk=loan.pk)
+                loan = Loan.objects.select_for_update().get(pk=loan.pk)
                 arrive_loan = is_arrive_funded_loan(loan)
 
                 if arrive_loan and method in ("eft", "etransfer"):
