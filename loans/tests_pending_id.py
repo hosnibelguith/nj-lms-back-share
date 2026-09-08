@@ -242,3 +242,88 @@ class PendingIdWorkflowTests(APITestCase):
         LoanService.complete_pending_id(self.customer)
         self.loan.refresh_from_db()
         self.assertEqual(self.loan.status, "pending")
+
+    def _portal_sign_payload(self, typed_name="fghmn"):
+        return {
+            "typed_name": typed_name,
+            "accepted_terms": True,
+            "accepted_credit_check": True,
+            "accepted_banking_review": True,
+            "accepted_electronic_signature": True,
+        }
+
+    def test_portal_sign_without_id_then_preview_and_analysis_succeed(self):
+        """Client signs, reloads the signed agreement, then continue-to-dashboard."""
+        self.client.force_authenticate(user=self.portal_user)
+        sign = self.client.post(
+            "/api/portal/me/sign-contract/",
+            self._portal_sign_payload(),
+            format="json",
+        )
+        self.assertEqual(sign.status_code, 200, sign.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "pending_id")
+
+        preview = self.client.get("/api/portal/me/contract-preview/")
+        self.assertEqual(preview.status_code, 200, preview.data)
+        self.assertEqual(preview.data["status"], "signed")
+        self.assertEqual(preview.data["typed_name"], "fghmn")
+        self.assertIn("APPLICATION CHANNEL:</strong> Landing", preview.data["agreement_text"])
+
+        dashboard = self.client.get("/api/portal/me/dashboard/")
+        self.assertEqual(dashboard.status_code, 200, dashboard.data)
+        self.assertEqual(dashboard.data["portal_state"], "id_required")
+
+        analysis = self.client.post("/api/portal/me/run-analysis/", {}, format="json")
+        self.assertEqual(analysis.status_code, 200, analysis.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "pending_id")
+        self.assertEqual(analysis.data["status"], "pending_id")
+
+    def test_portal_sign_approved_with_id_then_analysis_keeps_pending_funding(self):
+        add_government_id(self.customer)
+        self.loan.status = "pending_funding"
+        self.loan.approved_at = timezone.now()
+        self.loan.save(update_fields=["status", "approved_at", "updated_at"])
+        approved_at = self.loan.approved_at
+
+        self.client.force_authenticate(user=self.portal_user)
+        sign = self.client.post(
+            "/api/portal/me/sign-contract/",
+            self._portal_sign_payload(),
+            format="json",
+        )
+        self.assertEqual(sign.status_code, 200, sign.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "pending_funding")
+        self.assertTrue(self.loan.contract_signed)
+
+        preview = self.client.get("/api/portal/me/contract-preview/")
+        self.assertEqual(preview.status_code, 200, preview.data)
+        self.assertEqual(preview.data["status"], "signed")
+
+        analysis = self.client.post("/api/portal/me/run-analysis/", {}, format="json")
+        self.assertEqual(analysis.status_code, 200, analysis.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "pending_funding")
+        self.assertEqual(self.loan.approved_at, approved_at)
+        self.assertEqual(analysis.data["status"], "pending_funding")
+        self.assertIsNone(self.loan.ai_decision)
+
+    def test_portal_sign_with_id_then_analysis_on_pending_review(self):
+        add_government_id(self.customer)
+        self.client.force_authenticate(user=self.portal_user)
+        sign = self.client.post(
+            "/api/portal/me/sign-contract/",
+            self._portal_sign_payload(),
+            format="json",
+        )
+        self.assertEqual(sign.status_code, 200, sign.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "pending")
+
+        analysis = self.client.post("/api/portal/me/run-analysis/", {}, format="json")
+        self.assertEqual(analysis.status_code, 200, analysis.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "pending")
+        self.assertIn(self.loan.ai_decision, ["approved", "declined", "review_required"])

@@ -1051,7 +1051,7 @@ class LoanService:
     @transaction.atomic
     def run_mock_ai_analysis(customer: Customer) -> Loan:
         loan = customer.loans.filter(
-            status__in=['pending', 'pending_signature', 'pending_id']
+            status__in=['pending', 'pending_signature', 'pending_id', 'pending_funding']
         ).order_by('-created_at').first()
 
         if not loan:
@@ -1059,6 +1059,12 @@ class LoanService:
 
         if not customer.banking_verified:
             raise ValueError('Banking verification is required before analysis.')
+
+        # Continue-to-dashboard always POSTs this after sign. Approved files are
+        # already past mock AI; re-running it 500'd (status missing) or could
+        # overwrite a human approval with a random AI outcome.
+        if loan.status == 'pending_funding' or loan.approved_at:
+            return loan
 
         decision = LoanService.mock_ai_decision_for_loan(loan)
         previous_status = loan.status

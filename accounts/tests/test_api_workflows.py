@@ -503,6 +503,17 @@ class BackendApiWorkflowTests(APITestCase):
         self.assertIsNotNone(self.loan.contract_signed_at)
         self.assertTrue(self.customer.contract_completed)
 
+        preview_after_sign = self.client.get("/api/portal/me/contract-preview/")
+        self.assertEqual(preview_after_sign.status_code, 200, preview_after_sign.data)
+        self.assertEqual(preview_after_sign.data["status"], "signed")
+        self.assertEqual(preview_after_sign.data["typed_name"], self.customer.full_name)
+
+        analysis_response = self.client.post("/api/portal/me/run-analysis/", {}, format="json")
+        self.assertEqual(analysis_response.status_code, 200, analysis_response.data)
+        self.loan.refresh_from_db()
+        self.assertEqual(self.loan.status, "pending_id")
+        self.assertEqual(analysis_response.data["status"], "pending_id")
+
     @patch("communications.tasks.send_email.delay")
     @patch("communications.tasks.send_template_message.delay")
     def test_loan_workflow_reminders_send_ibv_and_signature_once_per_day(

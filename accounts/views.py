@@ -1196,7 +1196,13 @@ class CustomerPortalSignContractView(CustomerPortalBaseView):
 
         contract.save()
 
-        loan = LoanService.sign_customer_contract(customer)
+        try:
+            loan = LoanService.sign_customer_contract(customer)
+        except ValueError as exc:
+            return Response(
+                {'error': str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         template_name = 'We Have Received Your Request Template'
         from communications.models import CommunicationTemplate
@@ -1279,7 +1285,17 @@ class CustomerPortalRunAnalysisView(CustomerPortalBaseView):
         if error_response:
             return error_response
 
-        loan = LoanService.run_mock_ai_analysis(customer)
+        try:
+            loan = LoanService.run_mock_ai_analysis(customer)
+        except ValueError as exc:
+            loan = self.get_current_application(customer)
+            if loan is None or not (
+                customer.contract_completed or loan.contract_signed_at
+            ):
+                return Response(
+                    {'error': str(exc)},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         return Response({
             'message': 'Analysis completed.',
