@@ -38,7 +38,7 @@ class CustomerDocumentTests(APITestCase):
     def _pdf(self, name="cheque.pdf"):
         return SimpleUploadedFile(name, b"%PDF-1.4 test", content_type="application/pdf")
 
-    def test_portal_can_upload_supporting_docs_but_not_government_id(self):
+    def test_portal_can_upload_supporting_docs_and_government_id(self):
         self.client.force_authenticate(user=self.portal_user)
         created = self.client.post(
             "/api/portal/me/documents/",
@@ -47,18 +47,18 @@ class CustomerDocumentTests(APITestCase):
         )
         self.assertEqual(created.status_code, 201, created.data)
         self.assertEqual(created.data["document_type"], "void_cheque")
-        self.assertNotIn("government_id", created.data["document_type"])
 
-        blocked = self.client.post(
+        uploaded_id = self.client.post(
             "/api/portal/me/documents/",
             {"document_type": "government_id", "file": self._pdf("id.pdf")},
             format="multipart",
         )
-        self.assertEqual(blocked.status_code, 400)
+        self.assertEqual(uploaded_id.status_code, 201, uploaded_id.data)
+        self.assertEqual(uploaded_id.data["document_type"], "government_id")
 
         listed = self.client.get("/api/portal/me/documents/")
         self.assertEqual(listed.status_code, 200)
-        self.assertEqual(len(listed.data), 1)
+        self.assertEqual(len(listed.data), 2)
 
         download = self.client.get(f"/api/portal/me/documents/{created.data['id']}/file/")
         self.assertEqual(download.status_code, 200)

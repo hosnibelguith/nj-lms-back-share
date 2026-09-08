@@ -338,6 +338,7 @@ class LoanService:
         'ibv_pending',
         'pending',
         'pending_signature',
+        'pending_id',
         'pending_funding',
         'active',
     )
@@ -588,7 +589,7 @@ class LoanService:
     def approve_loan(loan: Loan, approved_by=None, notes: str = None, source='human') -> Loan:
         if source != 'human':
             raise ValueError('AI decisions must be recorded with set_ai_decision.')
-        if loan.status not in ['pending', 'pending_signature']:
+        if loan.status not in ['pending', 'pending_signature', 'pending_id']:
             raise ValueError(f"Cannot approve loan in status: {loan.status}")
 
         from activity.services import actor_label, log_staff_action
@@ -642,7 +643,7 @@ class LoanService:
     ) -> Loan:
         if source != 'human':
             raise ValueError('AI decisions must be recorded with set_ai_decision.')
-        if loan.status not in ['ibv_pending', 'pending', 'pending_signature', 'pending_funding']:
+        if loan.status not in ['ibv_pending', 'pending', 'pending_signature', 'pending_id', 'pending_funding']:
             raise ValueError(f"Cannot decline loan in status: {loan.status}")
 
         from activity.services import actor_label, log_staff_action
@@ -813,7 +814,7 @@ class LoanService:
 
         previous_status = loan.status
         previous_display = loan.get_status_display()
-        loan.status = 'pending_funding'
+        loan.status = loan.status_after_approval()
         loan.is_active = True
         loan.approved_at = timezone.now()
         loan.approved_by = approved_by
@@ -865,7 +866,7 @@ class LoanService:
         # outer join; PostgreSQL rejects FOR UPDATE on that join (Heroku 500).
         loan = Loan.objects.select_for_update().get(pk=loan.pk)
 
-        if loan.status not in ['ibv_pending', 'pending_signature', 'pending', 'pending_funding']:
+        if loan.status not in ['ibv_pending', 'pending_signature', 'pending', 'pending_id', 'pending_funding']:
             raise ValueError(f"Cannot update approved amount in status: {loan.status}")
         if loan.funded_payments.filter(status__in=['processing', 'completed']).exists():
             raise ValueError('Cannot update approved amount after funding has started.')
@@ -929,6 +930,8 @@ class LoanService:
             raise ValueError(f"Cannot fund loan in status: {loan.status}")
         if not loan.contract_signed:
             raise ValueError('Contract must be signed before funding.')
+        if not loan.has_government_id:
+            raise ValueError('Government ID must be uploaded before funding.')
 
         from activity.services import actor_label, log_staff_action
 
@@ -1002,7 +1005,7 @@ class LoanService:
     @transaction.atomic
     def sign_customer_contract(customer: Customer) -> Loan:
         loan = customer.loans.filter(
-            status__in=['pending_signature', 'pending', 'ibv_pending', 'pending_funding']
+            status__in=['pending_signature', 'pending', 'ibv_pending', 'pending_id', 'pending_funding']
         ).order_by('-created_at').first()
 
         if not loan:
@@ -1011,7 +1014,7 @@ class LoanService:
         if not customer.banking_verified:
             raise ValueError('Banking verification must be completed before signing.')
 
-        if loan.status not in ['pending_signature', 'pending_funding']:
+        if loan.status not in ['pending_signature', 'pending_funding', 'pending_id']:
             LoanService.mark_pending_signature(loan)
 
         loan.mark_contract_signed()
@@ -1023,6 +1026,22 @@ class LoanService:
         return loan
 
     @staticmethod
+    @transaction.atomic
+    def complete_pending_id(customer: Customer) -> None:
+        """Move pending-ID applications forward once a government ID is on file."""
+        from accounts.models import CustomerDocument
+
+        if not CustomerDocument.objects.filter(
+            customer=customer,
+            document_type=CustomerDocument.TYPE_GOVERNMENT_ID,
+        ).exists():
+            return
+
+        for loan in customer.loans.filter(status='pending_id'):
+            loan.status = 'pending_funding' if loan.approved_at else 'pending'
+            loan.save(update_fields=['status', 'updated_at'])
+
+    @staticmethod
     def mock_ai_decision_for_loan(loan: Loan) -> str:
         outcomes = ['approved', 'declined', 'review_required']
         index = sum(ord(char) for char in str(loan.id)) % len(outcomes)
@@ -1032,7 +1051,7 @@ class LoanService:
     @transaction.atomic
     def run_mock_ai_analysis(customer: Customer) -> Loan:
         loan = customer.loans.filter(
-            status__in=['pending', 'pending_signature']
+            status__in=['pending', 'pending_signature', 'pending_id']
         ).order_by('-created_at').first()
 
         if not loan:
@@ -1714,6 +1733,7 @@ class LoanService:
         """
         if loan.status not in [
             'pending_signature',
+            'pending_id',
             'pending',
             'pending_funding',
             'active',
@@ -2069,6 +2089,7 @@ class LoanService:
         """
         if loan.status not in [
             'pending_signature',
+            'pending_id',
             'pending',
             'pending_funding',
             'active',
@@ -2548,6 +2569,7 @@ class LoanService:
 
         if loan.status not in [
             'pending_signature',
+            'pending_id',
             'pending',
             'pending_funding',
             'active',
@@ -3357,6 +3379,7 @@ class LoanService:
 
         if loan.status not in [
             'pending_signature',
+            'pending_id',
             'pending',
             'pending_funding',
             'active',

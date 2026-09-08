@@ -2,7 +2,7 @@
 """
 Simplified Loan Models.
 Just 2 models: Loan and Payment.
-Loan lifecycle: ibv_pending → pending_signature → pending → pending_funding → active → paid_off (or defaulted)
+Loan lifecycle: ibv_pending → pending_signature → pending_id → pending → pending_funding → active → paid_off (or defaulted)
 """
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -136,6 +136,7 @@ class Loan(models.Model):
         ('ibv_pending', 'IBV Pending'),
         ('pending', 'Pending Human Decision'),
         ('pending_signature', 'Pending Signature'),
+        ('pending_id', 'Pending ID'),
         ('human_declined', 'Human Declined'),
         ('expired', 'Expired'),
         ('pending_funding', 'Pending Funding'),
@@ -269,7 +270,24 @@ class Loan(models.Model):
             self.contract_signed_at
             or getattr(self.customer, 'contract_completed', False)
         )
-    
+
+    @property
+    def has_government_id(self):
+        flag = getattr(self, 'has_government_id_flag', None)
+        if flag is not None:
+            return bool(flag)
+        from accounts.models import CustomerDocument
+        return CustomerDocument.objects.filter(
+            customer_id=self.customer_id,
+            document_type=CustomerDocument.TYPE_GOVERNMENT_ID,
+        ).exists()
+
+    def status_after_approval(self):
+        """Approved loans still missing ID stay off the funding queue."""
+        if self.contract_signed and not self.has_government_id:
+            return 'pending_id'
+        return 'pending_funding'
+
     def save(self, *args, **kwargs):
         # Auto-calculate total_amount if not set
         if not self.total_amount:
@@ -300,7 +318,7 @@ class Loan(models.Model):
             self.set_ai_decision('approved', user=user)
             return
 
-        self.status = 'pending_funding'
+        self.status = self.status_after_approval()
         self.is_active = True
         self.approved_at = timezone.now()
         self.approved_by = user
@@ -375,8 +393,11 @@ class Loan(models.Model):
         previous_status = self.status
 
         self.contract_signed_at = timezone.now()
-
-        self.status = 'pending_funding' if previous_status == 'pending_funding' else 'pending'
+        already_approved = bool(self.approved_at) or previous_status == 'pending_funding'
+        if self.has_government_id:
+            self.status = 'pending_funding' if already_approved else 'pending'
+        else:
+            self.status = 'pending_id'
 
         self.is_active = True
         self.save()

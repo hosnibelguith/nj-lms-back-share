@@ -2,6 +2,7 @@ from decimal import Decimal
 from unittest.mock import patch
 import json
 
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -11,7 +12,7 @@ from accounts.arrive_integration import (
     build_funding_payload,
     sign_arrive_webhook,
 )
-from accounts.models import Customer, User
+from accounts.models import Customer, CustomerDocument, User
 from banking.models import BankAccount, BankConnection
 from loans.models import Loan
 from loans.services import LoanService
@@ -383,6 +384,13 @@ class ArriveFundingWebhookTests(TransactionTestCase):
         loan.bank_account = account
         loan.collections_account = account
         loan.save()
+        CustomerDocument.objects.create(
+            customer=customer,
+            document_type=CustomerDocument.TYPE_GOVERNMENT_ID,
+            file=SimpleUploadedFile("id.pdf", b"%PDF-1.4 id", content_type="application/pdf"),
+            original_filename="id.pdf",
+            content_type="application/pdf",
+        )
         return loan
 
     def _fund(self, loan):

@@ -445,6 +445,7 @@ class LoanViewSet(viewsets.ModelViewSet):
             'ibv_pending': by_status.get('ibv_pending', 0),
             'pending': by_status.get('pending', 0),
             'pending_signature': by_status.get('pending_signature', 0),
+            'pending_id': by_status.get('pending_id', 0),
             'approved_pending_signature': approved_pending_signature_count,
             'pending_funding': pending_funding_count,
             'funding_failed': funding_failed_count,
@@ -464,7 +465,7 @@ class LoanViewSet(viewsets.ModelViewSet):
     def approve(self, request, pk=None):
         loan = self.get_object()
 
-        if loan.status not in ['pending', 'pending_signature']:
+        if loan.status not in ['pending', 'pending_signature', 'pending_id']:
             return Response({'error': 'Only pending or pending signature loans can be approved'}, status=400)
 
         serializer = LoanApproveSerializer(data=request.data)
@@ -561,7 +562,7 @@ class LoanViewSet(viewsets.ModelViewSet):
     def decline(self, request, pk=None):
         loan = self.get_object()
 
-        if loan.status not in ['ibv_pending', 'pending', 'pending_signature', 'pending_funding']:
+        if loan.status not in ['ibv_pending', 'pending', 'pending_signature', 'pending_id', 'pending_funding']:
             return Response({'error': 'Only pending loans can be declined'}, status=400)
 
         serializer = LoanDeclineSerializer(data=request.data)
@@ -658,6 +659,8 @@ class LoanViewSet(viewsets.ModelViewSet):
             return Response({'error': 'Only signed/approved loans can be funded'}, status=400)
         if not loan.contract_signed:
             return Response({'error': 'Contract must be signed before funding.'}, status=400)
+        if not loan.has_government_id:
+            return Response({'error': 'Government ID must be uploaded before funding.'}, status=400)
 
         recommended_method = FundingMethodRecommendation.for_date()
         if is_arrive_funded_loan(loan):
@@ -1349,7 +1352,7 @@ class LoanViewSet(viewsets.ModelViewSet):
             "current_active_loans_count": current_loans.filter(status='active').count(),
             "current_defaulted_loans_count": current_loans.filter(status='defaulted').count(),
             "current_pending_loans_count": current_loans.filter(
-                status__in=('ibv_pending', 'pending', 'pending_signature'),
+                status__in=('ibv_pending', 'pending', 'pending_signature', 'pending_id'),
             ).count(),
             "current_customers_count": current_customers.count(),
             "current_active_customers_count": current_customers.filter(

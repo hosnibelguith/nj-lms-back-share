@@ -379,7 +379,7 @@ def customer_document_upload_to(instance, filename):
 class CustomerDocument(models.Model):
     """Supporting files uploaded by the customer portal or staff.
 
-    Government ID is staff-only until an automatic capture path exists.
+    Government ID is a required last application step before funding.
     """
 
     TYPE_VOID_CHEQUE = 'void_cheque'
@@ -393,8 +393,9 @@ class CustomerDocument(models.Model):
         TYPE_PAY_STUB,
         TYPE_BANK_STATEMENT,
         TYPE_OTHER,
+        TYPE_GOVERNMENT_ID,
     )
-    STAFF_DOCUMENT_TYPES = PORTAL_DOCUMENT_TYPES + (TYPE_GOVERNMENT_ID,)
+    STAFF_DOCUMENT_TYPES = PORTAL_DOCUMENT_TYPES
 
     DOCUMENT_TYPE_CHOICES = [
         (TYPE_VOID_CHEQUE, 'Void cheque'),

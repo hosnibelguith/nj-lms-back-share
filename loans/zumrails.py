@@ -678,6 +678,8 @@ def funding_configuration_ready(loan: Loan) -> dict:
         blockers.append("Loan is not pending funding.")
     if not loan.contract_signed:
         blockers.append("Contract must be signed before funding.")
+    if not loan.has_government_id:
+        blockers.append("Government ID must be uploaded before funding.")
     funding_block = active_funding_block_message(loan)
     if funding_block:
         blockers.append(funding_block)
@@ -1328,6 +1330,8 @@ class FundingService:
                     raise ValueError("Only loans pending funding can be funded.")
                 if not loan.contract_signed:
                     raise ValueError("Contract must be signed before funding.")
+                if not loan.has_government_id:
+                    raise ValueError("Government ID must be uploaded before funding.")
                 if not schedule_confirmed:
                     raise ValueError("Schedule confirmation required")
                 funding_block = active_funding_block_message(loan)
@@ -1885,7 +1889,7 @@ class CollectionService:
 class FundingConfigurationService:
     # Staff may pick funding/collections accounts before approve and before fund.
     CONFIGURABLE_STATUSES = frozenset(
-        {"ibv_pending", "pending", "pending_signature", "pending_funding"}
+        {"ibv_pending", "pending", "pending_signature", "pending_id", "pending_funding"}
     )
 
     @staticmethod

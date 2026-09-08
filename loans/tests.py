@@ -8,13 +8,14 @@ from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
 
 import requests
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.cache import cache
 from django.db import IntegrityError, transaction
 from django.test import override_settings
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
-from accounts.models import Customer, User
+from accounts.models import Customer, CustomerDocument, User
 from banking.models import BankAccount, BankConnection
 from communications.models import Communication, CommunicationTemplate
 
@@ -35,6 +36,16 @@ from .zumrails import (
     normalize_zum_status,
     payload_hash,
 )
+
+
+def add_government_id(customer):
+    return CustomerDocument.objects.create(
+        customer=customer,
+        document_type=CustomerDocument.TYPE_GOVERNMENT_ID,
+        file=SimpleUploadedFile("id.pdf", b"%PDF-1.4 id", content_type="application/pdf"),
+        original_filename="id.pdf",
+        content_type="application/pdf",
+    )
 
 
 @override_settings(ZUMRAILS_DRY_RUN=True)
@@ -850,6 +861,7 @@ class ZumRailsWorkflowTests(APITestCase):
             is_active=True,
         )
         self.client.force_authenticate(self.staff)
+        add_government_id(self.customer)
         configure_response = self.client.patch(
             f"/api/loans/{self.loan.id}/funding/configuration/",
             {
@@ -5782,6 +5794,7 @@ class BlockedInstitutionFundingTests(APITestCase):
             is_active=True,
         )
         self.client.force_authenticate(self.staff)
+        add_government_id(self.customer)
 
     def risk_account(self, institution):
         return BankAccount.objects.create(
@@ -6054,6 +6067,7 @@ class FundingFailureRecoveryTests(APITestCase):
             is_active=True,
         )
         self.client.force_authenticate(self.staff)
+        add_government_id(self.customer)
 
     def attempt_funding(self):
         return self.client.post(
@@ -6526,6 +6540,7 @@ class IncompleteBankCoordinatesFundingTests(APITestCase):
             is_active=True,
         )
         self.client.force_authenticate(self.staff)
+        add_government_id(self.customer)
 
     def test_funding_options_blocks_incomplete_coordinates(self):
         response = self.client.get(f"/api/loans/{self.loan.id}/funding/options/")

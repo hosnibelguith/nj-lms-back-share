@@ -2,10 +2,11 @@ from decimal import Decimal
 from datetime import timedelta
 from unittest.mock import patch
 
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
-from accounts.models import Customer, GlobalSetting, User
+from accounts.models import Customer, CustomerDocument, GlobalSetting, User
 from communications.models import Communication, CommunicationTemplate
 from loans.models import CollectionPayment, FundedPayment, Loan, LoanFormula, Payment
 from loans.renewal import (
@@ -61,6 +62,13 @@ class EarlyRenewalTests(APITestCase):
             balance=Decimal("100.00"),
             remaining=2,
             formula=self.long_formula,
+        )
+        CustomerDocument.objects.create(
+            customer=self.customer,
+            document_type=CustomerDocument.TYPE_GOVERNMENT_ID,
+            file=SimpleUploadedFile("id.pdf", b"%PDF-1.4 id", content_type="application/pdf"),
+            original_filename="id.pdf",
+            content_type="application/pdf",
         )
         self.client.force_authenticate(user=self.staff)
 

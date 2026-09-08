@@ -410,6 +410,8 @@ class CustomerViewSet(viewsets.ModelViewSet):
         )
         serializer.is_valid(raise_exception=True)
         serializer.save()
+        from loans.services import LoanService
+        LoanService.complete_pending_id(customer)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     @action(
@@ -652,6 +654,7 @@ class CustomerPortalBaseView(APIView):
     APPLICATION_PRIORITY = [
         'pending_signature',
         'ibv_pending',
+        'pending_id',
         'pending',
         'pending_funding',
         'active',
@@ -779,6 +782,10 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
             'connection_status': connection.sync_status if connection else None,
             'last_synced_at': connection.last_synced_at if connection else None,
         }
+        has_government_id = CustomerDocument.objects.filter(
+            customer=customer,
+            document_type=CustomerDocument.TYPE_GOVERNMENT_ID,
+        ).exists()
 
         current_application = None
         if loan:
@@ -850,11 +857,20 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
             next_step = 'contract'
             next_url = '/customer/contracts'
 
+        elif loan.status == 'pending_id':
+            portal_state = 'id_required'
+            next_step = 'government_id'
+            next_url = '/customer/loans'
+
         elif loan.status == 'pending_funding':
             if not customer.contract_completed:
                 portal_state = 'contract_required'
                 next_step = 'contract'
                 next_url = '/customer/contracts'
+            elif not has_government_id:
+                portal_state = 'id_required'
+                next_step = 'government_id'
+                next_url = '/customer/loans'
             else:
                 portal_state = 'pending_funding'
                 next_step = 'funding'
@@ -865,6 +881,10 @@ class CustomerPortalDashboardView(CustomerPortalBaseView):
                 portal_state = 'contract_required'
                 next_step = 'contract'
                 next_url = '/customer/contracts'
+            elif not has_government_id:
+                portal_state = 'id_required'
+                next_step = 'government_id'
+                next_url = '/customer/loans'
             else:
                 portal_state = 'manual_review'
                 next_step = 'review'
@@ -984,6 +1004,8 @@ class CustomerPortalDocumentsView(CustomerPortalBaseView):
         )
         serializer.is_valid(raise_exception=True)
         serializer.save()
+        from loans.services import LoanService
+        LoanService.complete_pending_id(customer)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -1040,6 +1062,7 @@ class CustomerPortalContractPreviewView(CustomerPortalBaseView):
                 'pending_signature',
                 'ibv_pending',
                 'pending',
+                'pending_id',
                 'pending_funding',
             ]
         ).order_by('-created_at').first()
@@ -1122,6 +1145,7 @@ class CustomerPortalSignContractView(CustomerPortalBaseView):
                 'pending_signature',
                 'ibv_pending',
                 'pending',
+                'pending_id',
                 'pending_funding',
             ]
         ).order_by('-created_at').first()

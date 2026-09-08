@@ -499,7 +499,7 @@ class BackendApiWorkflowTests(APITestCase):
 
         self.loan.refresh_from_db()
         self.customer.refresh_from_db()
-        self.assertEqual(self.loan.status, "pending_funding")
+        self.assertEqual(self.loan.status, "pending_id")
         self.assertIsNotNone(self.loan.contract_signed_at)
         self.assertTrue(self.customer.contract_completed)
 

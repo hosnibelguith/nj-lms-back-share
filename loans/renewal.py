@@ -49,6 +49,7 @@ IN_PROGRESS_APPLICATION_STATUSES = (
     'ibv_pending',
     'pending',
     'pending_signature',
+    'pending_id',
     'pending_funding',
 )
 EARLY_RENEWAL_TEMPLATE_NAME = 'Early Renewal Offer'

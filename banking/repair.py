@@ -17,6 +17,7 @@ BLOCKING_LOAN_STATUSES = (
     "ibv_pending",
     "pending",
     "pending_signature",
+    "pending_id",
     "pending_funding",
     "active",
 )

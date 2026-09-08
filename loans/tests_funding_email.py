@@ -1,10 +1,11 @@
 from decimal import Decimal
 from unittest.mock import patch
 
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
-from accounts.models import Customer, User
+from accounts.models import Customer, CustomerDocument, User
 from communications.models import Communication, CommunicationTemplate
 from loans.models import FundedPayment, Loan
 from loans.zumrails import FundingService, apply_funded_payment_zum_status
@@ -37,6 +38,13 @@ class FundingCompletedEmailTests(APITestCase):
             status="pending_funding",
             contract_signed_at=timezone.now(),
             is_active=True,
+        )
+        CustomerDocument.objects.create(
+            customer=self.customer,
+            document_type=CustomerDocument.TYPE_GOVERNMENT_ID,
+            file=SimpleUploadedFile("id.pdf", b"%PDF-1.4 id", content_type="application/pdf"),
+            original_filename="id.pdf",
+            content_type="application/pdf",
         )
         self.template = CommunicationTemplate.objects.filter(
             name="Fund/Approve Template",

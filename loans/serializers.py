@@ -387,6 +387,7 @@ class CurrentApplicationSerializer(serializers.ModelSerializer):
     ai_decision_display = serializers.CharField(source='get_ai_decision_display', read_only=True)
     formula = LoanFormulaSerializer(read_only=True)
     contract_signed = serializers.BooleanField(read_only=True)
+    has_government_id = serializers.BooleanField(read_only=True)
     collected_amount = serializers.SerializerMethodField()
     previous_loan = serializers.UUIDField(source='previous_loan_id', read_only=True, allow_null=True)
     disbursement_amount = serializers.SerializerMethodField()
@@ -421,6 +422,7 @@ class CurrentApplicationSerializer(serializers.ModelSerializer):
             'contract_sent_at',
             'contract_signed',
             'contract_signed_at',
+            'has_government_id',
             'created_at',
             'updated_at',
         ]
@@ -448,6 +450,7 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     ai_decision_display = serializers.CharField(source='get_ai_decision_display', read_only=True)
     contract_signed = serializers.BooleanField(read_only=True)
+    has_government_id = serializers.BooleanField(read_only=True)
     holiday_warnings = serializers.SerializerMethodField()
     payoff_today = serializers.SerializerMethodField()
     unused_daily_interest = serializers.SerializerMethodField()
@@ -483,6 +486,7 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
             'contract_signed',
             'contract_signed_at',
             'contract_sent_at',
+            'has_government_id',
             'paymentSchedule',
             'holiday_warnings',
             'payoff_today',
@@ -549,6 +553,7 @@ class LoanSerializer(serializers.ModelSerializer):
     ai_decision_display = serializers.CharField(source='get_ai_decision_display', read_only=True)
     type_display = serializers.CharField(source='get_type_display', read_only=True)
     contract_signed = serializers.BooleanField(read_only=True)
+    has_government_id = serializers.BooleanField(read_only=True)
     holiday_warnings = serializers.SerializerMethodField()
     previous_loan = serializers.UUIDField(source='previous_loan_id', read_only=True, allow_null=True)
     disbursement_amount = serializers.SerializerMethodField()
@@ -569,6 +574,7 @@ class LoanSerializer(serializers.ModelSerializer):
             'funding_destination_locked_at',
             'collections_account_locked_at',
             'contract_id', 'contract_sent_at', 'contract_signed', 'contract_signed_at',
+            'has_government_id',
             'approved_at', 'approved_by', 'declined_at', 'decline_reason',
             'notes', 'payments', 'holiday_warnings',
             'previous_loan', 'renewal_payoff_amount', 'disbursement_amount', 'early_renewal',
@@ -613,6 +619,7 @@ class LoanListSerializer(serializers.ModelSerializer):
     ibv_status = serializers.SerializerMethodField()
     ibv_status_display = serializers.SerializerMethodField()
     contract_signed = serializers.SerializerMethodField()
+    has_government_id = serializers.BooleanField(read_only=True)
     has_funding_failure = serializers.SerializerMethodField()
     funding_failure_reason = serializers.SerializerMethodField()
 
@@ -645,6 +652,7 @@ class LoanListSerializer(serializers.ModelSerializer):
             'ibv_status_display',
             'contract_signed',
             'contract_signed_at',
+            'has_government_id',
             'is_active',
             'has_funding_failure',
             'funding_failure_reason',
@@ -725,7 +733,12 @@ class LoanCreateSerializer(serializers.ModelSerializer):
             elif not customer.contract_completed:
                 validated_data['status'] = 'pending_signature'
             else:
-                validated_data['status'] = 'pending'
+                from accounts.models import CustomerDocument
+                has_id = CustomerDocument.objects.filter(
+                    customer=customer,
+                    document_type=CustomerDocument.TYPE_GOVERNMENT_ID,
+                ).exists()
+                validated_data['status'] = 'pending' if has_id else 'pending_id'
         return super().create(validated_data)
 
 
