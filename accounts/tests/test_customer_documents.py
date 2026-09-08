@@ -1,3 +1,6 @@
+import tempfile
+from pathlib import Path
+
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from rest_framework.test import APITestCase
@@ -5,7 +8,7 @@ from rest_framework.test import APITestCase
 from accounts.models import Customer, CustomerDocument, User
 
 
-@override_settings(MEDIA_ROOT="/tmp/nj-lms-test-media")
+@override_settings(MEDIA_ROOT=str(Path(tempfile.gettempdir()) / "nj-lms-test-media"))
 class CustomerDocumentTests(APITestCase):
     def setUp(self):
         self.staff = User.objects.create_user(
@@ -59,6 +62,14 @@ class CustomerDocumentTests(APITestCase):
 
         download = self.client.get(f"/api/portal/me/documents/{created.data['id']}/file/")
         self.assertEqual(download.status_code, 200)
+        self.assertIn('attachment', download['Content-Disposition'])
+
+        preview = self.client.get(
+            f"/api/portal/me/documents/{created.data['id']}/file/?inline=1"
+        )
+        self.assertEqual(preview.status_code, 200)
+        self.assertIn('inline', preview['Content-Disposition'])
+        self.assertEqual(preview['Cache-Control'], 'private, no-store')
 
     def test_staff_can_upload_government_id(self):
         self.client.force_authenticate(user=self.staff)
@@ -82,3 +93,19 @@ class CustomerDocumentTests(APITestCase):
             f"/api/customers/{self.customer.id}/documents/{created.data['id']}/file/"
         )
         self.assertEqual(download.status_code, 200)
+
+    def test_missing_document_bytes_return_not_found(self):
+        self.client.force_authenticate(user=self.staff)
+        created = self.client.post(
+            f"/api/customers/{self.customer.id}/documents/",
+            {"document_type": "void_cheque", "file": self._pdf()},
+            format="multipart",
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        document = CustomerDocument.objects.get(pk=created.data['id'])
+        document.file.delete(save=False)
+
+        missing = self.client.get(
+            f"/api/customers/{self.customer.id}/documents/{document.id}/file/"
+        )
+        self.assertEqual(missing.status_code, 404)

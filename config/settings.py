@@ -390,6 +390,43 @@ AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 AWS_STORAGE_BUCKET_NAME = os.environ.get("AWS_STORAGE_BUCKET_NAME", "lendstack-files")
 AWS_S3_REGION_NAME = os.environ.get("AWS_S3_REGION_NAME", "ca-central-1")
 
+# Private Backblaze B2 storage for customer documents. Static assets continue
+# to use WhiteNoise; only Django's default/media storage changes when enabled.
+B2_STORAGE_ENABLED = os.environ.get("B2_STORAGE_ENABLED", "").lower() == "true"
+if B2_STORAGE_ENABLED:
+    B2_APPLICATION_KEY_ID = os.environ.get("B2_APPLICATION_KEY_ID", "")
+    B2_APPLICATION_KEY = os.environ.get("B2_APPLICATION_KEY", "")
+    B2_BUCKET_NAME = os.environ.get("B2_BUCKET_NAME", "")
+    B2_ENDPOINT_URL = os.environ.get("B2_ENDPOINT_URL", "")
+    B2_REGION_NAME = os.environ.get("B2_REGION_NAME", "")
+    if not all(
+        (
+            B2_APPLICATION_KEY_ID,
+            B2_APPLICATION_KEY,
+            B2_BUCKET_NAME,
+            B2_ENDPOINT_URL,
+            B2_REGION_NAME,
+        )
+    ):
+        raise RuntimeError("Backblaze B2 storage is enabled but incomplete.")
+    STORAGES["default"] = {
+        "BACKEND": "storages.backends.s3.S3Storage",
+        "OPTIONS": {
+            "access_key": B2_APPLICATION_KEY_ID,
+            "secret_key": B2_APPLICATION_KEY,
+            "bucket_name": B2_BUCKET_NAME,
+            "endpoint_url": B2_ENDPOINT_URL,
+            "region_name": B2_REGION_NAME,
+            "signature_version": "s3v4",
+            "addressing_style": "path",
+            "default_acl": None,
+            "querystring_auth": True,
+            "querystring_expire": 300,
+            "file_overwrite": False,
+            "object_parameters": {"ServerSideEncryption": "AES256"},
+        },
+    }
+
 
 ARRIVE_API_KEY = os.environ.get("ARRIVE_API_KEY", "")
 ARRIVE_WEBHOOK_URL = os.environ.get(

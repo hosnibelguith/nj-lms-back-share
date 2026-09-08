@@ -9,7 +9,7 @@ from django.contrib.auth.models import update_last_login
 from django.conf import settings
 from django.db import transaction
 from django.db.models import Count, Q
-from django.http import FileResponse
+from django.http import FileResponse, Http404
 from django.middleware.csrf import get_token
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -426,7 +426,10 @@ class CustomerViewSet(viewsets.ModelViewSet):
             document.file.delete(save=False)
             document.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
-        return _serve_customer_document(document)
+        return _serve_customer_document(
+            document,
+            inline=request.query_params.get('inline') == '1',
+        )
 
     @action(detail=True, methods=['post'], url_path='request-ibv')
     def request_ibv(self, request, pk=None):
@@ -451,15 +454,22 @@ class CustomerViewSet(viewsets.ModelViewSet):
         return Response(payload)
 
 
-def _serve_customer_document(document):
-    document.file.open('rb')
+def _serve_customer_document(document, *, inline=False):
+    if not document.file.name or not document.file.storage.exists(document.file.name):
+        raise Http404('Document file is unavailable')
+    try:
+        document.file.open('rb')
+    except FileNotFoundError as exc:
+        raise Http404('Document file is unavailable') from exc
     response = FileResponse(
         document.file,
-        as_attachment=True,
+        as_attachment=not inline,
         filename=document.original_filename or 'document',
     )
     if document.content_type:
         response['Content-Type'] = document.content_type
+    response['Cache-Control'] = 'private, no-store'
+    response['X-Content-Type-Options'] = 'nosniff'
     return response
 
 
@@ -988,7 +998,10 @@ class CustomerPortalDocumentFileView(CustomerPortalBaseView):
                 {'error': 'Document not found'},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        return _serve_customer_document(document)
+        return _serve_customer_document(
+            document,
+            inline=request.query_params.get('inline') == '1',
+        )
 
     def delete(self, request, document_id):
         customer, error_response = self.get_customer(request)
