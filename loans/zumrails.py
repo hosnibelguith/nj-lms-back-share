@@ -17,6 +17,8 @@ from django.db import IntegrityError, transaction
 from django.db.models import Q
 from django.utils import timezone
 
+from config.tenant_context import get_current_tenant_database
+
 from banking.constants import (
     incomplete_bank_coordinates_message,
     normalize_bank_coordinate,
@@ -1759,8 +1761,14 @@ class FundingService:
             customer_id = str(loan.customer_id)
             loan_id = str(loan.id)
             template_id = str(template.id)
+            tenant_database_alias = get_current_tenant_database()
             transaction.on_commit(
-                lambda: send_template_message.delay(customer_id, template_id, loan_id)
+                lambda: send_template_message.delay(
+                    customer_id,
+                    template_id,
+                    loan_id,
+                    tenant_database_alias=tenant_database_alias,
+                )
             )
 
 

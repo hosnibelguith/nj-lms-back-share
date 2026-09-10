@@ -18,7 +18,7 @@ class ContractViewSet(viewsets.ModelViewSet):
     permission_classes = [StaffOnlyPermission]
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = super().get_queryset().filter(customer__lender=self.request.user.effective_lender)
 
         customer_id = self.request.query_params.get('customer_id')
         if customer_id:

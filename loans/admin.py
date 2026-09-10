@@ -7,9 +7,26 @@ from .models import (
     FundedPayment,
     FundingMethodRecommendation,
     Loan,
+    LoanFormula,
     Payment,
     WebhookEvent,
 )
+
+
+@admin.register(LoanFormula)
+class LoanFormulaAdmin(admin.ModelAdmin):
+    list_display = (
+        "name",
+        "lender",
+        "principal_amount",
+        "brokerage_percent",
+        "repayment_percent",
+        "is_active",
+        "is_default",
+    )
+    list_filter = ("lender", "loan_type", "is_active", "is_default")
+    search_fields = ("name", "lender__name", "lender__slug")
+    readonly_fields = ("id", "created_at", "updated_at")
 
 
 class PaymentInline(admin.TabularInline):

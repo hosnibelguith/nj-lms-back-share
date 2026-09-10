@@ -25,7 +25,9 @@ class ActivityHistoryViewSet(viewsets.ModelViewSet):
         return ActivityHistorySerializer
     
     def get_queryset(self):
-        queryset = ActivityHistory.objects.select_related('customer', 'loan')
+        queryset = ActivityHistory.objects.select_related('customer', 'loan').filter(
+            customer__lender=self.request.user.effective_lender,
+        )
         
         # Filter by customer
         customer_id = self.request.query_params.get('customer_id')
@@ -85,6 +87,7 @@ class ActivityHistoryViewSet(viewsets.ModelViewSet):
             ActivityHistory.objects.filter(
                 title__in=FUNDING_ALERT_TITLES,
                 created_at__gte=timezone.now() - timedelta(days=days),
+                customer__lender=request.user.effective_lender,
             )
             .select_related('customer', 'loan')
             .order_by('-created_at')[: max(limit * 4, 40)]
@@ -112,7 +115,10 @@ class ActivityHistoryViewSet(viewsets.ModelViewSet):
         
         # Get activities only — Comment.save() already creates an ActivityHistory row,
         # so merging Comment objects here would duplicate notes in the timeline.
-        activities = ActivityHistory.objects.filter(customer_id=customer_id)
+        activities = ActivityHistory.objects.filter(
+            customer_id=customer_id,
+            customer__lender=request.user.effective_lender,
+        )
         if loan_id:
             activities = activities.filter(Q(loan_id=loan_id) | Q(loan__isnull=True))
 
@@ -168,7 +174,9 @@ class CommentViewSet(viewsets.ModelViewSet):
         return CommentSerializer
     
     def get_queryset(self):
-        queryset = Comment.objects.select_related('customer', 'loan', 'created_by')
+        queryset = Comment.objects.select_related('customer', 'loan', 'created_by').filter(
+            customer__lender=self.request.user.effective_lender,
+        )
         
         # Filter by customer
         customer_id = self.request.query_params.get('customer_id')

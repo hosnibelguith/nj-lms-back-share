@@ -330,7 +330,10 @@ class BankConnectionViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         ordered_transactions = BankTransaction.objects.order_by('-date', '-created_at')
-        queryset = BankConnection.objects.select_related('customer').filter(is_active=True).prefetch_related(
+        queryset = BankConnection.objects.select_related('customer').filter(
+            is_active=True,
+            customer__lender=self.request.user.effective_lender,
+        ).prefetch_related(
             Prefetch(
                 'accounts',
                 queryset=BankAccount.objects.order_by('-is_primary', 'name').prefetch_related(
@@ -372,7 +375,9 @@ class BankAccountViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         ordered_transactions = BankTransaction.objects.order_by('-date', '-created_at')
-        queryset = BankAccount.objects.select_related('customer', 'connection').prefetch_related(
+        queryset = BankAccount.objects.select_related('customer', 'connection').filter(
+            customer__lender=self.request.user.effective_lender,
+        ).prefetch_related(
             Prefetch('transactions', queryset=ordered_transactions)
         )
 
@@ -459,7 +464,10 @@ class BankAccountViewSet(viewsets.ReadOnlyModelViewSet):
         data = serializer.validated_data
 
         try:
-            customer = Customer.objects.get(id=data['customer_id'])
+            customer = Customer.objects.get(
+                id=data['customer_id'],
+                lender=request.user.effective_lender,
+            )
         except Customer.DoesNotExist:
             return Response({'error': 'Customer not found.'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -529,7 +537,8 @@ class BankTransactionViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         queryset = BankTransaction.objects.select_related('customer', 'account').filter(
-            account__connection__is_active=True
+            account__connection__is_active=True,
+            customer__lender=self.request.user.effective_lender,
         )
 
         customer_id = self.request.query_params.get('customer_id')
@@ -548,7 +557,9 @@ class FinancialAnalysisReportViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [permissions.IsAuthenticated, StaffOnlyPermission]
 
     def get_queryset(self):
-        queryset = FinancialAnalysisReport.objects.select_related('customer')
+        queryset = FinancialAnalysisReport.objects.select_related('customer').filter(
+            customer__lender=self.request.user.effective_lender,
+        )
 
         customer_id = self.request.query_params.get('customer_id')
         if customer_id:

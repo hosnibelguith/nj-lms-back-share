@@ -13,7 +13,7 @@ from django.http import FileResponse, Http404
 from django.middleware.csrf import get_token
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from .models import User, Customer, GlobalSetting, CustomerDocument
+from .models import User, Customer, GlobalSetting, CustomerDocument, Lender
 from .serializers import (
     UserSerializer, UserCreateSerializer, LoginSerializer,
     CustomerSerializer, CustomerListSerializer, CustomerCreateSerializer,
@@ -263,7 +263,7 @@ class UserViewSet(viewsets.ModelViewSet):
         return UserSerializer
     
     def get_queryset(self):
-        queryset = User.objects.all()
+        queryset = User.objects.filter(lender=self.request.user.effective_lender)
         
         permission_level = self.request.query_params.get('permission_level')
         if permission_level:
@@ -302,7 +302,7 @@ class CustomerViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = Customer.objects.annotate(
             loan_count=Count('loans', distinct=True)
-        )
+        ).filter(lender=self.request.user.effective_lender)
 
         search = self.request.query_params.get('search')
         if search:
@@ -481,12 +481,18 @@ class CustomerApplyView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        serializer = CustomerApplySerializer(data=request.data)
+        serializer = CustomerApplySerializer(
+            data=request.data,
+            context={'lender': Lender.for_host(request.get_host())},
+        )
         serializer.is_valid(raise_exception=True)
         customer = serializer.save()
         mark_user_login(customer.portal_user)
 
-        send_welcome_email.delay(str(customer.id))
+        send_welcome_email.delay(
+            str(customer.id),
+            tenant_database_alias=request.tenant_database_alias,
+        )
 
         refresh = RefreshToken.for_user(customer.portal_user)
         access_token = str(refresh.access_token)
@@ -513,7 +519,10 @@ class CustomerSignupStartView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        serializer = CustomerSignupStartSerializer(data=request.data)
+        serializer = CustomerSignupStartSerializer(
+            data=request.data,
+            context={'lender': Lender.for_host(request.get_host())},
+        )
         serializer.is_valid(raise_exception=True)
         result = serializer.save()
 
@@ -543,7 +552,10 @@ class CustomerSignupVerifyPhoneView(APIView):
         customer = serializer.save()
         mark_user_login(customer.portal_user)
 
-        send_welcome_email.delay(str(customer.id))
+        send_welcome_email.delay(
+            str(customer.id),
+            tenant_database_alias=request.tenant_database_alias,
+        )
 
         refresh = RefreshToken.for_user(customer.portal_user)
 
@@ -1222,7 +1234,12 @@ class CustomerPortalSignContractView(CustomerPortalBaseView):
             loan_id = str(loan.id)
             template_id = str(template.id)
             transaction.on_commit(
-                lambda: send_template_message.delay(customer_id, template_id, loan_id)
+                lambda: send_template_message.delay(
+                    customer_id,
+                    template_id,
+                    loan_id,
+                    tenant_database_alias=request.tenant_database_alias,
+                )
             )
 
         return Response({

@@ -8,6 +8,8 @@ from datetime import timedelta
 import logging
 import uuid
 
+from config.tenant_context import get_current_tenant_database
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,7 +42,7 @@ def send_contract_task(loan_id: str):
 
 
 @shared_task
-def process_scheduled_payments():
+def process_scheduled_payments(tenant_database_alias: str = None):
     """
     Initiate Zūm EFT collections for payments whose send window has opened.
 
@@ -103,7 +105,7 @@ def process_scheduled_payments():
 
 
 @shared_task
-def check_defaulted_loans():
+def check_defaulted_loans(tenant_database_alias: str = None):
     """
     Check for loans that should be marked as defaulted.
     A loan is defaulted after 3+ NSF payments.
@@ -128,7 +130,7 @@ def check_defaulted_loans():
 
 
 @shared_task
-def send_payment_reminders():
+def send_payment_reminders(tenant_database_alias: str = None):
     """
     Send payment reminders for payments due tomorrow.
     Run daily via celery beat.
@@ -190,7 +192,7 @@ def create_payment_schedule(loan_id: str, schedule: list):
 
 
 @shared_task
-def process_collection_settlements():
+def process_collection_settlements(tenant_database_alias: str = None):
     from .zumrails import SettlementService
 
     completed = SettlementService.process_due()
@@ -199,7 +201,7 @@ def process_collection_settlements():
 
 
 @shared_task
-def send_early_renewal_offers():
+def send_early_renewal_offers(tenant_database_alias: str = None):
     """Email eligible collecting clients once per loan."""
     from django.conf import settings
 
@@ -250,6 +252,7 @@ def send_early_renewal_offers():
             str(loan.customer_id),
             str(template.id),
             str(loan.id),
+            tenant_database_alias=get_current_tenant_database(),
             extra_context={
                 'old_balance': offer['old_balance'],
                 'remaining_balance': offer['remaining_balance'],

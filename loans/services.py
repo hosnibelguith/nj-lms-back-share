@@ -9,7 +9,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from datetime import timedelta
 from django.db import models, transaction
 from django.utils import timezone
-from accounts.models import Customer
+from config.tenant_context import get_current_tenant_database
+from accounts.models import Customer, Lender
 from . import business_calendar
 from .models import CollectionPayment, FundedPayment, Loan, LoanFormula, Payment
 
@@ -20,6 +21,9 @@ class LoanService:
     """Service class for loan operations."""
 
     RECEIVED_PAYMENT_MAX_AGE_DAYS = 3
+    DEFAULT_NSF_FEE_AMOUNT = Decimal('50.00')
+    DEFAULT_BROKERAGE_PERCENT = Decimal('70.00')
+    DEFAULT_INTEREST_PERCENT = Decimal('35.00')
     # Stopped loans still accept Interac/manual credits when PAD cannot run
     # (account closed / inactive). Do not reactivate; only reduce balance.
     STAFF_CREDIT_LOAN_STATUSES = ('active', 'defaulted', 'stopped')
@@ -27,6 +31,60 @@ class LoanService:
     @staticmethod
     def money(value):
         return value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    @staticmethod
+    def _lender_for_customer(customer: Customer | None) -> Lender:
+        if customer is not None and getattr(customer, 'lender_id', None):
+            return customer.lender
+        return Lender.default()
+
+    @staticmethod
+    def lending_settings(lender: Lender | None = None) -> dict:
+        lender = lender or Lender.default()
+        default_formula = (
+            LoanFormula.objects.filter(
+                models.Q(lender=lender) | models.Q(lender__isnull=True),
+                is_active=True,
+                is_default=True,
+            )
+            .order_by('-created_at')
+            .first()
+        )
+        default_brokerage = (
+            default_formula.brokerage_percent
+            if default_formula is not None
+            else LoanService.DEFAULT_BROKERAGE_PERCENT
+        )
+        default_interest = (
+            default_formula.repayment_percent
+            if default_formula is not None
+            else LoanService.DEFAULT_INTEREST_PERCENT
+        )
+        return {
+            'lender_id': str(lender.id),
+            'lender_name': lender.name,
+            'lender_slug': lender.slug,
+            'nsf_fee_amount': LoanService.money(
+                lender.nsf_fee_amount
+                if lender.nsf_fee_amount is not None
+                else LoanService.DEFAULT_NSF_FEE_AMOUNT
+            ),
+            'brokerage_percent': LoanService.money(
+                lender.brokerage_percent
+                if lender.brokerage_percent is not None
+                else default_brokerage
+            ),
+            'interest_percent': LoanService.money(
+                lender.interest_percent
+                if lender.interest_percent is not None
+                else default_interest
+            ),
+        }
+
+    @staticmethod
+    def collection_failure_fee_amount(loan: Loan | None = None) -> Decimal:
+        lender = LoanService._lender_for_customer(getattr(loan, 'customer', None))
+        return LoanService.lending_settings(lender)['nsf_fee_amount']
 
     @staticmethod
     def normalize_received_payment_date(received_date=None):
@@ -59,12 +117,13 @@ class LoanService:
         return this_week_thursday + timedelta(days=7)
 
     @staticmethod
-    def get_formula_for_amount(amount: Decimal) -> LoanFormula | None:
+    def get_formula_for_amount(amount: Decimal, lender: Lender | None = None) -> LoanFormula | None:
         """
         Find exact active formula for requested amount.
         Fallback to default active formula if no exact amount match exists.
         """
         formula = LoanFormula.objects.filter(
+            models.Q(lender=lender) | models.Q(lender__isnull=True),
             principal_amount=amount,
             is_active=True,
         ).order_by('-is_default', '-created_at').first()
@@ -73,14 +132,22 @@ class LoanService:
             return formula
 
         return LoanFormula.objects.filter(
+            models.Q(lender=lender) | models.Q(lender__isnull=True),
             is_active=True,
             is_default=True,
         ).order_by('-created_at').first()
 
     @staticmethod
     def calculate_from_formula(formula: LoanFormula, principal: Decimal) -> dict:
+        return LoanService.calculate_from_pricing(
+            principal=principal,
+            brokerage_percent=formula.brokerage_percent,
+        )
+
+    @staticmethod
+    def calculate_from_pricing(principal: Decimal, brokerage_percent: Decimal) -> dict:
         brokerage_fee = LoanService.money(
-            principal * formula.brokerage_percent / Decimal('100')
+            principal * brokerage_percent / Decimal('100')
         )
         subtotal = LoanService.money(principal + brokerage_fee)
 
@@ -135,10 +202,15 @@ class LoanService:
         money = LoanService.money
         principal = loan.principal or Decimal('0.00')
         formula = loan.formula
+        brokerage_percent = (
+            loan.pricing_brokerage_percent
+            if loan.pricing_brokerage_percent is not None
+            else getattr(formula, 'brokerage_percent', Decimal('0.00'))
+        )
 
-        if formula and principal:
+        if principal:
             brokerage_fee = money(
-                principal * formula.brokerage_percent / Decimal('100')
+                principal * brokerage_percent / Decimal('100')
             )
         else:
             brokerage_fee = Decimal('0.00')
@@ -148,7 +220,12 @@ class LoanService:
             planned_interest = Decimal('0.00')
         planned_interest = money(planned_interest)
 
-        if formula:
+        if loan.pricing_number_of_payments and loan.pricing_frequency_days:
+            planned_days = (
+                int(loan.pricing_number_of_payments)
+                * int(loan.pricing_frequency_days)
+            )
+        elif formula:
             planned_days = (
                 int(formula.default_number_of_payments)
                 * int(formula.default_frequency_days)
@@ -287,15 +364,25 @@ class LoanService:
             principal = Decimal(str(principal))
         if previous_loan is not None and principal <= 0:
             principal = LoanService.money(previous_loan.principal or Decimal('0.00'))
-        formula = LoanService.get_formula_for_amount(principal)
+        lender = LoanService._lender_for_customer(customer)
+        formula = LoanService.get_formula_for_amount(principal, lender=lender)
 
         if formula:
-            amounts = LoanService.calculate_from_formula(formula, principal)
+            lending_settings = LoanService.lending_settings(lender)
+            if not formula.lender_id:
+                formula.pk = None
+                formula.lender = lender
+                formula.name = f'{lender.name} {principal}'
+                formula.is_default = False
+                formula.save()
+            brokerage_percent = lending_settings['brokerage_percent']
+            interest_percent = lending_settings['interest_percent']
+            amounts = LoanService.calculate_from_pricing(principal, brokerage_percent)
 
             first_date = LoanService.get_demo_first_payment_date()
             total_amount = LoanService.calculate_schedule_total(
                 principal_balance=amounts['total_amount'],
-                annual_rate_percent=formula.annual_interest_rate,
+                annual_rate_percent=interest_percent,
                 start_date=first_date,
                 num_payments=formula.default_number_of_payments,
                 frequency_days=formula.default_frequency_days,
@@ -315,6 +402,10 @@ class LoanService:
             fee=fee,
             total_amount=total_amount,
             balance=total_amount,
+            pricing_brokerage_percent=brokerage_percent if formula else None,
+            pricing_interest_percent=interest_percent if formula else None,
+            pricing_number_of_payments=formula.default_number_of_payments if formula else None,
+            pricing_frequency_days=formula.default_frequency_days if formula else None,
             status=status,
             is_active=True,
             previous_loan=previous_loan,
@@ -697,8 +788,14 @@ class LoanService:
             customer_id = str(loan.customer_id)
             loan_id = str(loan.id)
             template_id = str(template.id)
+            tenant_database_alias = get_current_tenant_database()
             transaction.on_commit(
-                lambda: send_template_message.delay(customer_id, template_id, loan_id)
+                lambda: send_template_message.delay(
+                    customer_id,
+                    template_id,
+                    loan_id,
+                    tenant_database_alias=tenant_database_alias,
+                )
             )
 
         return loan
@@ -792,11 +889,13 @@ class LoanService:
             loan_id = str(loan.id)
             template_id = str(template.id)
             extra_context = {'portal_url': f'{frontend_url}/customer/login'}
+            tenant_database_alias = get_current_tenant_database()
             transaction.on_commit(
                 lambda: send_template_message.delay(
                     customer_id,
                     template_id,
                     loan_id,
+                    tenant_database_alias=tenant_database_alias,
                     extra_context=extra_context,
                 )
             )
@@ -985,9 +1084,15 @@ class LoanService:
             customer_id = str(loan.customer_id)
             loan_id = str(loan.id)
             template_id = str(template.id)
+            tenant_database_alias = get_current_tenant_database()
             transaction.on_commit(
-                lambda: send_template_message.delay(customer_id, template_id, loan_id)
-        )
+                lambda: send_template_message.delay(
+                    customer_id,
+                    template_id,
+                    loan_id,
+                    tenant_database_alias=tenant_database_alias,
+                )
+            )
 
         return loan
 
@@ -2669,8 +2774,8 @@ class LoanService:
 
     DEFERRAL_FEE_AMOUNT = Decimal('35.00')
     DEFERRAL_FEE_NOTE = 'Deferral fee $35'
-    COLLECTION_FAILURE_FEE_AMOUNT = Decimal('50.00')
-    COLLECTION_FAILURE_FEE_NOTE = 'Collection failure fee $50'
+    COLLECTION_FAILURE_FEE_AMOUNT = DEFAULT_NSF_FEE_AMOUNT
+    COLLECTION_FAILURE_FEE_NOTE = 'Collection failure fee'
     COLLECTION_FAILURE_RECOVERY_NOTE = 'Failed collection recovery'
     COLLECTION_FAILURE_INTEREST_NOTE = 'Collection failure daily interest'
     COLLECTION_FAILURE_ID_RE = re.compile(r'Collection failure id:\s*([0-9a-fA-F-]{36})')
@@ -2763,7 +2868,7 @@ class LoanService:
         for payment in payments:
             nsf = LoanService.collection_failure_nsf_fee_amount(payment)
             if nsf <= 0 and LoanService.is_collection_failure_fee_payment(payment):
-                nsf = LoanService.COLLECTION_FAILURE_FEE_AMOUNT
+                nsf = LoanService.collection_failure_fee_amount(loan)
             if nsf <= 0:
                 continue
             ids = LoanService._collection_failure_ids_from_payment(payment)
@@ -3129,7 +3234,8 @@ class LoanService:
                     outstanding=simulated_balance,
                     days=frequency_days * 2,
                 )
-            extra = money(LoanService.COLLECTION_FAILURE_FEE_AMOUNT + interest)
+            nsf_fee_amount = LoanService.collection_failure_fee_amount(loan)
+            extra = money(nsf_fee_amount + interest)
             simulated_balance = money(simulated_balance + extra)
             remaining, fill_updates = LoanService._collection_failure_original_fill_plan(
                 non_generated_payments,
@@ -3142,7 +3248,7 @@ class LoanService:
             note = (
                 f'Collection failure id: {collection_id}\n'
                 f'Reason: {reason}\n'
-                f'NSF fee: ${LoanService.COLLECTION_FAILURE_FEE_AMOUNT}\n'
+                f'NSF fee: ${nsf_fee_amount}\n'
                 f'Extension interest: ${interest}'
             )
             while remaining > 0:
@@ -3519,7 +3625,7 @@ class LoanService:
         ).get(pk=collection.pk)
         loan = Loan.objects.select_for_update().get(pk=collection.loan_id)
         failed_payment = collection.payment
-        fee_amount = LoanService.money(LoanService.COLLECTION_FAILURE_FEE_AMOUNT)
+        fee_amount = LoanService.collection_failure_fee_amount(loan)
         collection_id = str(collection.id)
 
         existing_fee = loan.payments.filter(
@@ -3649,7 +3755,7 @@ class LoanService:
                 continue
             nsf = LoanService.collection_failure_nsf_fee_amount(payment)
             if nsf <= 0 and LoanService.is_collection_failure_fee_payment(payment):
-                nsf = LoanService.COLLECTION_FAILURE_FEE_AMOUNT
+                nsf = LoanService.collection_failure_fee_amount(loan)
             if nsf > 0:
                 count += 1
         return count

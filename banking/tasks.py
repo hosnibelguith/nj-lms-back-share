@@ -944,7 +944,7 @@ def queue_flinks_gad_repull(
 
 
 @shared_task
-def repull_recent_unsynced_ibv():
+def repull_recent_unsynced_ibv(tenant_database_alias: str = None):
     """Pending IBV with a LoginId: run the same GAD pull as the staff button.
 
     Executes inline so the pull cannot be lost after Redis accepts a delay().

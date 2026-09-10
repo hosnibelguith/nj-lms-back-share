@@ -8,7 +8,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from django.db import models
 from django.utils import timezone
-from accounts.models import Customer
+from accounts.models import Customer, Lender
 from banking.models import BankAccount
 import uuid
 
@@ -23,6 +23,13 @@ class LoanFormula(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    lender = models.ForeignKey(
+        Lender,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='loan_formulas',
+    )
 
     name = models.CharField(max_length=255)
     loan_type = models.CharField(max_length=20, choices=[
@@ -177,6 +184,30 @@ class Loan(models.Model):
     fee = models.DecimalField(max_digits=10, decimal_places=2, default=0, help_text="Total fee charged")
     total_amount = models.DecimalField(max_digits=10, decimal_places=2, help_text="Principal + Fee")
     balance = models.DecimalField(max_digits=10, decimal_places=2, help_text="Remaining balance")
+    pricing_brokerage_percent = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Brokerage percentage snapshotted when this loan was priced.",
+    )
+    pricing_interest_percent = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Interest percentage snapshotted when this loan was priced.",
+    )
+    pricing_number_of_payments = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Payment count snapshotted when this loan was priced.",
+    )
+    pricing_frequency_days = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Payment frequency snapshotted when this loan was priced.",
+    )
     
     # Status
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')

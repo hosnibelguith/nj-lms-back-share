@@ -5,14 +5,20 @@ from uuid import uuid4
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
-from accounts.models import Customer, User
+from accounts.models import Customer, Lender, User
 from loans.models import CollectionPayment, Loan, LoanFormula, Payment
 from loans.services import LoanService
 
 
 class InterestBreakdownFailedPaymentTests(APITestCase):
     def setUp(self):
+        self.lender = Lender.objects.create(
+            name="Interest Test Lender",
+            slug="interest-test",
+            primary_domain="interest-test.local",
+        )
         self.staff = User.objects.create_user(
+            lender=self.lender,
             email="interest-breakdown@example.com",
             password="password123",
             full_name="Interest Agent",
@@ -21,6 +27,7 @@ class InterestBreakdownFailedPaymentTests(APITestCase):
             permission_level=4,
         )
         self.customer = Customer.objects.create(
+            lender=self.lender,
             first_name="Interest",
             last_name="Client",
             email="interest.client@example.com",

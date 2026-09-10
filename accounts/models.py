@@ -1,5 +1,6 @@
 from django.db import models
 from django.contrib.auth.models import AbstractUser, BaseUserManager
+from decimal import Decimal
 import uuid
 from django.utils import timezone
 
@@ -24,6 +25,51 @@ class UserManager(BaseUserManager):
         return self.create_user(email, password, **extra_fields)
 
 
+class Lender(models.Model):
+    """Tenant/lender configuration shared by all users and customers on that lender."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=255)
+    slug = models.SlugField(max_length=80, unique=True, db_index=True)
+    primary_domain = models.CharField(max_length=255, unique=True, blank=True, null=True)
+    logo_url = models.URLField(blank=True, default='')
+    primary_color = models.CharField(max_length=32, blank=True, default='')
+    secondary_color = models.CharField(max_length=32, blank=True, default='')
+    nsf_fee_amount = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('50.00'))
+    brokerage_percent = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal('70.00'))
+    interest_percent = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal('35.00'))
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'accounts_lender'
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+    @classmethod
+    def default(cls):
+        lender, _created = cls.objects.get_or_create(
+            slug='mohawkloans',
+            defaults={
+                'name': 'MohawkLoans',
+                'primary_domain': 'mohawkloans.com',
+            },
+        )
+        return lender
+
+    @classmethod
+    def for_host(cls, host: str | None):
+        normalized = (host or '').split(':', 1)[0].strip().lower()
+        if normalized:
+            lender = cls.objects.filter(primary_domain__iexact=normalized, is_active=True).first()
+            if lender:
+                return lender
+        return cls.default()
+
+
 class User(AbstractUser):
     """
     Unified auth user model.
@@ -45,6 +91,13 @@ class User(AbstractUser):
     ]
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    lender = models.ForeignKey(
+        Lender,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='users',
+    )
     username = None
     email = models.EmailField(unique=True)
     full_name = models.CharField(max_length=255)
@@ -78,6 +131,10 @@ class User(AbstractUser):
     
     def has_permission(self, required_level: int) -> bool:
         return self.permission_level >= required_level
+
+    @property
+    def effective_lender(self):
+        return self.lender or Lender.default()
 
 
 class Customer(models.Model):
@@ -117,6 +174,13 @@ class Customer(models.Model):
     ]
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    lender = models.ForeignKey(
+        Lender,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='customers',
+    )
     portal_user = models.OneToOneField(
         User,
         on_delete=models.SET_NULL,

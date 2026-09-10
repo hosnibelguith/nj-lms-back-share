@@ -12,6 +12,8 @@ from __future__ import annotations
 from django.conf import settings
 from django.db import transaction
 
+from config.tenant_context import get_current_tenant_database
+
 from accounts.models import Customer
 
 
@@ -93,6 +95,7 @@ def request_ibv(customer: Customer, *, user=None) -> dict:
         str(customer.id),
         str(template.id),
         str(loan.id) if loan else None,
+        tenant_database_alias=get_current_tenant_database(),
         extra_context={
             'ibv_url': url,
             'portal_url': url,

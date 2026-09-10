@@ -34,7 +34,11 @@ class CommunicationViewSet(viewsets.ModelViewSet):
         return CommunicationSerializer
     
     def get_queryset(self):
-        queryset = Communication.objects.select_related('customer', 'loan', 'created_by')
+        queryset = Communication.objects.select_related(
+            'customer',
+            'loan',
+            'created_by',
+        ).filter(customer__lender=self.request.user.effective_lender)
         
         # Filter by customer
         customer_id = self.request.query_params.get('customer_id')
@@ -384,7 +388,10 @@ class CommunicationViewSet(viewsets.ModelViewSet):
         )
         
         # Queue email task
-        send_email_task.delay(str(communication.id))
+        send_email_task.delay(
+            str(communication.id),
+            tenant_database_alias=request.tenant_database_alias,
+        )
         
         # Log activity
         from activity.models import ActivityHistory
@@ -443,7 +450,10 @@ class CommunicationViewSet(viewsets.ModelViewSet):
         )
         
         # Queue SMS task
-        send_sms.delay(str(communication.id))
+        send_sms.delay(
+            str(communication.id),
+            tenant_database_alias=request.tenant_database_alias,
+        )
         
         # Log activity
         from activity.models import ActivityHistory

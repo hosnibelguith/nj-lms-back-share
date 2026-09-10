@@ -15,7 +15,7 @@ def generate_contract_pdf(contract_id: str, template_id: str = None):
 
 
 @shared_task
-def check_expired_contracts():
+def check_expired_contracts(tenant_database_alias: str = None):
     logger.info("Placeholder expired contract check")
 
 

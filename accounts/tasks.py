@@ -8,41 +8,45 @@ from django.conf import settings
 from datetime import timedelta
 import logging
 
+from config.tenant_context import use_tenant_database
+
 logger = logging.getLogger(__name__)
 
 
 @shared_task
-def send_welcome_email(customer_id: str):
+def send_welcome_email(customer_id: str, tenant_database_alias: str = None):
     """Send welcome email to new customer."""
-    try:
-        from django.core.mail import send_mail
+    with use_tenant_database(tenant_database_alias):
+        try:
+            from django.core.mail import send_mail
 
-        from .models import Customer
+            from .models import Customer
 
-        customer = Customer.objects.get(id=customer_id)
-        frontend_url = settings.FRONTEND_URL.rstrip('/')
-        brand = getattr(settings, 'LENDER_BRAND_NAME', None) or 'MohawkLoans'
+            customer = Customer.objects.select_related('lender').get(id=customer_id)
+            frontend_url = settings.FRONTEND_URL.rstrip('/')
+            lender = getattr(customer, 'lender', None)
+            brand = getattr(lender, 'name', None) or getattr(settings, 'LENDER_BRAND_NAME', None) or 'MohawkLoans'
 
-        send_mail(
-            subject=f'Welcome to {brand}',
-            message=(
-                f'Hello {customer.first_name},\n\n'
-                f'Thank you for applying with {brand}.\n\n'
-                f'Your next step is to complete banking verification:\n'
-                f'{frontend_url}/customer/banking\n\n'
-                f'Thank you,\n{brand}'
-            ),
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[customer.email],
-            fail_silently=False,
-        )
+            send_mail(
+                subject=f'Welcome to {brand}',
+                message=(
+                    f'Hello {customer.first_name},\n\n'
+                    f'Thank you for applying with {brand}.\n\n'
+                    f'Your next step is to complete banking verification:\n'
+                    f'{frontend_url}/customer/banking\n\n'
+                    f'Thank you,\n{brand}'
+                ),
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[customer.email],
+                fail_silently=False,
+            )
 
-        logger.info(f"Welcome email sent to customer {customer_id}")
+            logger.info(f"Welcome email sent to customer {customer_id}")
 
-    except Customer.DoesNotExist:
-        logger.error(f"Customer {customer_id} not found")
-    except Exception as e:
-        logger.error(f"Error sending welcome email: {e}")
+        except Customer.DoesNotExist:
+            logger.error(f"Customer {customer_id} not found")
+        except Exception as e:
+            logger.error(f"Error sending welcome email: {e}")
 
 
 @shared_task

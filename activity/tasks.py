@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 @shared_task
-def cleanup_old_activities(days: int = 365):
+def cleanup_old_activities(days: int = 365, tenant_database_alias: str = None):
     """
     Clean up old activity entries to manage database size.
     Keeps activities for the specified number of days.

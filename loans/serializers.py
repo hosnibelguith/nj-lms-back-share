@@ -122,6 +122,7 @@ class LoanFormulaSerializer(serializers.ModelSerializer):
         model = LoanFormula
         fields = [
             'id',
+            'lender',
             'name',
             'loan_type',
             'principal_amount',
@@ -1029,3 +1030,23 @@ class BankHolidayUploadSerializer(serializers.Serializer):
 class CollectionSettingsSerializer(serializers.Serializer):
     mode = serializers.ChoiceField(choices=['manual', 'after_missed'])
     missed_count = serializers.IntegerField(min_value=1, max_value=20, required=False)
+
+
+class LendingSettingsSerializer(serializers.Serializer):
+    nsf_fee_amount = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=Decimal('0.00'),
+    )
+    brokerage_percent = serializers.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        min_value=Decimal('0.00'),
+        max_value=Decimal('100.00'),
+    )
+    interest_percent = serializers.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        min_value=Decimal('0.00'),
+        max_value=Decimal('100.00'),
+    )

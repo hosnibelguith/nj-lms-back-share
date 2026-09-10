@@ -3,6 +3,7 @@ Django settings for LendStack project.
 Configured for local development + Heroku deployment.
 """
 
+import json
 import os
 from pathlib import Path
 from datetime import timedelta
@@ -22,6 +23,16 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 def env_list(var_name, default=""):
     value = os.environ.get(var_name, default)
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def env_json(var_name, default=None):
+    raw = os.environ.get(var_name)
+    if not raw:
+        return default if default is not None else {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{var_name} must be valid JSON.") from exc
 
 
 # -------------------------------------------------------------------
@@ -90,6 +101,7 @@ MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
+    "config.tenant_middleware.TenantDatabaseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -138,6 +150,58 @@ if "DATABASE_URL" in os.environ:
         conn_health_checks=True,
         ssl_require=not DEBUG,
     )
+
+TENANT_DEFAULT_DATABASE_ALIAS = os.environ.get("TENANT_DEFAULT_DATABASE_ALIAS", "default")
+TENANT_DATABASES = env_json("TENANT_DATABASES", {})
+
+for alias, database_url in TENANT_DATABASES.items():
+    if alias == "default":
+        raise ValueError("TENANT_DATABASES should not redefine the default database.")
+    DATABASES[alias] = dj_database_url.parse(
+        database_url,
+        conn_max_age=600,
+        conn_health_checks=True,
+        ssl_require=not DEBUG,
+    )
+
+for database_config in DATABASES.values():
+    database_config.setdefault("ATOMIC_REQUESTS", True)
+
+TENANT_DATABASE_ALIASES = set(DATABASES.keys())
+if TENANT_DEFAULT_DATABASE_ALIAS not in TENANT_DATABASE_ALIASES:
+    raise ValueError("TENANT_DEFAULT_DATABASE_ALIAS must be a configured database alias.")
+
+TENANT_DATABASE_DOMAINS = env_json("TENANT_DATABASE_DOMAINS", {})
+TENANT_DATABASE_DOMAIN_MAP = {}
+for alias, domains in TENANT_DATABASE_DOMAINS.items():
+    if alias not in TENANT_DATABASE_ALIASES:
+        raise ValueError(f"TENANT_DATABASE_DOMAINS references unknown database alias '{alias}'.")
+    if isinstance(domains, str):
+        domains = [domains]
+    for domain in domains:
+        TENANT_DATABASE_DOMAIN_MAP[domain.lower()] = alias
+
+TENANT_DEBUG_HEADER_ENABLED = os.environ.get(
+    "TENANT_DEBUG_HEADER_ENABLED",
+    "False",
+).lower() == "true"
+TENANT_DATABASE_APPS = set(env_list(
+    "TENANT_DATABASE_APPS",
+    ",".join([
+        "accounts",
+        "activity",
+        "admin",
+        "auth",
+        "banking",
+        "communications",
+        "contenttypes",
+        "contracts",
+        "loans",
+        "sessions",
+        "token_blacklist",
+    ]),
+))
+DATABASE_ROUTERS = ["config.db_router.TenantDatabaseRouter"]
 
 
 # -------------------------------------------------------------------

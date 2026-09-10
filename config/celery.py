@@ -5,6 +5,8 @@ Celery configuration for LendStack project.
 import os
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import task_postrun, task_prerun
+from django.conf import settings
 
 # Set the default Django settings module for the 'celery' program.
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
@@ -17,6 +19,26 @@ app.config_from_object('django.conf:settings', namespace='CELERY')
 
 # Load task modules from all registered Django apps.
 app.autodiscover_tasks()
+
+
+@task_prerun.connect
+def set_task_tenant_database(sender=None, task=None, kwargs=None, **_):
+    from config.tenant_context import set_current_tenant_database
+
+    alias = (kwargs or {}).get("tenant_database_alias")
+    token = set_current_tenant_database(alias)
+    if task is not None:
+        task._tenant_database_token = token
+
+
+@task_postrun.connect
+def reset_task_tenant_database(sender=None, task=None, **_):
+    from config.tenant_context import reset_current_tenant_database
+
+    token = getattr(task, "_tenant_database_token", None)
+    if token is not None:
+        reset_current_tenant_database(token)
+        task._tenant_database_token = None
 
 # Celery Beat Schedule (periodic tasks)
 app.conf.beat_schedule = {
@@ -77,6 +99,14 @@ app.conf.beat_schedule = {
         'kwargs': {'days': 365},
     },
 }
+
+for alias in sorted(settings.TENANT_DATABASE_ALIASES - {"default"}):
+    for name, entry in list(app.conf.beat_schedule.items()):
+        tenant_entry = dict(entry)
+        tenant_kwargs = dict(tenant_entry.get("kwargs", {}))
+        tenant_kwargs["tenant_database_alias"] = alias
+        tenant_entry["kwargs"] = tenant_kwargs
+        app.conf.beat_schedule[f"{name}-{alias}"] = tenant_entry
 
 
 @app.task(bind=True, ignore_result=True)

@@ -42,6 +42,7 @@ from .serializers import (
     CollectionsAccountChangeAuditSerializer,
     CollectionsAccountUpdateSerializer,
     FundingMethodRecommendationSerializer,
+    LendingSettingsSerializer,
     LoanFormulaSerializer,
     LoanSerializer,
     LoanListSerializer,
@@ -102,7 +103,7 @@ class LoanFormulaViewSet(viewsets.ModelViewSet):
     permission_classes = [StaffOnlyPermission]
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = super().get_queryset().filter(lender=self.request.user.effective_lender)
 
         is_active = self.request.query_params.get('is_active')
         if is_active is not None:
@@ -113,6 +114,9 @@ class LoanFormulaViewSet(viewsets.ModelViewSet):
             qs = qs.filter(loan_type=loan_type)
 
         return qs
+
+    def perform_create(self, serializer):
+        serializer.save(lender=self.request.user.effective_lender)
 
 
 class FundingMethodRecommendationViewSet(viewsets.ModelViewSet):
@@ -191,6 +195,7 @@ class LoanViewSet(viewsets.ModelViewSet):
     def _returned_collections_queryset(cls, request):
         qs = CollectionPayment.objects.filter(
             cls._returned_collection_q(),
+            loan__customer__lender=request.user.effective_lender,
         ).select_related('loan', 'loan__customer', 'payment').annotate(
             effective_returned_at=Coalesce('returned_at', 'updated_at', 'initiated_at'),
         )
@@ -253,7 +258,7 @@ class LoanViewSet(viewsets.ModelViewSet):
         return rows
 
     def _filtered_queryset(self, *, ignore_status=False, ignore_dates=False):
-        qs = super().get_queryset()
+        qs = super().get_queryset().filter(customer__lender=self.request.user.effective_lender)
 
         status_param = None if ignore_status else self.request.query_params.get('status')
         if status_param:
@@ -422,6 +427,7 @@ class LoanViewSet(viewsets.ModelViewSet):
         qs = self._filtered_queryset(ignore_status=True)
         defaulted_count = CollectionPayment.objects.filter(
             self._returned_collection_q(),
+            loan__customer__lender=request.user.effective_lender,
         ).count()
         by_status = {
             row['status']: row['count']
@@ -996,6 +1002,33 @@ class LoanViewSet(viewsets.ModelViewSet):
                 missed_count=serializer.validated_data.get('missed_count'),
             )
         )
+
+    @action(detail=False, methods=['get', 'patch'], url_path='lending-settings')
+    def lending_settings(self, request):
+        lender = request.user.effective_lender
+
+        if not request.user.has_permission(4):
+            return Response(
+                {'error': 'Only managers can access lending settings.'},
+                status=403,
+            )
+        if request.method == 'GET':
+            return Response(LoanService.lending_settings(lender))
+        serializer = LendingSettingsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        lender.nsf_fee_amount = data['nsf_fee_amount']
+        lender.brokerage_percent = data['brokerage_percent']
+        lender.interest_percent = data['interest_percent']
+        lender.save(
+            update_fields=[
+                'nsf_fee_amount',
+                'brokerage_percent',
+                'interest_percent',
+                'updated_at',
+            ]
+        )
+        return Response(LoanService.lending_settings(lender))
 
     @action(detail=False, methods=['get'], url_path='problematic-collections')
     def problematic_collections(self, request):

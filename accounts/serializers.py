@@ -9,12 +9,15 @@ from .tasks import send_sms_otp_task, send_email_otp_task
 
 class UserSerializer(serializers.ModelSerializer):
     permission_level_display = serializers.CharField(source='get_permission_level_display', read_only=True)
+    lender_name = serializers.CharField(source='effective_lender.name', read_only=True)
+    lender_slug = serializers.CharField(source='effective_lender.slug', read_only=True)
     
     class Meta:
         model = User
         fields = [
             'id', 'email', 'full_name', 'phone',
             'permission_level', 'permission_level_display',
+            'lender', 'lender_name', 'lender_slug',
             'user_type',
             'is_active', 'created_at', 'updated_at'
         ]
@@ -26,10 +29,16 @@ class UserCreateSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = User
-        fields = ['id', 'email', 'full_name', 'phone', 'password', 'permission_level', 'user_type']
+        fields = ['id', 'email', 'full_name', 'phone', 'password', 'permission_level', 'user_type', 'lender']
         read_only_fields = ['id']
     
     def create(self, validated_data):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if getattr(user, 'is_authenticated', False):
+            validated_data['lender'] = user.effective_lender
+        elif not validated_data.get('lender'):
+            validated_data['lender'] = None
         return User.objects.create_user(**validated_data)
 
 
@@ -65,11 +74,16 @@ class CustomerSerializer(serializers.ModelSerializer):
     onboarding_stage_display = serializers.CharField(source='get_onboarding_stage_display', read_only=True)
     flinks_email = serializers.SerializerMethodField()
     flinks_name = serializers.SerializerMethodField()
+    lender_name = serializers.CharField(source='lender.name', read_only=True, allow_null=True)
+    lender_slug = serializers.CharField(source='lender.slug', read_only=True, allow_null=True)
 
     class Meta:
         model = Customer
         fields = [
             'id',
+            'lender',
+            'lender_name',
+            'lender_slug',
             'first_name',
             'last_name',
             'full_name',
@@ -114,6 +128,8 @@ class CustomerSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             'id',
+            'lender_name',
+            'lender_slug',
             'full_name',
             'full_address',
             'flinks_email',
@@ -146,11 +162,14 @@ class CustomerListSerializer(serializers.ModelSerializer):
     loan_count = serializers.IntegerField(read_only=True)
     province_display = serializers.CharField(source='get_province_display', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
+    lender_name = serializers.CharField(source='lender.name', read_only=True, allow_null=True)
     
     class Meta:
         model = Customer
         fields = [
             'id',
+            'lender',
+            'lender_name',
             'first_name',
             'last_name',
             'full_name',
@@ -171,7 +190,7 @@ class CustomerCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Customer
         fields = [
-            'first_name', 'last_name', 'email', 'phone', 'date_of_birth',
+            'lender', 'first_name', 'last_name', 'email', 'phone', 'date_of_birth',
             'address_line_1', 'address_line_2', 'city', 'province', 'postal_code'
         ]
     
@@ -179,6 +198,15 @@ class CustomerCreateSerializer(serializers.ModelSerializer):
         if Customer.objects.filter(email=value).exists():
             raise serializers.ValidationError('A customer with this email already exists')
         return value
+
+    def create(self, validated_data):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if getattr(user, 'is_authenticated', False):
+            validated_data['lender'] = user.effective_lender
+        elif not validated_data.get('lender'):
+            validated_data['lender'] = None
+        return super().create(validated_data)
 
 class CustomerApplySerializer(serializers.Serializer):
     first_name = serializers.CharField(max_length=100)
@@ -209,13 +237,16 @@ class CustomerApplySerializer(serializers.Serializer):
 
     def create(self, validated_data):
         from django.utils import timezone
+        from .models import Lender
 
         password = validated_data.pop('password')
         validated_data.pop('confirm_password')
+        lender = self.context.get('lender') or Lender.default()
 
         full_name = f"{validated_data['first_name']} {validated_data['last_name']}".strip()
 
         portal_user = User.objects.create_user(
+            lender=lender,
             email=validated_data['email'],
             password=password,
             full_name=full_name,
@@ -228,6 +259,7 @@ class CustomerApplySerializer(serializers.Serializer):
         )
 
         customer = Customer.objects.create(
+            lender=lender,
             portal_user=portal_user,
             first_name=validated_data['first_name'],
             last_name=validated_data['last_name'],
@@ -298,13 +330,17 @@ class CustomerSignupStartSerializer(serializers.Serializer):
         return attrs
 
     def save(self):
+        from .models import Lender
+
         if self.validated_data['existing_account']:
             return {
                 'existing_account': True,
                 'challenge_id': None,
             }
 
+        lender = self.context.get('lender') or Lender.default()
         metadata = {
+            'lender_id': str(lender.id),
             'first_name': self.validated_data['first_name'],
             'last_name': self.validated_data['last_name'],
             'email': self.validated_data['email'],
@@ -352,6 +388,7 @@ class CustomerSignupVerifyPhoneSerializer(serializers.Serializer):
         from django.utils import timezone
         from decimal import Decimal
         from datetime import date
+        from .models import Lender
 
         challenge = self.validated_data['challenge']
         data = challenge.metadata
@@ -369,8 +406,10 @@ class CustomerSignupVerifyPhoneSerializer(serializers.Serializer):
                     raise serializers.ValidationError('Unable to complete verification.')
 
                 full_name = f"{data['first_name']} {data['last_name']}".strip()
+                lender = Lender.objects.filter(id=data.get('lender_id')).first() or Lender.default()
 
                 portal_user = User.objects.create_user(
+                    lender=lender,
                     email=email,
                     password=data['password'],
                     full_name=full_name,
@@ -384,6 +423,7 @@ class CustomerSignupVerifyPhoneSerializer(serializers.Serializer):
                 )
 
                 customer = Customer.objects.create(
+                    lender=lender,
                     portal_user=portal_user,
                     first_name=data['first_name'],
                     last_name=data['last_name'],

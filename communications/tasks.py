@@ -5,6 +5,8 @@ from django.conf import settings
 import logging
 from zoneinfo import ZoneInfo
 
+from config.tenant_context import get_current_tenant_database
+
 logger = logging.getLogger(__name__)
 
 
@@ -113,6 +115,7 @@ def _queue_workflow_reminder(loan, template_name: str, extra_context: dict, toda
         str(loan.customer_id),
         str(template.id),
         str(loan.id),
+        tenant_database_alias=get_current_tenant_database(),
         extra_context={
             "reminder_number": sent_count + 1,
             "reminder_max_days": max_days,
@@ -152,6 +155,7 @@ def _expire_ibv_application(loan, today) -> bool:
                 str(loan.customer_id),
                 str(template.id),
                 str(loan.id),
+                tenant_database_alias=get_current_tenant_database(),
                 extra_context={"portal_url": f"{frontend_url}/customer/login"},
             )
         else:
@@ -160,7 +164,7 @@ def _expire_ibv_application(loan, today) -> bool:
 
 
 @shared_task(bind=True, max_retries=3)
-def send_email(self, communication_id: str):
+def send_email(self, communication_id: str, tenant_database_alias: str = None):
     """
     Send an email using the configured email provider.
     """
@@ -232,7 +236,7 @@ def _send_email_via_provider(to: str, subject: str, content: str, html_content: 
 
 
 @shared_task
-def poll_inbound_email():
+def poll_inbound_email(tenant_database_alias: str = None):
     """
     Poll configured inbound email inbox and store matched customer emails.
     """
@@ -251,7 +255,7 @@ def poll_inbound_email():
 
 
 @shared_task
-def send_loan_workflow_reminders():
+def send_loan_workflow_reminders(tenant_database_alias: str = None):
     """
     Send daily IBV/signature workflow reminders.
 
@@ -358,7 +362,7 @@ def send_loan_workflow_reminders():
 
 
 @shared_task(bind=True, max_retries=3)
-def send_sms(self, communication_id: str):
+def send_sms(self, communication_id: str, tenant_database_alias: str = None):
     """Send an SMS through Twilio."""
     from .models import Communication
     from .twilio_sms import (
@@ -429,7 +433,7 @@ def send_sms(self, communication_id: str):
 
 
 @shared_task
-def send_bulk_sms(customer_ids: list, message: str, loan_id: str = None):
+def send_bulk_sms(customer_ids: list, message: str, loan_id: str = None, tenant_database_alias: str = None):
     """
     Send SMS to multiple customers.
     """
@@ -455,7 +459,10 @@ def send_bulk_sms(customer_ids: list, message: str, loan_id: str = None):
             communications.append(communication)
             
             # Queue individual SMS task
-            send_sms.delay(str(communication.id))
+            send_sms.delay(
+                str(communication.id),
+                tenant_database_alias=tenant_database_alias or get_current_tenant_database(),
+            )
             
         except Customer.DoesNotExist:
             logger.warning(f"Customer not found: {customer_id}")
@@ -464,7 +471,14 @@ def send_bulk_sms(customer_ids: list, message: str, loan_id: str = None):
 
 
 @shared_task
-def send_bulk_email(customer_ids: list, subject: str, content: str, html_content: str = None, loan_id: str = None):
+def send_bulk_email(
+    customer_ids: list,
+    subject: str,
+    content: str,
+    html_content: str = None,
+    loan_id: str = None,
+    tenant_database_alias: str = None,
+):
     """
     Send email to multiple customers.
     """
@@ -492,7 +506,10 @@ def send_bulk_email(customer_ids: list, subject: str, content: str, html_content
             communications.append(communication)
             
             # Queue individual email task
-            send_email.delay(str(communication.id))
+            send_email.delay(
+                str(communication.id),
+                tenant_database_alias=tenant_database_alias or get_current_tenant_database(),
+            )
             
         except Customer.DoesNotExist:
             logger.warning(f"Customer not found: {customer_id}")
@@ -501,7 +518,13 @@ def send_bulk_email(customer_ids: list, subject: str, content: str, html_content
 
 
 @shared_task
-def send_template_message(customer_id: str, template_id: str, loan_id: str = None, extra_context: dict = None):
+def send_template_message(
+    customer_id: str,
+    template_id: str,
+    loan_id: str = None,
+    extra_context: dict = None,
+    tenant_database_alias: str = None,
+):
     """
     Send a message using a template.
     """
@@ -552,7 +575,10 @@ def send_template_message(customer_id: str, template_id: str, loan_id: str = Non
                 status='pending',
                 template_name=template.name
             )
-            send_email.delay(str(communication.id))
+            send_email.delay(
+                str(communication.id),
+                tenant_database_alias=tenant_database_alias or get_current_tenant_database(),
+            )
         else:
             communication = Communication.objects.create(
                 customer=customer,
@@ -564,7 +590,10 @@ def send_template_message(customer_id: str, template_id: str, loan_id: str = Non
                 status='pending',
                 template_name=template.name
             )
-            send_sms.delay(str(communication.id))
+            send_sms.delay(
+                str(communication.id),
+                tenant_database_alias=tenant_database_alias or get_current_tenant_database(),
+            )
         
         return str(communication.id)
         
