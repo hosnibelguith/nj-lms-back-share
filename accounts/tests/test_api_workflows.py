@@ -69,6 +69,8 @@ class BackendApiWorkflowTests(APITestCase):
 
         self.assertEqual(login_response.status_code, 200, login_response.data)
         self.assertEqual(login_response.data["user"]["user_type"], "staff")
+        self.assertIn("access", login_response.data)
+        self.assertIn("refresh", login_response.data)
         self.assertIn(settings.AUTH_COOKIE_ACCESS, self.client.cookies)
         self.assertIn(settings.AUTH_COOKIE_REFRESH, self.client.cookies)
 

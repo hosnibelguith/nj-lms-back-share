@@ -133,6 +133,8 @@ def set_auth_cookies(request, response, access_token: str, refresh_token: str):
     set_csrf_cookie(response, csrf_token)
     if isinstance(response.data, dict):
         response.data.setdefault("csrf_token", csrf_token)
+        response.data.setdefault("access", access_token)
+        response.data.setdefault("refresh", refresh_token)
 
     response.set_cookie(
         key=settings.AUTH_COOKIE_ACCESS,
