@@ -131,6 +131,13 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
 
+# Optional, isolated owner-only payment processor plugin.
+PAYMENT_PROCESSOR_INSTALLED = os.environ.get('PAYMENT_PROCESSOR_INSTALLED', 'True').lower() == 'true'
+PAYMENT_PROCESSOR_ALLOW_WRITES = os.environ.get('PAYMENT_PROCESSOR_ALLOW_WRITES', 'False').lower() == 'true'
+if PAYMENT_PROCESSOR_INSTALLED:
+    INSTALLED_APPS += ['payment_processor.apps.PaymentProcessorConfig']
+
+
 
 # -------------------------------------------------------------------
 # Database
