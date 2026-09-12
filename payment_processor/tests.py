@@ -339,6 +339,71 @@ class ProcessorTests(APITestCase):
             self.assertEqual(action_request('create_transaction', raw)[2]['WalletId'], WALLET)
 
 
+    def test_dashboard_separates_ap_ar_wallet_transfers_and_noncompleted_attempts(self):
+        run = self.snapshot()
+        for flow, status, value in [('AccountsPayable', 'Completed', '100.10'), ('AccountsPayable', 'InProgress', '30.20'),
+                                    ('AccountsPayable', 'Failed', '20.30'), ('AccountsPayable', 'Cancelled', '10.40'),
+                                    ('AccountsReceivable', 'Completed', '50.05'), ('FundZumWallet', 'Completed', '200.15'),
+                                    ('WithdrawZumWallet', 'Completed', '40.10'), ('Other', 'Completed', '9.00')]:
+            self.record(run, id=str(uuid.uuid4()), ZumRailsType=flow, TransactionStatus=status, Amount=value,
+                        User={'Id': ID, 'Name': 'Example Customer'})
+        report = self.client.get('/api/payment-processor/reports/').data
+        movement = report['dashboard']['currencies'][0]
+        self.assertEqual(movement['ap_amount'], '100.10')
+        self.assertEqual(movement['in_amount'], '250.20')
+        self.assertEqual(movement['out_amount'], '140.20')
+        self.assertEqual(movement['net_amount'], '110.00')
+        self.assertEqual((movement['in_count'], movement['out_count']), (2, 2))
+        self.assertEqual(movement['unclassified_completed_amount'], '9.00')
+        ap = next(row for row in report['flows'] if row['label'] == 'AccountsPayable')
+        self.assertEqual((ap['pending_amount'], ap['failed_amount'], ap['cancelled_amount']), ('30.20', '20.30', '10.40'))
+        self.assertEqual(ap['success_rate'], '25.00')
+        self.assertEqual(ap['completed_average'], '100.10')
+        slices = report['dashboard']['ap_statuses']
+        self.assertEqual(sum(row['count'] for row in slices), 4)
+        self.assertEqual(sum(Decimal(row['amount']) for row in slices), Decimal('161.00'))
+        self.assertEqual(report['dashboard']['ap_users'][0]['completed_amount'], '100.10')
+
+    def test_dashboard_periods_dates_currencies_and_negative_net_remain_exact(self):
+        run = self.snapshot()
+        self.record(run, Amount='0.10')  # September 10 in Toronto.
+        self.record(run, id=str(uuid.uuid4()), Amount='0.20', CreatedAt='2026-09-11T16:00:00Z')
+        self.record(run, id=str(uuid.uuid4()), Amount='999.00', Currency='USD')
+        self.record(run, id=str(uuid.uuid4()), Amount='3.00', CreatedAt=None)
+        data = self.client.get('/api/payment-processor/reports/?currency=CAD').data['dashboard']
+        self.assertEqual(len(data['currencies']), 1)
+        self.assertEqual(data['currencies'][0]['net_amount'], '-3.30')
+        self.assertEqual(data['currencies'][0]['undated_count'], 1)
+        self.assertEqual([(row['date'], row['ap_amount']) for row in data['trend']], [('2026-09-10', '0.10'), ('2026-09-11', '0.20')])
+        week = self.client.get('/api/payment-processor/reports/?currency=CAD&period=week').data['dashboard']['trend']
+        self.assertEqual([(row['date'], row['ap_amount']) for row in week], [('2026-09-07', '0.30')])
+        month = self.client.get('/api/payment-processor/reports/?currency=CAD&period=month').data['dashboard']['trend']
+        self.assertEqual([(row['date'], row['ap_amount']) for row in month], [('2026-09-01', '0.30')])
+        filtered = self.client.get('/api/payment-processor/reports/?currency=CAD&start=2026-09-11&end=2026-09-11').data['dashboard']
+        self.assertEqual(filtered['currencies'][0]['ap_amount'], '0.20')
+
+    def test_dashboard_drilldown_matches_outcome_direction_and_export(self):
+        run = self.snapshot()
+        for flow, status in [('AccountsPayable', 'Completed'), ('AccountsPayable', 'Rejected'),
+                             ('AccountsPayable', 'PendingCancellation'), ('AccountsReceivable', 'completed'),
+                             ('FundZumWallet', 'Completed'), ('WithdrawZumWallet', 'Completed')]:
+            self.record(run, id=str(uuid.uuid4()), ZumRailsType=flow, TransactionStatus=status)
+        pending = self.client.get('/api/payment-processor/records/transactions/?flow=AccountsPayable&outcome=pending')
+        self.assertEqual(pending.data['count'], 1)
+        failed = self.client.get('/api/payment-processor/records/transactions/?flow=AccountsPayable&outcome=failed')
+        self.assertEqual(failed.data['count'], 1)
+        incoming = self.client.get('/api/payment-processor/records/transactions/?direction=in&outcome=completed')
+        self.assertEqual(incoming.data['count'], 2)
+        report = self.client.get('/api/payment-processor/reports/?direction=in&outcome=completed').data
+        self.assertEqual(report['dashboard']['currencies'][0]['in_count'], 2)
+        export = self.client.get('/api/payment-processor/export/transactions/?direction=in&outcome=completed')
+        self.assertEqual(len(b''.join(export.streaming_content).decode().splitlines()), 3)
+        self.assertEqual(self.client.get('/api/payment-processor/reports/?outcome=unknown').status_code, 400)
+        empty = self.client.get('/api/payment-processor/reports/?flow=Absent').data
+        self.assertEqual(empty['dashboard']['currencies'], [])
+        self.assertEqual(empty['dashboard']['ap_statuses'], [])
+
+
 @override_settings(ZUMRAILS_API_BASE_URL='https://api-sandbox.zumrails.com', ZUMRAILS_USERNAME='test-user',
                    ZUMRAILS_PASSWORD='test-password', PAYMENT_PROCESSOR_ALLOW_WRITES=True, ZUMRAILS_TRANSACTIONS_ENABLED=True)
 class ExecutionCommitTests(APITransactionTestCase):

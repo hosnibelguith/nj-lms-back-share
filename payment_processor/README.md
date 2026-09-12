@@ -27,6 +27,14 @@ Payment processor is an expandable sidebar menu with ZUM, TIB and VoPay. The pag
 
 The old `/dashboard/payment-processor` link redirects to `/dashboard/payment-processor/zum`. The provider shell retains owner-only access and the existing plugin switch.
 
+## Adjustable dashboard
+
+ZUM opens on Dashboard. It includes selectable and reorderable KPIs for customer funding (completed AP), AR collections, completed money in/out, net transaction movement, wallet funding/withdrawals, AP pending and failed amounts, AP success rate, completed AP count and average. Layout and chart preferences persist in the owner browser; no financial records are stored in those preferences.
+
+Two percentage pies show AP outcomes and a selectable flow/method/status breakdown. Percentages can use amount or transaction count. The trend switches between bars and lines, and between in/out or AP/AR/wallet-transfer series. A top-10 customer funding chart uses completed AP only. Labels and chart-value tables provide exact readable values. KPI and pie selections drill into the matching transaction list; the same filters apply to exports.
+
+Dates, currency, status, outcome, direction, flow, payment method and search are shared with reports. The charts use transaction creation date (Toronto), with status as of the latest complete synchronization. Completed AP means money sent to customers; wallet top-ups are separate. In = completed AR + wallet funding; out = completed AP + wallet withdrawals. Net is not the wallet balance and excludes unclassified flows, fees and other ledger adjustments. Unclassified completed flows and undated rows are disclosed. Missing snapshots are never shown as zero, currencies never mix, and gaps in a dated chart are filled with zero values. Negative totals are not converted into misleading pie shares.
+
 ## Data and report behavior
 
 - Wallet balances: ZUM GET, at most 15 seconds cached, refreshed by the visible UI every 30 seconds.
