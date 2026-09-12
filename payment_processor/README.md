@@ -95,3 +95,7 @@ python -B manage.py test payment_processor.tests --settings=config.settings_paym
 These tests use an isolated in-memory database and block real HTTP. They cover owner/admin authorization, unplugging, pagination completeness, report math/dates/currencies, CSV escaping, signed webhooks, bank/card masking, review expiry, changed-payload rejection, removed-section rejection, local versus live guards, committed submission state, and action replay/unknown-outcome protection.
 
 References: [transactions](https://docs.zumrails.com/api-reference/transactions), [users](https://docs.zumrails.com/api-reference/users), [wallets](https://docs.zumrails.com/api-reference/wallets), [funding sources](https://docs.zumrails.com/api-reference/funding-source), [webhooks](https://docs.zumrails.com/api-reference/webhooks).
+
+## Failed AP and AR visibility
+
+AP failed and AR failed KPIs show the selected failed/rejected amounts, counts and count-based failure rates. Both are selected by default and added once to older saved dashboard preferences; subsequent hide/reorder choices persist. AP and AR each have an outcome pie. The trend supports failed AP/AR attempts by amount or count and automatically shows that mode when filtering to failed/rejected statuses. Failed amounts remain excluded from completed money movement. Chart drilldowns and exports use the same outcome filters.

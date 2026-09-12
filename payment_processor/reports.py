@@ -102,6 +102,7 @@ def render(group):
     result['average'] = str((group['amount'] / group['count']).quantize(Decimal('.01'))) if group['count'] else '0.00'
     result['completed_average'] = str((group['completed_amount'] / group['completed_count']).quantize(Decimal('.01'))) if group['completed_count'] else None
     result['success_rate'] = str((Decimal(group['completed_count']) * 100 / group['count']).quantize(Decimal('.01'))) if group['count'] else None
+    result['failure_rate'] = str((Decimal(group['failed_count']) * 100 / group['count']).quantize(Decimal('.01'))) if group['count'] else None
     result['average_processing_seconds'] = str((group['duration_seconds'] / group['duration_count']).quantize(Decimal('.01'))) if group['duration_count'] else None
     result['processing_time_samples'] = group['duration_count']
     return result
@@ -111,6 +112,7 @@ def report_data(qs, filters):
     groups = {name: defaultdict(metrics) for name in ('totals', 'flows', 'methods', 'statuses', 'periods', 'failures', 'users', 'returns')}
     flow_periods = defaultdict(lambda: defaultdict(metrics))
     ap_statuses = defaultdict(metrics)
+    ar_statuses = defaultdict(metrics)
     ap_users = defaultdict(metrics)
     undated = defaultdict(int)
     zone = ZoneInfo(filters['timezone'])
@@ -131,6 +133,8 @@ def report_data(qs, filters):
             accumulate(ap_statuses[(currency, row.status)], row)
             if row.user_id or row.user_name:
                 accumulate(ap_users[(currency, row.user_id, row.user_name)], row)
+        elif row.flow == 'AccountsReceivable':
+            accumulate(ar_statuses[(currency, row.status)], row)
         if row.failure:
             keys['failures'] = (currency, row.failure)
         if row.user_id or row.user_name:
@@ -160,6 +164,8 @@ def report_data(qs, filters):
                   for (currency, date), flows in sorted(flow_periods.items())],
         'ap_statuses': [dict(currency=currency, label=status, **render(value))
                         for (currency, status), value in sorted(ap_statuses.items())],
+        'ar_statuses': [dict(currency=currency, label=status, **render(value))
+                        for (currency, status), value in sorted(ar_statuses.items())],
         'ap_users': [dict(currency=currency, label=user_id, name=name, **render(value))
                      for (currency, user_id, name), value in sorted(ap_users.items())],
         'date_basis': 'CreatedAt',
@@ -169,7 +175,7 @@ def report_data(qs, filters):
 
 
 def movement(flows):
-    """Completed provider transaction movement, never wallet balance or ledger totals."""
+    """Completed movement and separate failed attempts; failures never affect in/out."""
     names = {'ap': 'AccountsPayable', 'ar': 'AccountsReceivable',
              'wallet_funding': 'FundZumWallet', 'wallet_withdrawal': 'WithdrawZumWallet'}
     values = {}
@@ -177,6 +183,9 @@ def movement(flows):
         group = flows.get(flow, metrics())
         values[label + '_amount'] = group['completed_amount']
         values[label + '_count'] = group['completed_count']
+        if label in ('ap', 'ar'):
+            values[label + '_failed_amount'] = group['failed_amount']
+            values[label + '_failed_count'] = group['failed_count']
     for suffix in ('amount', 'count'):
         values['in_' + suffix] = values['ar_' + suffix] + values['wallet_funding_' + suffix]
         values['out_' + suffix] = values['ap_' + suffix] + values['wallet_withdrawal_' + suffix]

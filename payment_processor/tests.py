@@ -364,6 +364,41 @@ class ProcessorTests(APITestCase):
         self.assertEqual(sum(Decimal(row['amount']) for row in slices), Decimal('161.00'))
         self.assertEqual(report['dashboard']['ap_users'][0]['completed_amount'], '100.10')
 
+    def test_failed_ap_and_ar_have_separate_pies_trends_rates_and_matching_records(self):
+        run = self.snapshot()
+        for flow, status, amount in [('AccountsPayable', 'Completed', '10.00'),
+                                     ('AccountsPayable', 'Failed', '3.10'),
+                                     ('AccountsReceivable', 'Completed', '20.00'),
+                                     ('AccountsReceivable', 'Failed', '5.20'),
+                                     ('AccountsReceivable', 'Cancelled', '9.00'),
+                                     ('FundZumWallet', 'Failed', '22.00')]:
+            self.record(run, id=str(uuid.uuid4()), ZumRailsType=flow, TransactionStatus=status, Amount=amount)
+        self.record(run, id=str(uuid.uuid4()), ZumRailsType='AccountsReceivable', TransactionStatus='Rejected',
+                    Amount='7.30', CreatedAt='2026-09-11T16:00:00Z')
+        self.record(run, id=str(uuid.uuid4()), ZumRailsType='AccountsReceivable', TransactionStatus='Failed', Amount='999.00', Currency='USD')
+        report = self.client.get('/api/payment-processor/reports/?currency=CAD').data
+        movement = report['dashboard']['currencies'][0]
+        self.assertEqual((movement['ap_failed_count'], movement['ap_failed_amount']), (1, '3.10'))
+        self.assertEqual((movement['ar_failed_count'], movement['ar_failed_amount']), (2, '12.50'))
+        self.assertEqual((movement['in_amount'], movement['out_amount'], movement['net_amount']), ('20.00', '10.00', '10.00'))
+        for flow in ('AccountsPayable', 'AccountsReceivable'):
+            self.assertEqual(next(row for row in report['flows'] if row['label'] == flow)['failure_rate'], '50.00')
+        ar_slices = report['dashboard']['ar_statuses']
+        self.assertEqual(sum(row['count'] for row in ar_slices), 4)
+        self.assertEqual(sum(row['failed_count'] for row in ar_slices), 2)
+        self.assertEqual(sum(Decimal(row['failed_amount']) for row in ar_slices), Decimal('12.50'))
+        trend = report['dashboard']['trend']
+        self.assertEqual([(row['date'], row['ar_failed_amount']) for row in trend], [('2026-09-10', '5.20'), ('2026-09-11', '7.30')])
+        for period in ('week', 'month'):
+            rows = self.client.get('/api/payment-processor/reports/?currency=CAD&period=' + period).data['dashboard']['trend']
+            self.assertEqual((rows[0]['ap_failed_amount'], rows[0]['ar_failed_amount']), ('3.10', '12.50'))
+        query = 'currency=CAD&flow=AccountsReceivable&outcome=failed'
+        failed = self.client.get('/api/payment-processor/reports/?' + query).data['dashboard']['currencies'][0]
+        self.assertEqual((failed['ar_failed_count'], failed['ar_count'], failed['in_amount']), (2, 0, '0.00'))
+        self.assertEqual(self.client.get('/api/payment-processor/records/transactions/?' + query).data['count'], 2)
+        export = self.client.get('/api/payment-processor/export/transactions/?' + query)
+        self.assertEqual(len(b''.join(export.streaming_content).decode().splitlines()), 3)
+
     def test_dashboard_periods_dates_currencies_and_negative_net_remain_exact(self):
         run = self.snapshot()
         self.record(run, Amount='0.10')  # September 10 in Toronto.
