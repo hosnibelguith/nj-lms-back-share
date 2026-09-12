@@ -1,6 +1,4 @@
 """Durable, restartable reads. Only a fully counted snapshot becomes reportable."""
-import hashlib
-import json
 from datetime import timedelta, timezone as dt_timezone
 from decimal import Decimal, InvalidOperation
 
@@ -14,9 +12,7 @@ from .client import ProviderError, ZumClient, page_result, sanitize, unwrap
 from .models import DetailCache, PluginSettings, SyncRow, SyncRun, WebhookInbox
 
 RESOURCES = {'transactions': '/transaction/filter', 'users': '/user/filter',
-             'funding_sources': '/fundingsource/filter', 'ledger': '/wallet/transactions/filter',
-             'invoices': '/invoice/filter', 'subscriptions': '/subscription/filter',
-             'cards': '', 'card_activity': '/user/get-card-transactions'}
+             'funding_sources': '/fundingsource/filter', 'ledger': '/wallet/transactions/filter'}
 CORE_RESOURCES = ('transactions', 'users', 'funding_sources', 'ledger')
 
 
@@ -106,10 +102,6 @@ def queue_sync(client, resources=CORE_RESOURCES):
     require_enabled()
     runs = []
     resources = list(resources)
-    if 'card_activity' in resources and 'cards' not in resources:
-        resources.insert(0, 'cards')
-    if 'cards' in resources and not latest_run(client.scope, 'users') and 'users' not in resources:
-        resources.insert(0, 'users')
     with transaction.atomic(using='default'):
         PluginSettings.objects.using('default').select_for_update().get(pk=1)
         for resource in resources:
@@ -126,14 +118,17 @@ def sync_page(client, run):
     require_enabled()
     if run.scope != client.scope or run.status not in ('queued', 'running'):
         return
+    if run.resource not in RESOURCES:
+        run.status = 'cancelled'
+        run.error = 'This section has been removed.'
+        run.save(using='default', update_fields=['status', 'error'])
+        return
     now = timezone.now()
     if run.retry_at and run.retry_at > now:
         return
     run.status = 'running'
     run.heartbeat_at = now
     run.save(using='default', update_fields=['status', 'heartbeat_at'])
-    if run.resource in ('cards', 'card_activity'):
-        return sync_card_page(client, run)
     payload = {'Pagination': {'PageNumber': run.next_page, 'ItemsPerPage': 100}}
     # Freeze the creation boundary so newly-created rows do not shift every page.
     if run.resource in ('transactions', 'users', 'ledger'):
@@ -207,87 +202,6 @@ def transaction_detail(client, provider_id, force=False):
     return cached(client, 'transaction', provider_id, fetch, ttl=15, force=force)
 
 
-def sync_card_page(client, run):
-    """Opt-in exhaustive card catalog and activity, one bounded request per tick."""
-    try:
-        if not run.cursor:
-            parent_resource = 'users' if run.resource == 'cards' else 'cards'
-            parent = latest_run(client.scope, parent_resource)
-            if not parent:
-                raise ProviderError(f'Finish {parent_resource} synchronization before reading cards.')
-            if run.resource == 'cards':
-                targets = [{'user_id': row.provider_id, 'name': row.payload.get('Name') or '', 'currency': row.payload.get('Currency') or 'UNKNOWN'} for row in parent.rows.all()]
-            else:
-                targets = [{'user_id': row.payload['UserId'], 'id': row.provider_id, 'reference': row.payload['CardReferenceId'],
-                            'currency': row.payload.get('Currency') or 'UNKNOWN', 'name': row.payload.get('UserName') or ''} for row in parent.rows.all()]
-            run.cursor = {'parent_run': str(parent.pk), 'targets': targets, 'index': 0, 'page': 1, 'target_count': None, 'target_received': 0}
-            run.expected_count = 0
-        cursor = run.cursor
-        targets = cursor['targets']
-        records = []
-        if cursor['index'] < len(targets):
-            target = targets[cursor['index']]
-            if run.resource == 'cards':
-                items = unwrap(client.request('GET', '/card/get-cards/' + target['user_id']))
-                if not isinstance(items, list) or any(not isinstance(item, dict) or not item.get('Id') or not item.get('CardReferenceId') for item in items):
-                    raise ProviderError('ZUM returned an invalid card catalog.')
-                for item in items:
-                    payload = {**item, 'UserId': target['user_id'], 'UserName': target['name'], 'Currency': item.get('Currency') or target['currency']}
-                    records.append(SyncRow(run=run, provider_id=str(item['Id']), **row_values(payload, 'cards')))
-                run.expected_count += len(records)
-                cursor['index'] += 1
-            else:
-                payload = {'UserId': target['user_id'], 'CardReferenceId': target['reference'],
-                           'Pagination': {'PageNumber': cursor['page'], 'ItemsPerPage': 100},
-                           'CreatedAtOperator': 'IsBetween', 'CreatedAtFrom': '1970-01-01T00:00:00Z',
-                           'CreatedAtTo': run.started_at.isoformat(), 'Timezone': 'UTC'}
-                page = page_result(client.request('POST', '/user/get-card-transactions', payload))
-                if page['CurrentPage'] != cursor['page'] or (cursor['target_count'] is not None and cursor['target_count'] != page['TotalCount']):
-                    raise ProviderError('Card activity changed during synchronization. Retry for a complete report.')
-                if cursor['target_count'] is None:
-                    cursor['target_count'] = page['TotalCount']
-                    run.expected_count += page['TotalCount']
-                for item in page['Items']:
-                    provider_id = target['id'] + ':' + str(item['Id'])
-                    if run.rows.filter(provider_id=provider_id).exists():
-                        raise ProviderError('Duplicate card activity page; report not published.')
-                    values = row_values({**item, 'UserId': target['user_id'], 'UserName': target['name'], 'CardId': target['id'], 'Currency': item.get('Currency') or target['currency']}, 'card_activity')
-                    try:
-                        debit = Decimal(str(item.get('Debit') or 0))
-                        credit = Decimal(str(item.get('Credit') or 0))
-                        if not debit.is_finite() or not credit.is_finite():
-                            raise ValueError
-                    except (InvalidOperation, ValueError):
-                        raise ProviderError('Invalid card amount; report not published.')
-                    values.update(amount=abs(debit), flow='CardDebit', method=str(item.get('CardTransactionType') or 'Card'),
-                                  status={'Posted': 'Completed', 'Declined': 'Failed'}.get(item.get('Status'), 'Pending'), failure=str(item.get('DeclineReason') or '') if item.get('Status') == 'Declined' else '')
-                    records.append(SyncRow(run=run, provider_id=provider_id, **values))
-                cursor['target_received'] += len(records)
-                cursor['page'] += 1
-                if cursor['target_received'] > cursor['target_count'] or (not records and cursor['target_received'] != cursor['target_count']):
-                    raise ProviderError('Incomplete card activity page; report not published.')
-                if cursor['target_received'] == cursor['target_count']:
-                    cursor.update(index=cursor['index'] + 1, page=1, target_count=None, target_received=0)
-            ids = [row.provider_id for row in records]
-            if len(ids) != len(set(ids)) or run.rows.filter(provider_id__in=ids).exists():
-                raise ProviderError('ZUM returned duplicate card records; report not published.')
-        with transaction.atomic(using='default'):
-            SyncRow.objects.using('default').bulk_create(records)
-            run.fetched_count += len(records)
-            run.error = ''
-            run.retry_at = None
-            if cursor['index'] == len(targets):
-                run.status = 'complete'
-                run.completed_at = timezone.now()
-            run.save(using='default')
-    except ProviderError as error:
-        run.error = str(error)[:250]
-        run.status = 'running' if error.status == 429 else 'failed'
-        run.retry_at = timezone.now() + timedelta(seconds=error.retry_after or 60) if error.status == 429 else None
-        # Persist the cursor only after a successful page; retries replay no rows.
-        run.save(using='default', update_fields=['status', 'error', 'retry_at'])
-
-
 def mirror_existing_webhooks(client):
     config = require_enabled()
     if not config.read_existing_webhooks or not apps.is_installed('loans'):
@@ -344,7 +258,7 @@ def run_cycle(client):
         due = not latest or latest.completed_at < timezone.now() - timedelta(seconds=interval)
         if due and (not last_attempt or last_attempt.status != 'failed' or last_attempt.started_at < timezone.now() - timedelta(seconds=interval)):
             queue_sync(client, (resource,))
-    run = SyncRun.objects.using('default').filter(scope=client.scope, status__in=['queued', 'running']).order_by('started_at').first()
+    run = SyncRun.objects.using('default').filter(scope=client.scope, resource__in=RESOURCES, status__in=['queued', 'running']).order_by('started_at').first()
     if run:
         sync_page(client, run)
     return run

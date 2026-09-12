@@ -52,6 +52,28 @@ def unwrap(data):
     return data['result'] if isinstance(data, dict) and 'result' in data else data
 
 
+def bank_payload(value):
+    """Hide unsupported product fields in both existing snapshots and live reads."""
+    value = sanitize(value)
+    if isinstance(value, list):
+        return [bank_payload(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        normalized = re.sub('[^a-z]', '', key.casefold())
+        if any(product in normalized for product in ('card', 'invoice', 'subscription')):
+            continue
+        if normalized == 'transactionmethodsavailabledescription':
+            if isinstance(item, str):
+                item = ', '.join(method.strip() for method in item.split(',')
+                                 if method.strip().casefold() in ('eft', 'interac', 'ach'))
+            elif isinstance(item, list):
+                item = [method for method in item if str(method).casefold() in ('eft', 'interac', 'ach')]
+        result[key] = bank_payload(item)
+    return result
+
+
 def page_result(data):
     data = unwrap(data)
     if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict) and 'Items' in data[0]:
@@ -72,10 +94,8 @@ def page_result(data):
 
 
 class ZumClient:
-    READ_POSTS = {'/transaction/filter', '/user/filter', '/fundingsource/filter', '/wallet/transactions/filter',
-                  '/user/get-card-transactions', '/card/statements/filter', '/card/statements-transactions/filter',
-                  '/invoice/filter', '/subscription/filter', '/batch/filter'}
-    READ_GET = re.compile(r'^/(wallet|transaction/[\w-]+|user/[\w-]+|fundingsource/[\w-]+|card/get-cards/[\w-]+|subscription/[\w-]+|invoice/getinvoiceevents/[\w-]+|subscription/getsubscription(?:events|invoices)/[\w-]+)$')
+    READ_POSTS = {'/transaction/filter', '/user/filter', '/fundingsource/filter', '/wallet/transactions/filter'}
+    READ_GET = re.compile(r'^/(wallet|transaction/[\w-]+|user/[\w-]+|fundingsource/[\w-]+)$')
 
     def __init__(self):
         self.base = str(integration_setting('ZUMRAILS_API_BASE_URL')).rstrip('/')
@@ -144,7 +164,7 @@ class ZumClient:
         require_enabled()
         read = (method == 'GET' and self.READ_GET.fullmatch(path)) or (method == 'POST' and path in self.READ_POSTS)
         if not read and (not operation_id or not writes_enabled()):
-            raise ProviderError('Live provider changes are disabled for this local review.', status=403)
+            raise ProviderError('Live actions are disabled. Enable provider writes in the Payment processor admin switch and server configuration.', status=403)
         self.reserve('filter' if path.endswith('/filter') else 'read')
         headers = {'Authorization': 'Bearer ' + self.token()}
         if operation_id:

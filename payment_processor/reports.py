@@ -34,6 +34,9 @@ class Filters(serializers.Serializer):
 
 def filtered_rows(run, filters):
     qs = SyncRow.objects.using('default').filter(run=run)
+    if run.resource == 'transactions':
+        qs = qs.exclude(Q(method__icontains='card') | Q(method__iexact='VisaDirect') |
+                        Q(flow__icontains='card') | Q(flow__iexact='StatementPayment'))
     zone = ZoneInfo(filters['timezone'])
     for field in ('flow', 'method', 'status', 'currency', 'user_id'):
         if filters.get(field):

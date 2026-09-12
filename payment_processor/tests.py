@@ -11,13 +11,13 @@ from django.contrib import admin
 from django.core.cache import cache
 from django.test import override_settings
 from django.utils import timezone
-from rest_framework.test import APITestCase
+from rest_framework.test import APITestCase, APITransactionTestCase
 from rest_framework.exceptions import ValidationError
 from accounts.models import User, GlobalSetting
 from loans.models import FundedPayment, CollectionPayment, WebhookEvent
-from .access import OWNER_EMAIL
+from .access import OWNER_EMAIL, writes_enabled
 from .admin import PluginSettingsAdmin
-from .client import ZumClient, ProviderError, sanitize, page_result
+from .client import ZumClient, ProviderError, sanitize, page_result, bank_payload
 from .models import PluginSettings, SyncRun, SyncRow, Operation, WebhookInbox
 from .operations import prepare, execute, action_request
 from .reports import Filters, filtered_rows, report_data
@@ -165,35 +165,7 @@ class ProcessorTests(APITestCase):
         self.assertEqual(run.next_page, 1)
         self.assertGreater(run.retry_at, timezone.now())
 
-    def test_card_reports_require_complete_catalog_and_activity(self):
-        users = SyncRun.objects.create(scope=self.provider.scope, resource='users', status='complete', completed_at=timezone.now())
-        SyncRow.objects.create(run=users, provider_id=ID, payload={'Id': ID, 'Name': 'Example', 'Currency': 'CAD'})
-        cards = SyncRun.objects.create(scope=self.provider.scope, resource='cards')
-        with patch.object(self.provider, 'request', return_value={'result': [{'Id': WALLET, 'CardReferenceId': 'reference', 'CardStatus': 'Activated'}]}):
-            sync_page(self.provider, cards)
-        self.assertEqual(cards.status, 'complete')
-        activity = SyncRun.objects.create(scope=self.provider.scope, resource='card_activity')
-        with patch.object(self.provider, 'request', side_effect=[
-            {'result': {'CurrentPage': 1, 'TotalCount': 2, 'Items': [{'Id': ID, 'Debit': '-12.34', 'Credit': 0, 'Status': 'Posted', 'CreatedAt': '2026-09-10T15:00:00Z'}]}},
-            {'result': {'CurrentPage': 2, 'TotalCount': 2, 'Items': [{'Id': WALLET, 'Debit': '-2.00', 'Credit': 0, 'Status': 'Declined', 'CreatedAt': '2026-09-10T15:00:00Z'}]}},
-        ]):
-            sync_page(self.provider, activity)
-            self.assertEqual(activity.status, 'running')
-            self.assertFalse(self.client.get('/api/payment-processor/card-reports/').data['available'])
-            sync_page(self.provider, activity)
-        response = self.client.get('/api/payment-processor/card-reports/')
-        self.assertEqual(response.data['cards'], {'count': 1, 'active': 1})
-        self.assertEqual(response.data['totals'][0]['amount'], '14.34')
-        self.assertEqual(response.data['totals'][0]['failed_count'], 1)
 
-    def test_card_read_rejection_does_not_invent_empty_catalog(self):
-        users = SyncRun.objects.create(scope=self.provider.scope, resource='users', status='complete', completed_at=timezone.now())
-        SyncRow.objects.create(run=users, provider_id=ID, payload={'Id': ID})
-        cards = SyncRun.objects.create(scope=self.provider.scope, resource='cards')
-        with patch.object(self.provider, 'request', side_effect=ProviderError('ZUM returned HTTP 403.', status=403)):
-            sync_page(self.provider, cards)
-        self.assertEqual(cards.status, 'failed')
-        self.assertIsNone(latest_run(self.provider.scope, 'cards'))
 
     def test_export_contains_all_matching_rows_and_escapes_formulas(self):
         run = self.snapshot()
@@ -261,37 +233,8 @@ class ProcessorTests(APITestCase):
             with self.assertRaises(ValidationError):
                 action_request('create_transaction', {**self.transaction_payload(), **changes})
 
-    def test_batch_preview_preserves_method_and_duplicate_guard(self):
-        content = b'first_name;last_name;amount_in_cents;memo\nTest;User;1234;Test\n'
-        raw = {'TransactionType': 'AccountsPayable', 'TransactionMethod': 'Eft', 'WalletId': WALLET,
-               'Bytes': base64.b64encode(content).decode(), 'FileName': 'payments.csv'}
-        operation = prepare(self.provider, self.owner, 'validate_batch', raw)
-        self.assertEqual(operation.summary['rows'], 1)
-        self.assertEqual(operation.summary['total_amount'], '12.34')
-        self.assertNotIn('Bytes', operation.summary)
-        _, _, payload = action_request('process_batch', raw)
-        self.assertEqual(payload['TransactionMethod'], 'Eft')
-        self.assertTrue(payload['SkipFileAlreadyProcessedInLast24Hours'])
 
-    @override_settings(PAYMENT_PROCESSOR_ALLOW_WRITES=True, ZUMRAILS_TRANSACTIONS_ENABLED=True)
-    def test_processing_batch_requires_successful_matching_validation(self):
-        raw = {'TransactionType': 'AccountsPayable', 'TransactionMethod': 'Eft', 'WalletId': WALLET,
-               'Bytes': base64.b64encode(b'first_name;amount_in_cents\nTest;100\n').decode(), 'FileName': 'payments.csv', 'ValidationId': ID}
-        operation = prepare(self.provider, self.owner, 'process_batch', raw)
-        with patch.object(self.provider, 'request') as provider_request:
-            with self.assertRaises(ValidationError):
-                execute(self.provider, self.owner, operation.pk, raw, 'CONFIRM')
-        provider_request.assert_not_called()
 
-    @override_settings(PAYMENT_PROCESSOR_ALLOW_WRITES=True, ZUMRAILS_TRANSACTIONS_ENABLED=True)
-    def test_card_mutation_checks_user_card_relationship(self):
-        raw = {'UserId': ID, 'UserCardId': WALLET}
-        operation = prepare(self.provider, self.owner, 'activate_card', raw)
-        with patch.object(self.provider, 'request', return_value={'result': []}) as provider_request:
-            with self.assertRaises(ProviderError):
-                execute(self.provider, self.owner, operation.pk, raw, 'CONFIRM')
-        self.assertEqual(provider_request.call_count, 1)
-        self.assertEqual(provider_request.call_args.args[0], 'GET')
 
     @override_settings(ZUMRAILS_WEBHOOK_SECRET='test-signature-secret')
     def test_signed_webhook_is_durable_idempotent_and_does_not_modify_lms(self):
@@ -311,3 +254,117 @@ class ProcessorTests(APITestCase):
         result = self.client.post('/api/payment-processor/webhook/', {'Type': 'Transaction'}, format='json', HTTP_ZUMRAILS_SIGNATURE='wrong')
         self.assertEqual(result.status_code, 403)
         self.assertFalse(WebhookInbox.objects.exists())
+
+
+    def test_removed_actions_cannot_be_prepared_even_when_writes_are_enabled(self):
+        removed = ['validate_batch', 'process_batch', 'refund_transaction', 'complete_transaction',
+                   'activate_card', 'update_card_status', 'update_card_program', 'reissue_card',
+                   'pause_subscription', 'resume_subscription']
+        for action in removed:
+            with self.subTest(action=action):
+                response = self.client.post('/api/payment-processor/operations/', {'action': action, 'payload': {}}, format='json')
+                self.assertEqual(response.status_code, 400)
+        self.assertFalse(Operation.objects.exists())
+        for change in [{'ZumRailsType': 'LoadCard'}, {'ZumRailsType': 'StatementPayment'},
+                       {'TransactionMethod': 'CreditCard'}, {'TransactionMethod': 'PrepaidCard'}]:
+            with self.assertRaises(ValidationError):
+                action_request('create_transaction', {**self.transaction_payload(), **change})
+
+    def test_removed_routes_and_sync_jobs_are_unavailable(self):
+        for path in ('card-reports/', f'card-activity/{ID}/', 'tib/status/', 'vopay/status/'):
+            self.assertEqual(self.client.get('/api/payment-processor/' + path).status_code, 404)
+        for resource in ('cards', 'card_activity', 'invoices', 'subscriptions'):
+            for prefix in ('records', 'export', 'details'):
+                suffix = f'{resource}/{ID}/' if prefix == 'details' else f'{resource}/'
+                self.assertEqual(self.client.get(f'/api/payment-processor/{prefix}/' + suffix).status_code, 400)
+            self.assertEqual(self.client.post('/api/payment-processor/sync/', {'resources': [resource]}, format='json').status_code, 400)
+        run = SyncRun.objects.create(scope=self.provider.scope, resource='cards')
+        with patch.object(self.provider, 'request') as request:
+            sync_page(self.provider, run)
+        request.assert_not_called()
+        self.assertEqual(run.status, 'cancelled')
+        self.assertNotIn('cards', self.client.get('/api/payment-processor/status/').data['snapshots'])
+
+    def test_bank_report_and_export_exclude_removed_payment_products(self):
+        run = self.snapshot()
+        self.record(run)
+        self.record(run, id=WALLET, TransactionMethod='CreditCard', Amount='100.00')
+        self.record(run, id=str(uuid.uuid4()), ZumRailsType='LoadCard', Amount='200.00')
+        self.record(run, id=str(uuid.uuid4()), TransactionMethod='VisaDirect', Amount='300.00')
+        report = self.client.get('/api/payment-processor/reports/').data
+        self.assertEqual(report['totals'][0]['amount'], '12.34')
+        self.assertEqual(report['scope_label'], 'Bank and wallet transactions')
+        self.assertNotIn('cards', report)
+        self.assertEqual(self.client.get('/api/payment-processor/records/transactions/').data['count'], 1)
+        export = self.client.get('/api/payment-processor/export/transactions/')
+        self.assertEqual(len(b''.join(export.streaming_content).decode().splitlines()), 2)
+
+    def test_existing_user_details_hide_removed_product_fields(self):
+        data = {'Id': ID, 'FirstName': 'Example', 'HasPrepaidCardUser': True,
+                'TransactionMethodsAvailableDescription': 'Eft, CreditCard, Interac, VisaDirect',
+                'BankAccountInformation': {'AccountNumber': '123456789'},
+                'Nested': {'Cards': [{'CardNumber': '4111111111111111'}], 'InvoiceId': ID}}
+        filtered = bank_payload(data)
+        self.assertNotIn('Card', json.dumps(filtered))
+        self.assertNotIn('Invoice', json.dumps(filtered))
+        self.assertEqual(filtered['TransactionMethodsAvailableDescription'], 'Eft, Interac')
+        self.assertEqual(filtered['BankAccountInformation']['AccountNumber'], '****6789')
+        with patch.object(ZumClient, 'request', return_value={'result': data}):
+            response = self.client.get(f'/api/payment-processor/details/users/{ID}/')
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn('HasPrepaidCardUser', response.data['data'])
+
+    @override_settings(PAYMENT_PROCESSOR_ALLOW_WRITES=True, ZUMRAILS_TRANSACTIONS_ENABLED=True)
+    def test_live_flags_enable_owner_actions_but_local_guard_still_wins(self):
+        self.assertTrue(writes_enabled())
+        self.assertTrue(self.client.get('/api/payment-processor/availability/').data['writes_enabled'])
+        with self.settings(ZUMRAILS_TRANSACTIONS_ENABLED=False):
+            self.assertFalse(writes_enabled())
+            operation = prepare(self.provider, self.owner, 'create_transaction', self.transaction_payload())
+            with patch.object(self.provider, 'request') as request:
+                with self.assertRaises(ProviderError):
+                    execute(self.provider, self.owner, operation.pk, self.transaction_payload(), 'CONFIRM')
+            request.assert_not_called()
+        PluginSettings.objects.filter(pk=1).update(allow_provider_writes=False)
+        self.assertFalse(writes_enabled())
+
+    def test_bank_transaction_flows_validate_for_eft_and_interac(self):
+        for flow in ('AccountsPayable', 'AccountsReceivable'):
+            for method in ('Eft', 'Interac'):
+                verb, path, payload = action_request('create_transaction', {**self.transaction_payload(), 'ZumRailsType': flow, 'TransactionMethod': method})
+                self.assertEqual((verb, path, payload['Amount']), ('POST', '/transaction', '12.34'))
+        for flow in ('FundZumWallet', 'WithdrawZumWallet'):
+            raw = {**self.transaction_payload(), 'ZumRailsType': flow, 'FundingSourceId': ID}
+            raw.pop('UserId')
+            self.assertEqual(action_request('create_transaction', raw)[2]['WalletId'], WALLET)
+
+
+@override_settings(ZUMRAILS_API_BASE_URL='https://api-sandbox.zumrails.com', ZUMRAILS_USERNAME='test-user',
+                   ZUMRAILS_PASSWORD='test-password', PAYMENT_PROCESSOR_ALLOW_WRITES=True, ZUMRAILS_TRANSACTIONS_ENABLED=True)
+class ExecutionCommitTests(APITransactionTestCase):
+    def test_execution_commits_before_provider_request_and_retains_unknown_result(self):
+        from django.db import connection
+        owner = User.objects.create_user(email=OWNER_EMAIL, password='test-only', is_staff=True, user_type='staff')
+        PluginSettings.objects.update_or_create(pk=1, defaults={'enabled': True, 'allow_provider_writes': True})
+        self.client.force_authenticate(owner)
+        provider = ZumClient()
+        raw = {'ZumRailsType': 'AccountsPayable', 'TransactionMethod': 'Eft', 'Amount': '12.34', 'Memo': 'Test', 'UserId': ID, 'WalletId': WALLET}
+        operation = prepare(provider, owner, 'create_transaction', raw)
+        previous = connection.settings_dict.get('ATOMIC_REQUESTS', False)
+        connection.settings_dict['ATOMIC_REQUESTS'] = True
+        self.addCleanup(connection.settings_dict.__setitem__, 'ATOMIC_REQUESTS', previous)
+        def uncertain(*args, **kwargs):
+            self.assertFalse(connection.in_atomic_block)
+            self.assertEqual(Operation.objects.get(pk=operation.pk).status, 'submitted')
+            raise ProviderError('Uncertain provider result', unknown=True)
+        with patch('requests.sessions.Session.request', side_effect=AssertionError('Real HTTP prohibited')):
+            with patch.object(ZumClient, 'request', side_effect=uncertain) as request:
+                response = self.client.post(f'/api/payment-processor/operations/{operation.pk}/execute/', {'payload': raw, 'confirmation': 'CONFIRM'}, format='json')
+                self.assertEqual(response.status_code, 502)
+                operation.refresh_from_db()
+                self.assertEqual(operation.status, 'unknown')
+                retry = self.client.post(f'/api/payment-processor/operations/{operation.pk}/execute/', {'payload': raw, 'confirmation': 'CONFIRM'}, format='json')
+                self.assertEqual(retry.status_code, 400)
+                self.assertEqual(request.call_count, 1)
+        self.assertFalse(FundedPayment.objects.exists())
+        self.assertFalse(CollectionPayment.objects.exists())

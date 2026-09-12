@@ -7,6 +7,8 @@ import json
 from datetime import timedelta
 
 from django.http import StreamingHttpResponse
+from django.db import transaction
+from django.utils.decorators import method_decorator
 from django.utils import timezone
 from rest_framework import permissions
 from rest_framework.exceptions import ValidationError
@@ -14,9 +16,9 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .access import OwnerOnly, configuration, is_owner, writes_enabled
-from .client import ZumClient, ProviderError, sanitize, unwrap, page_result, integration_setting
-from .models import DetailCache, Operation, SyncRun, WebhookInbox, WorkerLease
-from .operations import identifier, prepare, execute
+from .client import ZumClient, ProviderError, sanitize, unwrap, integration_setting, bank_payload
+from .models import Operation, SyncRun, WebhookInbox, WorkerLease
+from .operations import prepare, execute, ACTIONS
 from .reports import Filters, filtered_rows, report_data
 from .sync import RESOURCES, cached, latest_run, queue_sync, transaction_detail, wallets
 
@@ -72,7 +74,7 @@ class StatusView(ProcessorView):
     def get(self, request):
         client = ZumClient()
         lease = WorkerLease.objects.using('default').filter(scope=client.scope).first()
-        runs = list(SyncRun.objects.using('default').filter(scope=client.scope).order_by('-started_at')[:30])
+        runs = list(SyncRun.objects.using('default').filter(scope=client.scope, resource__in=RESOURCES).order_by('-started_at')[:30])
         last = {resource: run_info(latest_run(client.scope, resource)) for resource in RESOURCES}
         return Response({'writes_enabled': writes_enabled(), 'worker_active': bool(lease and lease.expires_at > timezone.now()),
                          'snapshots': last, 'runs': [run_info(run) for run in runs],
@@ -108,7 +110,7 @@ class RecordsView(ProcessorView):
         rows = filtered_rows(run, filters).order_by('-created_at', 'provider_id')
         start = (filters['page'] - 1) * filters['page_size']
         return Response({'available': True, 'snapshot': run_info(run), 'count': rows.count(), 'page': filters['page'],
-                         'page_size': filters['page_size'], 'results': [row.payload for row in rows[start:start + filters['page_size']]]})
+                         'page_size': filters['page_size'], 'results': [bank_payload(row.payload) for row in rows[start:start + filters['page_size']]]})
 
 
 class DetailView(ProcessorView):
@@ -118,46 +120,23 @@ class DetailView(ProcessorView):
         if resource == 'transactions':
             data, stamp = transaction_detail(client, provider_id)
         else:
-            paths = {'users': '/user/', 'funding_sources': '/fundingsource/', 'subscriptions': '/subscription/',
-                     'invoice_events': '/invoice/getinvoiceevents/', 'subscription_events': '/subscription/getsubscriptionevents/',
-                     'subscription_invoices': '/subscription/getsubscriptioninvoices/', 'cards': '/card/get-cards/'}
+            paths = {'users': '/user/', 'funding_sources': '/fundingsource/'}
             if resource not in paths:
                 raise ValidationError('Unknown detail type.')
             data, stamp = cached(client, resource, provider_id, lambda: unwrap(client.request('GET', paths[resource] + provider_id)), ttl=30)
-        return Response({'data': data, 'synced_at': stamp})
-
-
-class CardActivityView(ProcessorView):
-    def get(self, request, provider_id):
-        client = ZumClient()
-        filters = filters_for(request)
-        cards, _ = cached(client, 'cards', str(provider_id), lambda: unwrap(client.request('GET', '/card/get-cards/' + str(provider_id))))
-        card = next((item for item in cards if str(item.get('Id')) == request.query_params.get('card_id')), None) if isinstance(cards, list) else None
-        if not card:
-            raise ValidationError('Select a card belonging to this user.')
-        payload = {'UserId': str(provider_id), 'CardReferenceId': str(card['CardReferenceId']),
-                   'Pagination': {'PageNumber': filters['page'], 'ItemsPerPage': filters['page_size']}}
-        if filters.get('start') and filters.get('end'):
-            payload.update(CreatedAtOperator='IsBetween', CreatedAtFrom=filters['start'].isoformat() + 'T00:00:00', CreatedAtTo=filters['end'].isoformat() + 'T23:59:59')
-        cache_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-        data, stamp = cached(client, 'card_activity', cache_id, lambda: page_result(client.request('POST', '/user/get-card-transactions', payload)))
-        return Response({'results': data['Items'], 'count': data['TotalCount'], 'page': data['CurrentPage'], 'synced_at': stamp})
+        return Response({'data': bank_payload(data), 'synced_at': stamp})
 
 
 class ReportsView(ProcessorView):
-    def get(self, request, resource='transactions'):
+    def get(self, request):
+        resource = 'transactions'
         client = ZumClient()
         filters = filters_for(request)
         run = latest_run(client.scope, resource)
         if not run:
             return Response({'available': False, 'snapshot': None, 'message': 'No complete transaction snapshot yet. Start synchronization.'})
         qs = filtered_rows(run, filters)
-        card_totals = None
-        if resource == 'card_activity':
-            cards = SyncRun.objects.using('default').filter(pk=run.cursor.get('parent_run'), scope=client.scope, status='complete').first()
-            card_totals = {'count': cards.rows.count() if cards else None,
-                           'active': cards.rows.filter(payload__CardStatus='Activated').count() if cards else None}
-        return Response({'available': True, 'snapshot': run_info(run), 'timezone': filters['timezone'], 'cards': card_totals,
+        return Response({'available': True, 'snapshot': run_info(run), 'timezone': filters['timezone'], 'scope_label': 'Bank and wallet transactions',
                          'date_basis': 'CreatedAt', 'stale': run.completed_at < timezone.now() - timedelta(minutes=configuration().reconcile_minutes * 2),
                          **report_data(qs, filters)})
 
@@ -178,11 +157,7 @@ class ExportView(ProcessorView):
         fields = {'transactions': ['Id', 'CreatedAt', 'UserName', 'ZumRailsType', 'TransactionMethod', 'TransactionStatus', 'Currency', 'Amount', 'FailedTransactionEvent', 'ClientTransactionId', 'Memo', 'Comment'],
                   'ledger': ['Id', 'CreatedAt', 'Description', 'Debit', 'Credit', 'Balance', 'Type'],
                   'users': ['Id', 'Name', 'FirstName', 'LastName', 'Email', 'PhoneNumber', 'CreatedAt', 'ClientUserId'],
-                  'funding_sources': ['Id', 'Name', 'Number', 'FundingSourceStatus', 'FundingSourceType', 'BillingAccount'],
-                  'invoices': ['Id', 'CreatedAt', 'Status', 'Amount', 'Currency'],
-                  'subscriptions': ['Id', 'CreatedAt', 'Status', 'Amount', 'Currency'],
-                  'cards': ['Id', 'UserId', 'UserName', 'CardNumber', 'CardStatus', 'CardType', 'Currency', 'AvailableBalance', 'LedgerBalance'],
-                  'card_activity': ['Id', 'UserId', 'UserName', 'CardId', 'CreatedAt', 'Description', 'Status', 'Currency', 'Debit', 'Credit', 'MerchantNameAndLocation']}[resource]
+                  'funding_sources': ['Id', 'Name', 'Number', 'FundingSourceStatus', 'FundingSourceType', 'BillingAccount']}[resource]
         def stream():
             buffer = io.StringIO()
             writer = csv.writer(buffer)
@@ -207,7 +182,7 @@ def operation_info(operation):
 
 class OperationsView(ProcessorView):
     def get(self, request):
-        rows = Operation.objects.using('default').filter(scope=ZumClient().scope, actor_email=request.user.email.casefold()).order_by('-created_at')[:100]
+        rows = Operation.objects.using('default').filter(scope=ZumClient().scope, actor_email=request.user.email.casefold(), action__in=ACTIONS).order_by('-created_at')[:100]
         return Response({'results': [operation_info(row) for row in rows]})
 
     def post(self, request):
@@ -215,6 +190,7 @@ class OperationsView(ProcessorView):
         return Response({**operation_info(operation), 'writes_enabled': writes_enabled()}, status=201)
 
 
+@method_decorator(transaction.non_atomic_requests(using='default'), name='dispatch')
 class ExecuteView(ProcessorView):
     def post(self, request, operation_id):
         operation = execute(ZumClient(), request.user, operation_id, request.data.get('payload'), request.data.get('confirmation'))
