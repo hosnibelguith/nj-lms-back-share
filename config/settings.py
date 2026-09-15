@@ -137,6 +137,13 @@ PAYMENT_PROCESSOR_ALLOW_WRITES = os.environ.get('PAYMENT_PROCESSOR_ALLOW_WRITES'
 if PAYMENT_PROCESSOR_INSTALLED:
     INSTALLED_APPS += ['payment_processor.apps.PaymentProcessorConfig']
 
+# The database switch is off until explicitly enabled in Django admin.
+INSTALLED_APPS += ['icollector.apps.ICollectorConfig']
+ICOLLECTOR_BASE_URL = os.environ.get('ICOLLECTOR_BASE_URL', '').rstrip('/')
+ICOLLECTOR_API_KEY = os.environ.get('ICOLLECTOR_API_KEY', '')
+ICOLLECTOR_HMAC_SECRET = os.environ.get('ICOLLECTOR_HMAC_SECRET', '')
+ICOLLECTOR_PROXY_URL = os.environ.get('ICOLLECTOR_PROXY_URL', os.environ.get('FIXIE_URL', ''))
+
 
 
 # -------------------------------------------------------------------

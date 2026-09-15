@@ -98,5 +98,7 @@ from django.conf.urls.static import static
 if apps.is_installed('payment_processor'):
     urlpatterns += [path('api/payment-processor/', include('payment_processor.urls'))]
 
+urlpatterns += [path('api/icollector/', include('icollector.urls'))]
+
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
