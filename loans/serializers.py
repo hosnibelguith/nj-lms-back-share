@@ -694,7 +694,7 @@ class LoanListSerializer(serializers.ModelSerializer):
         return 'IBV Completed' if obj.customer.banking_verified else 'Pending IBV'
 
     def get_contract_signed(self, obj):
-        return obj.contract_signed
+        return bool(obj.contract_signed_at or obj.contracts.filter(status='signed').exists())
 
     def get_has_funding_failure(self, obj):
         # Only surface on loans still awaiting funding (not after a later success).

@@ -345,6 +345,10 @@ class LoanService:
         if existing_loan:
             return existing_loan
 
+        if customer.contract_completed:
+            customer.contract_completed = False
+            customer.save(update_fields=['contract_completed', 'updated_at'])
+
         return LoanService._create_priced_application(
             customer,
             status='ibv_pending',

@@ -111,18 +111,19 @@ def _apply_loan_status_filter(qs, status, *, prefix=''):
     if not status or status == 'all':
         return qs
     status_field = f'{prefix}status' if prefix else 'status'
-    customer = f'{prefix}customer' if prefix else 'customer'
     signed_at = f'{prefix}contract_signed_at' if prefix else 'contract_signed_at'
+    contracts = f'{prefix}contracts' if prefix else 'contracts'
     if status == 'approved_pending_signature':
-        return qs.filter(**{status_field: 'pending_funding'}).filter(
-            Q(**{f'{signed_at}__isnull': True}),
-            Q(**{f'{customer}__contract_completed': False}),
+        return qs.filter(
+            **{status_field: 'pending_funding', f'{signed_at}__isnull': True}
+        ).exclude(
+            **{f'{contracts}__status': 'signed'}
         )
     if status == 'pending_funding':
         qs = qs.filter(**{status_field: 'pending_funding'}).filter(
             Q(**{f'{signed_at}__isnull': False})
-            | Q(**{f'{customer}__contract_completed': True})
-        )
+            | Q(**{f'{contracts}__status': 'signed'})
+        ).distinct()
         return qs.exclude(Exists(_active_funding_exists(prefix)))
     if status == 'funding_failed':
         qs = qs.filter(**{status_field: 'pending_funding'}).filter(

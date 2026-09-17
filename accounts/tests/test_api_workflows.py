@@ -7,7 +7,7 @@ from django.utils import timezone
 from rest_framework.test import APITestCase
 from unittest.mock import patch
 
-from accounts.models import AuthOTPChallenge, Customer, GlobalSetting, User
+from accounts.models import AuthOTPChallenge, Customer, GlobalSetting, Lender, User
 from communications.models import Communication, CommunicationTemplate
 from communications.tasks import send_loan_workflow_reminders
 from contracts.models import Contract
@@ -22,6 +22,7 @@ from loans.models import FundedPayment, Loan, LoanStateEvent, Payment
 )
 class BackendApiWorkflowTests(APITestCase):
     def setUp(self):
+        self.lender = Lender.default()
         self.staff = User.objects.create_user(
             email="staff@example.com",
             password="Password123!",
@@ -29,6 +30,7 @@ class BackendApiWorkflowTests(APITestCase):
             user_type="staff",
             permission_level=5,
             is_staff=True,
+            lender=self.lender,
         )
         self.customer_user = User.objects.create_user(
             email="customer@example.com",
@@ -37,8 +39,10 @@ class BackendApiWorkflowTests(APITestCase):
             user_type="customer",
             phone="4165550100",
             phone_normalized="+14165550100",
+            lender=self.lender,
         )
         self.customer = Customer.objects.create(
+            lender=self.lender,
             portal_user=self.customer_user,
             first_name="Customer",
             last_name="User",
@@ -226,6 +230,7 @@ class BackendApiWorkflowTests(APITestCase):
 
     def test_staff_customer_filters_search_status_province_and_has_loans(self):
         Customer.objects.create(
+            lender=self.lender,
             first_name="Morgan",
             last_name="Chen",
             email="morgan@example.com",
@@ -321,8 +326,10 @@ class BackendApiWorkflowTests(APITestCase):
             password="password123",
             full_name="Arrive Dash",
             user_type="customer",
+            lender=self.lender,
         )
         arrive_customer = Customer.objects.create(
+            lender=self.lender,
             portal_user=arrive_user,
             first_name="Arrive",
             last_name="Dash",
@@ -728,6 +735,7 @@ class StartNewApplicationTests(APITestCase):
     """Terminal declined/expired customers can open a second loan."""
 
     def setUp(self):
+        self.lender = Lender.default()
         self.portal_user = User.objects.create_user(
             email="declined@example.com",
             password="Password123!",
@@ -735,8 +743,10 @@ class StartNewApplicationTests(APITestCase):
             user_type="customer",
             phone="4165550199",
             phone_normalized="+14165550199",
+            lender=self.lender,
         )
         self.customer = Customer.objects.create(
+            lender=self.lender,
             portal_user=self.portal_user,
             first_name="Declined",
             last_name="Customer",

@@ -4,7 +4,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
-from accounts.models import Customer, CustomerDocument, User
+from accounts.models import Customer, CustomerDocument, Lender, User
 from banking.models import BankAccount, BankConnection
 from loans.models import Loan
 from loans.services import LoanService
@@ -23,6 +23,7 @@ def add_government_id(customer):
 
 class PendingIdWorkflowTests(APITestCase):
     def setUp(self):
+        self.lender = Lender.default()
         self.staff = User.objects.create_user(
             email="id-staff@example.com",
             password="password123",
@@ -30,14 +31,17 @@ class PendingIdWorkflowTests(APITestCase):
             user_type="staff",
             is_staff=True,
             permission_level=4,
+            lender=self.lender,
         )
         self.portal_user = User.objects.create_user(
             email="id-customer@example.com",
             password="password123",
             full_name="ID Customer",
             user_type="customer",
+            lender=self.lender,
         )
         self.customer = Customer.objects.create(
+            lender=self.lender,
             portal_user=self.portal_user,
             first_name="ID",
             last_name="Customer",
@@ -106,6 +110,34 @@ class PendingIdWorkflowTests(APITestCase):
         self.loan.refresh_from_db()
         self.assertEqual(self.loan.status, "pending_funding")
         self.assertFalse(self.loan.contract_signed)
+
+    def test_new_initial_application_resets_stale_customer_contract_flag(self):
+        self.loan.status = "expired"
+        self.loan.save(update_fields=["status", "updated_at"])
+        self.customer.contract_completed = True
+        self.customer.save(update_fields=["contract_completed", "updated_at"])
+
+        new_loan = LoanService.create_initial_application(self.customer)
+
+        self.customer.refresh_from_db()
+        self.assertNotEqual(new_loan.id, self.loan.id)
+        self.assertEqual(new_loan.status, "ibv_pending")
+        self.assertFalse(self.customer.contract_completed)
+
+    def test_staff_list_contract_badge_ignores_stale_customer_contract_flag(self):
+        self.customer.contract_completed = True
+        self.customer.save(update_fields=["contract_completed", "updated_at"])
+
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.get(
+            "/api/loans/",
+            {"status": "pending_signature", "contract_signed": "false"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        results = response.data["results"] if isinstance(response.data, dict) else response.data
+        row = next(item for item in results if item["id"] == str(self.loan.id))
+        self.assertFalse(row["contract_signed"])
 
     def test_portal_dashboard_asks_for_id_after_signature(self):
         LoanService.sign_customer_contract(self.customer)
