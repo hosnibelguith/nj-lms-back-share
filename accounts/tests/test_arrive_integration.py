@@ -68,8 +68,8 @@ class ArriveIntegrationTests(TestCase):
             )
         )
 
-        customer = Customer.objects.get(email="arrive.customer@example.com")
         lender = Lender.default()
+        customer = Customer.objects.get(email="arrive.customer@example.com")
         self.assertEqual(customer.source, Customer.SOURCE_ARRIVE)
         self.assertEqual(customer.lender, lender)
         self.assertEqual(customer.portal_user.lender, lender)
@@ -123,6 +123,29 @@ class ArriveIntegrationTests(TestCase):
         self.assertEqual(customer.source, Customer.SOURCE_ARRIVE)
         self.assertEqual(customer.lender, lender)
         self.assertEqual(portal_user.lender, lender)
+
+    def test_existing_customer_new_portal_user_preserves_lender(self):
+        lender = Lender.objects.create(name='Existing lender', slug='existing-lender')
+        customer = Customer.objects.create(
+            lender=lender, first_name='Existing', last_name='Customer',
+            email='arrive.customer@example.com', phone='+14165550100',
+            source=Customer.SOURCE_ARRIVE,
+            arrive_application_id='arrive-application-uuid',
+            arrive_zum_user_id='zum-user-1',
+        )
+        # Match by email after the previous application reaches a terminal state.
+        Loan.objects.create(customer=customer, principal=Decimal('750.00'),
+            fee=Decimal('50.00'), total_amount=Decimal('800.00'),
+            balance=Decimal('0.00'), status='expired', is_active=False)
+        response = self.client.post(
+            '/api/integrations/arrive/leads/',
+            self._lead_payload(arrive_application_id='next-arrive-application'),
+            format='json', **self.headers,
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        customer.refresh_from_db()
+        self.assertEqual(customer.lender_id, lender.id)
+        self.assertEqual(customer.portal_user.lender_id, lender.id)
 
     def test_terminal_customer_can_start_new_arrive_application_same_zum_user(self):
         first = self.client.post(

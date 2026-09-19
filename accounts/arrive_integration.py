@@ -310,7 +310,7 @@ def create_or_resume_lead(payload: dict[str, Any]) -> tuple[Customer, Loan, Arri
             customer.date_of_birth = date_of_birth
         if not customer.portal_user:
             portal_user = User(
-                lender=lender,
+                lender=customer.lender or lender,
                 email=email,
                 full_name=f"{first_name} {last_name}".strip() or email,
                 phone=phone,
@@ -331,6 +331,7 @@ def create_or_resume_lead(payload: dict[str, Any]) -> tuple[Customer, Loan, Arri
         if User.objects.filter(email__iexact=email).exists():
             raise ArriveIdentityConflict("A user with this email already exists.")
 
+        lender = Lender.default()
         portal_user = User(
             lender=lender,
             email=email,

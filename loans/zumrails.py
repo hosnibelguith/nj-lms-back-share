@@ -808,6 +808,12 @@ def apply_collection_failure(collection: CollectionPayment, *, reason: str, stat
     )
 
 
+    # Capture the final balance in the same transaction; delivery runs after commit.
+    if collection._state.db == 'default':
+        from icollector.services import capture_final_failure
+        capture_final_failure(collection.pk)
+
+
 def log_activity(loan: Loan, type_value: str, title: str, description: str, created_by="system", metadata=None):
     try:
         from activity.models import ActivityHistory
