@@ -12,7 +12,7 @@ from accounts.arrive_integration import (
     build_funding_payload,
     sign_arrive_webhook,
 )
-from accounts.models import Customer, CustomerDocument, User
+from accounts.models import Customer, CustomerDocument, Lender, User
 from banking.models import BankAccount, BankConnection
 from loans.models import Loan
 from loans.services import LoanService
@@ -69,7 +69,10 @@ class ArriveIntegrationTests(TestCase):
         )
 
         customer = Customer.objects.get(email="arrive.customer@example.com")
+        lender = Lender.default()
         self.assertEqual(customer.source, Customer.SOURCE_ARRIVE)
+        self.assertEqual(customer.lender, lender)
+        self.assertEqual(customer.portal_user.lender, lender)
         self.assertEqual(customer.arrive_zum_user_id, "zum-user-1")
 
         retry = self.client.post(
@@ -84,6 +87,42 @@ class ArriveIntegrationTests(TestCase):
         self.assertNotEqual(retry.json()["application_url"], body["application_url"])
         self.assertEqual(Customer.objects.filter(email="arrive.customer@example.com").count(), 1)
         self.assertEqual(Loan.objects.filter(customer=customer).count(), 1)
+
+    def test_existing_arrive_match_with_blank_lender_is_assigned_to_default_lender(self):
+        portal_user = User.objects.create_user(
+            email="arrive.customer@example.com",
+            password=None,
+            full_name="Existing Arrive",
+            phone="+14165550100",
+            phone_normalized="+14165550100",
+            user_type="customer",
+            is_staff=False,
+        )
+        customer = Customer.objects.create(
+            portal_user=portal_user,
+            first_name="Existing",
+            last_name="Arrive",
+            email="arrive.customer@example.com",
+            phone="+14165550100",
+            phone_normalized="+14165550100",
+            onboarding_stage="banking_verification",
+            source=Customer.SOURCE_ORGANIC,
+        )
+
+        response = self.client.post(
+            "/api/integrations/arrive/leads/",
+            self._lead_payload(),
+            format="json",
+            **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 200, response.json())
+        customer.refresh_from_db()
+        portal_user.refresh_from_db()
+        lender = Lender.default()
+        self.assertEqual(customer.source, Customer.SOURCE_ARRIVE)
+        self.assertEqual(customer.lender, lender)
+        self.assertEqual(portal_user.lender, lender)
 
     def test_terminal_customer_can_start_new_arrive_application_same_zum_user(self):
         first = self.client.post(

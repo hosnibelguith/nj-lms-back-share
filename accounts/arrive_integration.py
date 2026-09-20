@@ -19,7 +19,7 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from accounts.models import ArriveHandoffToken, Customer, GlobalSetting, User
+from accounts.models import ArriveHandoffToken, Customer, GlobalSetting, Lender, User
 from accounts.utils.phone import normalize_ca_phone
 from loans.models import Loan
 from loans.services import LoanService
@@ -105,6 +105,22 @@ def _utc_iso(value: datetime | None) -> str:
 def _handoff_ttl() -> timedelta:
     seconds = int(getattr(settings, "ARRIVE_HANDOFF_TOKEN_TTL_SECONDS", 1800) or 1800)
     return timedelta(seconds=max(60, seconds))
+
+
+def _assign_lender_if_missing(customer: Customer, lender: Lender) -> None:
+    """Keep Arrive-created customer and portal user visible under the lender."""
+    customer_updated = False
+    if customer.lender_id is None:
+        customer.lender = lender
+        customer_updated = True
+
+    portal_user = customer.portal_user
+    if portal_user and portal_user.lender_id is None:
+        portal_user.lender = lender
+        portal_user.save()
+
+    if customer_updated:
+        customer.save(update_fields=["lender", "updated_at"])
 
 
 @transaction.atomic
@@ -222,6 +238,7 @@ def create_or_resume_lead(payload: dict[str, Any]) -> tuple[Customer, Loan, Arri
     province = (payload.get("province") or "").strip().upper() or None
     date_of_birth = payload.get("date_of_birth")
     zum_user_card_id = (payload.get("zum_user_card_id") or "").strip() or None
+    lender = Lender.default()
 
     existing_by_event = (
         Customer.objects.select_for_update()
@@ -229,6 +246,7 @@ def create_or_resume_lead(payload: dict[str, Any]) -> tuple[Customer, Loan, Arri
         .first()
     )
     if existing_by_event:
+        _assign_lender_if_missing(existing_by_event, lender)
         loan = LoanService.create_initial_application(existing_by_event)
         token = mint_handoff_token(existing_by_event)
         return existing_by_event, loan, token, False
@@ -245,6 +263,11 @@ def create_or_resume_lead(payload: dict[str, Any]) -> tuple[Customer, Loan, Arri
         if zum_user_card_id:
             existing_by_app.arrive_zum_user_card_id = zum_user_card_id
         existing_by_app.requested_loan_amount = requested_amount
+        if existing_by_app.lender_id is None:
+            existing_by_app.lender = lender
+        if existing_by_app.portal_user and existing_by_app.portal_user.lender_id is None:
+            existing_by_app.portal_user.lender = lender
+            existing_by_app.portal_user.save()
         if not existing_by_app.arrive_event_id:
             existing_by_app.arrive_event_id = event_id
         existing_by_app.save()
@@ -269,6 +292,8 @@ def create_or_resume_lead(payload: dict[str, Any]) -> tuple[Customer, Loan, Arri
     created = False
 
     if customer:
+        if customer.lender_id is None:
+            customer.lender = lender
         customer.source = Customer.SOURCE_ARRIVE
         customer.arrive_application_id = arrive_application_id
         customer.arrive_zum_user_id = zum_user_id
@@ -285,6 +310,7 @@ def create_or_resume_lead(payload: dict[str, Any]) -> tuple[Customer, Loan, Arri
             customer.date_of_birth = date_of_birth
         if not customer.portal_user:
             portal_user = User(
+                lender=lender,
                 email=email,
                 full_name=f"{first_name} {last_name}".strip() or email,
                 phone=phone,
@@ -295,6 +321,9 @@ def create_or_resume_lead(payload: dict[str, Any]) -> tuple[Customer, Loan, Arri
             portal_user.set_unusable_password()
             portal_user.save()
             customer.portal_user = portal_user
+        elif customer.portal_user.lender_id is None:
+            customer.portal_user.lender = lender
+            customer.portal_user.save()
         if customer.onboarding_stage == "password_setup":
             customer.onboarding_stage = "banking_verification"
         customer.save()
@@ -303,6 +332,7 @@ def create_or_resume_lead(payload: dict[str, Any]) -> tuple[Customer, Loan, Arri
             raise ArriveIdentityConflict("A user with this email already exists.")
 
         portal_user = User(
+            lender=lender,
             email=email,
             full_name=f"{first_name} {last_name}".strip() or email,
             phone=phone,
@@ -314,6 +344,7 @@ def create_or_resume_lead(payload: dict[str, Any]) -> tuple[Customer, Loan, Arri
         portal_user.save()
 
         customer = Customer.objects.create(
+            lender=lender,
             portal_user=portal_user,
             first_name=first_name,
             last_name=last_name,
