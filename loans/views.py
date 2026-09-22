@@ -1257,8 +1257,9 @@ class LoanViewSet(viewsets.ModelViewSet):
         date_to = parse_date(request.query_params.get('date_to')) if request.query_params.get('date_to') else None
         source = (request.query_params.get('source') or '').strip().lower()
 
-        events = LoanStateEvent.objects.select_related('loan__customer')
-        loans = Loan.objects.select_related('customer')
+        lender = request.user.effective_lender
+        events = LoanStateEvent.objects.filter(loan__customer__lender=lender)
+        loans = Loan.objects.filter(customer__lender=lender)
 
         if source in ('arrive', 'organic'):
             events = events.filter(loan__customer__source=source)
@@ -1272,17 +1273,29 @@ class LoanViewSet(viewsets.ModelViewSet):
         received_loans = loans
         approved_loans = loans.filter(approved_at__isnull=False)
         funded_loans = loans.filter(funded_at__isnull=False)
-        defaulted_loans = loans.filter(status='defaulted')
         if date_from:
             received_loans = received_loans.filter(created_at__date__gte=date_from)
             approved_loans = approved_loans.filter(approved_at__date__gte=date_from)
             funded_loans = funded_loans.filter(funded_at__date__gte=date_from)
-            defaulted_loans = defaulted_loans.filter(updated_at__date__gte=date_from)
         if date_to:
             received_loans = received_loans.filter(created_at__date__lte=date_to)
             approved_loans = approved_loans.filter(approved_at__date__lte=date_to)
             funded_loans = funded_loans.filter(funded_at__date__lte=date_to)
-            defaulted_loans = defaulted_loans.filter(updated_at__date__lte=date_to)
+
+        def loans_with_event(event_type):
+            # Count a loan once per period, on its first matching transition.
+            # updated_at changes for unrelated edits and is not a transition date.
+            first_event = events.filter(
+                loan_id=OuterRef('pk'), event_type=event_type,
+            ).order_by('created_at').values('created_at')[:1]
+            return loans.annotate(period_event_at=Subquery(first_event)).filter(
+                period_event_at__isnull=False,
+            )
+
+        defaulted_loans = loans_with_event('defaulted')
+        declined_loans = loans_with_event('human_declined')
+        paid_off_loans = loans_with_event('paid_off')
+        reactivated_loans = loans_with_event('reactivated')
 
         def series(qs, date_field='created_at'):
             return list(
@@ -1292,44 +1305,57 @@ class LoanViewSet(viewsets.ModelViewSet):
                 .order_by('date')
             )
 
-        funded_payments = FundedPayment.objects.all()
-        processing_collections = CollectionPayment.objects.filter(status='processing')
+        funded_payments = FundedPayment.objects.filter(loan__customer__lender=lender)
+        processing_collections = CollectionPayment.objects.filter(
+            loan__customer__lender=lender, status='processing',
+        )
         completed_collections = CollectionPayment.objects.filter(
-            status='completed',
+            loan__customer__lender=lender, status='completed',
         ).annotate(
             completed_date=TruncDate(Coalesce('settled_at', 'updated_at'))
         )
-        nsf_payments = Payment.objects.filter(
-            status='nsf',
+        resolved_payments = Payment.objects.filter(
+            loan__customer__lender=lender,
+            type='scheduled',
+            status__in=('completed', 'nsf', 'failed'),
             processed_at__isnull=False,
-        )
-        sent_payments = Payment.objects.filter(
-            status__in=('completed', 'pending', 'nsf', 'failed'),
         )
 
         if source in ('arrive', 'organic'):
             funded_payments = funded_payments.filter(loan__customer__source=source)
             processing_collections = processing_collections.filter(loan__customer__source=source)
             completed_collections = completed_collections.filter(loan__customer__source=source)
-            nsf_payments = nsf_payments.filter(loan__customer__source=source)
-            sent_payments = sent_payments.filter(loan__customer__source=source)
+            resolved_payments = resolved_payments.filter(loan__customer__source=source)
 
         if date_from:
             funded_payments = funded_payments.filter(initiated_at__date__gte=date_from)
             processing_collections = processing_collections.filter(initiated_at__date__gte=date_from)
             completed_collections = completed_collections.filter(completed_date__gte=date_from)
-            nsf_payments = nsf_payments.filter(processed_at__date__gte=date_from)
-            sent_payments = sent_payments.filter(created_at__date__gte=date_from)
+            resolved_payments = resolved_payments.filter(processed_at__date__gte=date_from)
         if date_to:
             funded_payments = funded_payments.filter(initiated_at__date__lte=date_to)
             processing_collections = processing_collections.filter(initiated_at__date__lte=date_to)
             completed_collections = completed_collections.filter(completed_date__lte=date_to)
-            nsf_payments = nsf_payments.filter(processed_at__date__lte=date_to)
-            sent_payments = sent_payments.filter(created_at__date__lte=date_to)
+            resolved_payments = resolved_payments.filter(processed_at__date__lte=date_to)
 
-        sent_payments_count = sent_payments.count()
-        nsf_payments_count = nsf_payments.count()
-        nsf_ratio = round((nsf_payments_count / sent_payments_count) * 100, 2) if sent_payments_count else 0
+        # Numerator is a subset of the denominator with identical date semantics.
+        # Pending/future payments, manual receipts and rebates are not PAD outcomes.
+        resolved_payments_count = resolved_payments.count()
+        nsf_payments_count = resolved_payments.filter(status='nsf').count()
+        nsf_ratio = round((nsf_payments_count / resolved_payments_count) * 100, 2) if resolved_payments_count else 0
+        nsf_series = [
+            {
+                'date': row['date'],
+                'value': round(row['nsf_count'] / row['resolved_count'] * 100, 2),
+                'nsf_count': row['nsf_count'],
+                'sent_count': row['resolved_count'],  # Compatibility alias.
+                'resolved_count': row['resolved_count'],
+            }
+            for row in resolved_payments.order_by().annotate(date=TruncDate('processed_at'))
+            .values('date').annotate(
+                resolved_count=Count('id'), nsf_count=Count('id', filter=Q(status='nsf')),
+            ).order_by('date')
+        ]
 
         funded_series = funded_payments \
             .annotate(date=TruncDate('initiated_at')) \
@@ -1359,18 +1385,11 @@ class LoanViewSet(viewsets.ModelViewSet):
         received_organic = received_loans.exclude(customer__source='arrive')
 
         current_loans = loans
-        current_customers = Customer.objects.all()
+        current_customers = Customer.objects.filter(lender=lender)
         if source in ('arrive', 'organic'):
             current_customers = current_customers.filter(source=source)
 
-        paid_off_loans = loans.filter(status='paid_off')
-        if date_from:
-            paid_off_loans = paid_off_loans.filter(updated_at__date__gte=date_from)
-        if date_to:
-            paid_off_loans = paid_off_loans.filter(updated_at__date__lte=date_to)
-
-        # Ops KPIs use loan timestamps (created/approved/funded). Other lifecycle
-        # counts still use LoanStateEvent for trend compatibility.
+        # Lifecycle totals and their daily series use the same distinct loans.
         totals = {
             "funded_payments_amount": str(funded_payments.aggregate(total=Sum('amount'))['total'] or 0),
             "processing_collection_payments_amount": str(processing_collection_total),
@@ -1380,11 +1399,11 @@ class LoanViewSet(viewsets.ModelViewSet):
             "received_arrive_count": received_arrive.count(),
             "received_organic_count": received_organic.count(),
             "approved_loans_count": approved_loans.count(),
-            "declined_loans_count": events.filter(event_type='human_declined').count(),
+            "declined_loans_count": declined_loans.count(),
             "funded_loans_count": funded_loans.count(),
             "paid_off_loans_count": paid_off_loans.count(),
             "defaulted_loans_count": defaulted_loans.count(),
-            "reactivated_loans_count": events.filter(event_type='reactivated').count(),
+            "reactivated_loans_count": reactivated_loans.count(),
             "current_active_loans_count": current_loans.filter(status='active').count(),
             "current_defaulted_loans_count": current_loans.filter(status='defaulted').count(),
             "current_pending_loans_count": current_loans.filter(
@@ -1395,7 +1414,8 @@ class LoanViewSet(viewsets.ModelViewSet):
                 loans__status='active',
             ).distinct().count(),
             "nsf_payments_count": nsf_payments_count,
-            "sent_payments_count": sent_payments_count,
+            "sent_payments_count": resolved_payments_count,  # Compatibility alias.
+            "resolved_payments_count": resolved_payments_count,
             "nsf_ratio": nsf_ratio,
         }
 
@@ -1415,12 +1435,12 @@ class LoanViewSet(viewsets.ModelViewSet):
                 "received_arrive_count": series(received_arrive, 'created_at'),
                 "received_organic_count": series(received_organic, 'created_at'),
                 "approved_loans_count": series(approved_loans, 'approved_at'),
-                "declined_loans_count": series(events.filter(event_type='human_declined')),
+                "declined_loans_count": series(declined_loans, 'period_event_at'),
                 "funded_loans_count": series(funded_loans, 'funded_at'),
-                "paid_off_loans_count": series(events.filter(event_type='paid_off')),
-                "defaulted_loans_count": series(events.filter(event_type='defaulted')),
-                "reactivated_loans_count": series(events.filter(event_type='reactivated')),
-                "nsf_ratio": [],
+                "paid_off_loans_count": series(paid_off_loans, 'period_event_at'),
+                "defaulted_loans_count": series(defaulted_loans, 'period_event_at'),
+                "reactivated_loans_count": series(reactivated_loans, 'period_event_at'),
+                "nsf_ratio": nsf_series,
             },
         })
 

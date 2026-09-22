@@ -7,7 +7,7 @@ from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth.models import update_last_login
 from django.conf import settings
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Count, Q
 from django.http import FileResponse, Http404
 from django.middleware.csrf import get_token
@@ -16,7 +16,7 @@ from django.utils import timezone
 from .models import User, Customer, GlobalSetting, CustomerDocument, Lender
 from .serializers import (
     UserSerializer, UserCreateSerializer, LoginSerializer,
-    CustomerSerializer, CustomerListSerializer, CustomerCreateSerializer,
+    CustomerSerializer, CustomerListSerializer, CustomerCreateSerializer, CustomerContactSerializer,
     CustomerApplySerializer, CustomerPasswordSetupSerializer,
     CustomerPortalLoginSerializer, CustomerPortalMeSerializer,
     CustomerPortalLoanSerializer,
@@ -361,6 +361,30 @@ class CustomerViewSet(viewsets.ModelViewSet):
         if self.action == 'create':
             return CustomerCreateSerializer
         return CustomerSerializer
+
+    @action(detail=True, methods=['patch'], url_path='contact')
+    def contact(self, request, pk=None):
+        if not request.user.has_permission(2):
+            return Response({'detail': 'Agent access or higher is required.'}, status=403)
+        customer = self.get_object()  # Preserve the existing lender boundary.
+        try:
+            with transaction.atomic():
+                customer = Customer.objects.select_for_update().get(pk=customer.pk)
+                serializer = CustomerContactSerializer(
+                    customer, data=request.data, context={'request': request},
+                )
+                if not serializer.is_valid():
+                    return Response({
+                        'detail': ' '.join(str(message) for messages in serializer.errors.values() for message in messages),
+                        'errors': serializer.errors,
+                    }, status=400)
+                serializer.save()
+        except IntegrityError:
+            return Response(
+                {'detail': 'This email or phone number is already in use. Please refresh and try again.'},
+                status=400,
+            )
+        return Response(CustomerSerializer(self.get_object()).data)
 
     @action(detail=True, methods=['get'])
     def loans(self, request, pk=None):

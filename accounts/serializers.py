@@ -157,6 +157,95 @@ class CustomerSerializer(serializers.ModelSerializer):
         return ''
 
 
+class CustomerContactSerializer(serializers.Serializer):
+    """Narrow staff edit of application contact and its linked portal identity."""
+
+    email = serializers.EmailField(max_length=254, required=False)
+    phone = serializers.CharField(max_length=20, required=False)
+
+    def validate_email(self, value):
+        value = User.objects.normalize_email(value).lower()
+        if Customer.objects.filter(email__iexact=value).exclude(pk=self.instance.pk).exists():
+            raise serializers.ValidationError('A customer with this email already exists.')
+        if User.objects.filter(email__iexact=value).exclude(pk=self.instance.portal_user_id).exists():
+            raise serializers.ValidationError('An account with this email already exists.')
+        return value
+
+    def validate_phone(self, value):
+        normalized = normalize_ca_phone(value)
+        if Customer.objects.filter(phone_normalized=normalized).exclude(pk=self.instance.pk).exists():
+            raise serializers.ValidationError('A customer with this phone number already exists.')
+        if User.objects.filter(phone_normalized=normalized).exclude(pk=self.instance.portal_user_id).exists():
+            raise serializers.ValidationError('An account with this phone number already exists.')
+        return normalized
+
+    def validate(self, attrs):
+        if set(self.initial_data) - {'email', 'phone'}:
+            raise serializers.ValidationError('Only application email and phone can be edited here.')
+        if not attrs:
+            raise serializers.ValidationError('Provide an application email or phone number.')
+        return attrs
+
+    def update(self, instance, validated_data):
+        from activity.models import ActivityHistory
+
+        before = {field: getattr(instance, field) for field in validated_data}
+        changes = {
+            field: {'before': before[field], 'after': value}
+            for field, value in validated_data.items() if before[field] != value
+        }
+        if not changes:
+            return instance
+
+        portal_user = None
+        if instance.portal_user_id:
+            portal_user = User.objects.select_for_update().get(pk=instance.portal_user_id)
+            if portal_user.user_type != 'customer':
+                raise serializers.ValidationError('The linked account is not a customer login.')
+
+        update_fields = list(changes)
+        for field in changes:
+            setattr(instance, field, validated_data[field])
+        if 'phone' in changes:
+            old_normalized = instance.phone_normalized
+            if not old_normalized:
+                try:
+                    old_normalized = normalize_ca_phone(before['phone'])
+                except serializers.ValidationError:
+                    old_normalized = None
+            instance.phone_normalized = validated_data['phone']
+            update_fields.append('phone_normalized')
+            if old_normalized != instance.phone_normalized:
+                instance.phone_verified = False
+                instance.phone_verified_at = None
+                update_fields.extend(['phone_verified', 'phone_verified_at'])
+        instance.save(update_fields=[*update_fields, 'updated_at'])
+
+        if portal_user:
+            user_fields = list(changes)
+            for field in changes:
+                setattr(portal_user, field, validated_data[field])
+            if 'phone' in changes:
+                portal_user.phone_normalized = instance.phone_normalized
+                user_fields.append('phone_normalized')
+            portal_user.save(update_fields=[*user_fields, 'updated_at'])
+            # Previously issued codes must not authenticate a replaced contact.
+            AuthOTPChallenge.objects.filter(
+                metadata__user_id=str(portal_user.pk),
+                status__in=[AuthOTPChallenge.STATUS_PENDING, AuthOTPChallenge.STATUS_VERIFIED],
+            ).update(status=AuthOTPChallenge.STATUS_EXPIRED)
+
+        ActivityHistory.objects.create(
+            customer=instance,
+            type='customer_updated',
+            title='Contact Details Updated',
+            description='Application contact updated: ' + ', '.join(changes) + '.',
+            metadata={'action': 'update_contact', 'changes': changes},
+            created_by=str(self.context['request'].user.pk),
+        )
+        return instance
+
+
 class CustomerListSerializer(serializers.ModelSerializer):
     full_name = serializers.CharField(read_only=True)
     loan_count = serializers.IntegerField(read_only=True)

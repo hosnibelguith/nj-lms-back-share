@@ -61,6 +61,7 @@ class DashboardAnalyticsTests(APITestCase):
         )
         self.customer = Customer.objects.create(
             first_name="Dash",
+            lender=self.staff.effective_lender,
             last_name="Customer",
             email="dashboard-customer@example.com",
             phone="4165550101",
@@ -145,10 +146,8 @@ class DashboardAnalyticsTests(APITestCase):
             [{"date": settled_at.date(), "value": Decimal("35")}],
         )
 
-    def test_dashboard_defaulted_count_uses_current_loan_status(self):
-        self.loan.status = "defaulted"
-        self.loan.is_active = False
-        self.loan.save(update_fields=["status", "is_active", "updated_at"])
+    def test_dashboard_defaulted_count_uses_recorded_loan_transition(self):
+        self.loan.mark_defaulted()
 
         response = self.client.get("/api/loans/dashboard/analytics/")
 
@@ -159,6 +158,7 @@ class DashboardAnalyticsTests(APITestCase):
     def test_dashboard_quick_summary_uses_live_customer_and_pending_counts(self):
         Customer.objects.create(
             first_name="Idle",
+            lender=self.staff.effective_lender,
             last_name="Lead",
             email="idle-lead@example.com",
             phone="4165550102",
@@ -187,6 +187,7 @@ class DashboardAnalyticsTests(APITestCase):
     def test_dashboard_active_loan_and_customer_counts_ignore_pending_flags(self):
         idle = Customer.objects.create(
             first_name="Lead",
+            lender=self.staff.effective_lender,
             last_name="Only",
             email="lead-only@example.com",
             phone="4165550103",
@@ -212,6 +213,7 @@ class DashboardAnalyticsTests(APITestCase):
             is_active=False,
         )
         self.assertEqual(paid.status, "paid_off")
+        LoanStateEvent.objects.create(loan=paid, event_type='paid_off')
 
         response = self.client.get("/api/loans/dashboard/analytics/")
 
@@ -249,6 +251,110 @@ class DashboardAnalyticsTests(APITestCase):
         self.assertEqual(response.data["totals"]["sent_payments_count"], 2)
         self.assertEqual(response.data["totals"]["nsf_payments_count"], 1)
         self.assertEqual(response.data["totals"]["nsf_ratio"], 50.0)
+
+
+    def test_nsf_ratio_uses_outcomes_not_schedule_creation_in_short_ranges(self):
+        day = timezone.make_aware(datetime(2026, 9, 22, 12))
+        for payment_status in ('nsf', 'completed', 'completed', 'failed'):
+            payment = Payment.objects.create(
+                loan=self.loan, amount=100, scheduled_date=day.date(),
+                status=payment_status, processed_at=day,
+            )
+            Payment.objects.filter(pk=payment.pk).update(created_at=day - timedelta(days=30))
+        # Neither unresolved rows nor non-PAD credits dilute the NSF rate.
+        for payment_status, payment_type in (
+            ('scheduled', 'scheduled'), ('pending', 'scheduled'),
+            ('completed', 'rebate'), ('completed', 'manual'), ('completed', 'etransfer'),
+            ('cancelled', 'scheduled'),
+        ):
+            Payment.objects.create(
+                loan=self.loan, amount=100, scheduled_date=day.date(),
+                status=payment_status, type=payment_type, processed_at=day,
+            )
+        Payment.objects.create(
+            loan=self.loan, amount=100, scheduled_date=day.date(),
+            status='nsf', processed_at=day - timedelta(days=30),
+        )
+        for start in ('2026-09-22', '2026-09-20', '2026-09-16'):
+            with self.subTest(start=start):
+                response = self.client.get('/api/loans/dashboard/analytics/', {
+                    'date_from': start, 'date_to': '2026-09-22',
+                })
+                self.assertEqual(response.status_code, 200, response.data)
+                self.assertEqual(response.data['totals']['nsf_payments_count'], 1)
+                self.assertEqual(response.data['totals']['resolved_payments_count'], 4)
+                self.assertEqual(response.data['totals']['nsf_ratio'], 25)
+                self.assertEqual(response.data['series']['nsf_ratio'][0]['value'], 25)
+        empty = self.client.get('/api/loans/dashboard/analytics/', {
+            'date_from': '2026-09-23', 'date_to': '2026-09-23',
+        }).data
+        self.assertEqual(empty['totals']['resolved_payments_count'], 0)
+        self.assertEqual(empty['totals']['nsf_ratio'], 0)
+        self.assertEqual(empty['series']['nsf_ratio'], [])
+
+    def test_default_transitions_are_unique_and_unrelated_updates_do_not_count(self):
+        for when in (datetime(2026, 9, 1, 12), datetime(2026, 9, 20, 12), datetime(2026, 9, 22, 12)):
+            event = LoanStateEvent.objects.create(loan=self.loan, event_type='defaulted')
+            LoanStateEvent.objects.filter(pk=event.pk).update(created_at=timezone.make_aware(when))
+        # A failed payment without a default transition is not a defaulted loan.
+        other = Loan.objects.create(customer=self.customer, principal=100, fee=0,
+                                    total_amount=100, balance=100, status='active')
+        Payment.objects.create(loan=other, amount=50, status='nsf',
+                               scheduled_date='2026-09-22', processed_at=timezone.now())
+        for start, end, expected, series_date in (
+            ('2026-09-16', '2026-09-22', 1, '2026-09-20'),
+            ('2026-09-22', '2026-09-22', 1, '2026-09-22'),
+            ('2026-09-23', '2026-09-23', 0, None),
+            ('2026-01-01', '2026-12-31', 1, '2026-09-01'),
+        ):
+            Loan.objects.filter(pk=self.loan.pk).update(
+                status='defaulted', updated_at=timezone.make_aware(datetime.fromisoformat(end + 'T15:00')),
+            )
+            data = self.client.get('/api/loans/dashboard/analytics/', {
+                'date_from': start, 'date_to': end,
+            }).data
+            self.assertEqual(data['totals']['defaulted_loans_count'], expected)
+            self.assertEqual(sum(row['value'] for row in data['series']['defaulted_loans_count']), expected)
+            if series_date:
+                self.assertEqual(str(data['series']['defaulted_loans_count'][0]['date']), series_date)
+            self.assertEqual(data['totals']['current_defaulted_loans_count'], 1)
+
+    def test_dashboard_preserves_lender_and_source_boundaries(self):
+        from accounts.models import Lender
+        other_lender = Lender.objects.create(name='Other', slug='other-dashboard')
+        outsider = Customer.objects.create(lender=other_lender, first_name='Other', last_name='Borrower',
+                                           email='other-dashboard@example.test', phone='4165550123')
+        other = Loan.objects.create(customer=outsider, principal=100, fee=0,
+                                    total_amount=100, balance=100, status='active')
+        other.mark_defaulted()
+        Payment.objects.create(loan=other, amount=50, status='nsf',
+                               scheduled_date=timezone.localdate(), processed_at=timezone.now())
+        FundedPayment.objects.create(loan=other, amount=100)
+        self.customer.source = 'arrive'
+        self.customer.save(update_fields=['source'])
+        self.loan.mark_defaulted()
+        Payment.objects.create(loan=self.loan, amount=50, status='completed',
+                               scheduled_date=timezone.localdate(), processed_at=timezone.now())
+        all_data = self.client.get('/api/loans/dashboard/analytics/').data
+        self.assertEqual(all_data['totals']['current_customers_count'], 1)
+        self.assertEqual(all_data['totals']['defaulted_loans_count'], 1)
+        self.assertEqual(all_data['totals']['resolved_payments_count'], 1)
+        self.assertEqual(all_data['totals']['nsf_payments_count'], 0)
+        self.assertEqual(Decimal(all_data['totals']['funded_payments_amount']), 0)
+        data = self.client.get('/api/loans/dashboard/analytics/', {'source': 'organic'}).data
+        self.assertEqual(data['totals']['defaulted_loans_count'], 0)
+        self.assertEqual(data['totals']['resolved_payments_count'], 0)
+
+    def test_lifecycle_totals_and_series_count_the_same_distinct_loans(self):
+        for event_type, key in (
+            ('paid_off', 'paid_off_loans_count'), ('human_declined', 'declined_loans_count'),
+            ('reactivated', 'reactivated_loans_count'),
+        ):
+            for _ in range(2):
+                LoanStateEvent.objects.create(loan=self.loan, event_type=event_type)
+            data = self.client.get('/api/loans/dashboard/analytics/').data
+            self.assertEqual(data['totals'][key], 1)
+            self.assertEqual(sum(row['value'] for row in data['series'][key]), 1)
 
 
 @override_settings(ZUMRAILS_DRY_RUN=True)
@@ -1555,7 +1661,7 @@ class ZumRailsWorkflowTests(APITestCase):
 
         self.assertIn(response.status_code, [400, 403])
         if response.status_code == 400:
-        self.assertIn("schedule_confirmed", response.data)
+            self.assertIn("schedule_confirmed", response.data)
 
     def test_adjust_schedule_reprices_daily_interest_from_selected_terms(self):
         formula = LoanFormula.objects.create(
