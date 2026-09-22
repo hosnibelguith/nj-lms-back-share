@@ -488,6 +488,8 @@ class CustomerLoanDetailSerializer(serializers.ModelSerializer):
             'contract_signed_at',
             'contract_sent_at',
             'has_government_id',
+            'declined_at',
+            'decline_reason',
             'paymentSchedule',
             'holiday_warnings',
             'payoff_today',
