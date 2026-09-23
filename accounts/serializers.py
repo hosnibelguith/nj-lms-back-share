@@ -369,6 +369,11 @@ class CustomerApplySerializer(serializers.Serializer):
 
 
 class CustomerSignupStartSerializer(serializers.Serializer):
+    # Arrive attribution is reserved for its authenticated integration.
+    source = serializers.ChoiceField(
+        choices=[Customer.SOURCE_ORGANIC, Customer.SOURCE_ALPHALOANS],
+        default=Customer.SOURCE_ORGANIC,
+    )
     first_name = serializers.CharField(max_length=100)
     last_name = serializers.CharField(max_length=100)
     email = serializers.EmailField()
@@ -430,6 +435,7 @@ class CustomerSignupStartSerializer(serializers.Serializer):
         lender = self.context.get('lender') or Lender.default()
         metadata = {
             'lender_id': str(lender.id),
+            'source': self.validated_data['source'],
             'first_name': self.validated_data['first_name'],
             'last_name': self.validated_data['last_name'],
             'email': self.validated_data['email'],
@@ -514,6 +520,7 @@ class CustomerSignupVerifyPhoneSerializer(serializers.Serializer):
                 customer = Customer.objects.create(
                     lender=lender,
                     portal_user=portal_user,
+                    source=data.get('source', Customer.SOURCE_ORGANIC),
                     first_name=data['first_name'],
                     last_name=data['last_name'],
                     email=email,

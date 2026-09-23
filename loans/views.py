@@ -340,10 +340,12 @@ class LoanViewSet(viewsets.ModelViewSet):
                     )
                 )
             elif normalized_source in ('organic', 'landing', 'kyc'):
-                qs = qs.exclude(customer__source='arrive').filter(
+                qs = qs.exclude(customer__source__in=('arrive', 'alphaloans')).filter(
                     Q(customer__arrive_application_id__isnull=True) |
                     Q(customer__arrive_application_id='')
                 )
+            elif normalized_source == 'alphaloans':
+                qs = qs.filter(customer__source='alphaloans')
 
         is_active_param = self.request.query_params.get('is_active')
         if is_active_param is not None:
@@ -1298,7 +1300,7 @@ class LoanViewSet(viewsets.ModelViewSet):
         events = LoanStateEvent.objects.filter(loan__customer__lender=lender)
         loans = Loan.objects.filter(customer__lender=lender)
 
-        if source in ('arrive', 'organic'):
+        if source in ('arrive', 'organic', 'alphaloans'):
             events = events.filter(loan__customer__source=source)
             loans = loans.filter(customer__source=source)
 
@@ -1358,7 +1360,7 @@ class LoanViewSet(viewsets.ModelViewSet):
             processed_at__isnull=False,
         )
 
-        if source in ('arrive', 'organic'):
+        if source in ('arrive', 'organic', 'alphaloans'):
             funded_payments = funded_payments.filter(loan__customer__source=source)
             processing_collections = processing_collections.filter(loan__customer__source=source)
             completed_collections = completed_collections.filter(loan__customer__source=source)
@@ -1419,11 +1421,12 @@ class LoanViewSet(viewsets.ModelViewSet):
         completed_collection_total = completed_collections.aggregate(total=Sum('amount'))['total'] or 0
 
         received_arrive = received_loans.filter(customer__source='arrive')
-        received_organic = received_loans.exclude(customer__source='arrive')
+        received_organic = received_loans.exclude(customer__source__in=('arrive', 'alphaloans'))
+        received_alphaloans = received_loans.filter(customer__source='alphaloans')
 
         current_loans = loans
         current_customers = Customer.objects.filter(lender=lender)
-        if source in ('arrive', 'organic'):
+        if source in ('arrive', 'organic', 'alphaloans'):
             current_customers = current_customers.filter(source=source)
 
         # Lifecycle totals and their daily series use the same distinct loans.
@@ -1435,6 +1438,7 @@ class LoanViewSet(viewsets.ModelViewSet):
             "received_applications_count": received_loans.count(),
             "received_arrive_count": received_arrive.count(),
             "received_organic_count": received_organic.count(),
+            "received_alphaloans_count": received_alphaloans.count(),
             "approved_loans_count": approved_loans.count(),
             "declined_loans_count": declined_loans.count(),
             "funded_loans_count": funded_loans.count(),
@@ -1471,6 +1475,7 @@ class LoanViewSet(viewsets.ModelViewSet):
                 "received_applications_count": series(received_loans, 'created_at'),
                 "received_arrive_count": series(received_arrive, 'created_at'),
                 "received_organic_count": series(received_organic, 'created_at'),
+                "received_alphaloans_count": series(received_alphaloans, 'created_at'),
                 "approved_loans_count": series(approved_loans, 'approved_at'),
                 "declined_loans_count": series(declined_loans, 'period_event_at'),
                 "funded_loans_count": series(funded_loans, 'funded_at'),

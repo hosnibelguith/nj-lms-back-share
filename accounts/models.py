@@ -258,9 +258,11 @@ class Customer(models.Model):
 
     SOURCE_ORGANIC = 'organic'
     SOURCE_ARRIVE = 'arrive'
+    SOURCE_ALPHALOANS = 'alphaloans'
     SOURCE_CHOICES = [
         (SOURCE_ORGANIC, 'Organic'),
         (SOURCE_ARRIVE, 'Arrive'),
+        (SOURCE_ALPHALOANS, 'Alphaloans'),
     ]
     source = models.CharField(
         max_length=20,
