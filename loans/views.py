@@ -2,6 +2,7 @@ from decimal import Decimal
 import logging
 import re
 
+from django.http import HttpResponse
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -65,7 +66,9 @@ from .serializers import (
     LoanReactivateSerializer,
     FundedPaymentSerializer,
     BankHolidaySerializer,
+    TrusteeStatementSerializer,
 )
+from .statements import build_trustee_statement_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -1241,6 +1244,18 @@ class LoanViewSet(viewsets.ModelViewSet):
         loan = self.get_object()
         funded_payments = loan.funded_payments.all().order_by('-initiated_at', '-created_at')
         return Response(FundedPaymentSerializer(funded_payments, many=True).data)
+
+    @action(detail=True, methods=['post'], url_path='trustee-statement')
+    def trustee_statement(self, request, pk=None):
+        loan = self.get_object()
+        serializer = TrusteeStatementSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        fees = serializer.validated_data.get('fees') or []
+        pdf = build_trustee_statement_pdf(loan, fees)
+        filename = f"trustee-statement-{str(loan.id)[:8]}.pdf"
+        response = HttpResponse(pdf.getvalue(), content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
 
     @action(detail=False, methods=['post'], url_path='settlement/process')
     def process_settlement(self, request):

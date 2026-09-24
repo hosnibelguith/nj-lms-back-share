@@ -207,6 +207,16 @@ class PaymentCreateSerializer(serializers.ModelSerializer):
         fields = ['loan', 'amount', 'type', 'scheduled_date', 'notes']
 
 
+class TrusteeStatementFeeSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=120, trim_whitespace=True)
+    amount = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0.01"))
+    date = serializers.DateField()
+
+
+class TrusteeStatementSerializer(serializers.Serializer):
+    fees = TrusteeStatementFeeSerializer(many=True, required=False, allow_empty=True)
+
+
 class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     method = serializers.CharField(source='get_type_display', read_only=True)

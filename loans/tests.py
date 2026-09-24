@@ -129,6 +129,7 @@ class DashboardAnalyticsTests(APITestCase):
             Decimal(response.data["totals"]["processing_collection_payments_amount"]),
             Decimal("50.00"),
         )
+
         self.assertEqual(
             Decimal(response.data["totals"]["completed_collection_payments_amount"]),
             Decimal("35.00"),
@@ -6708,3 +6709,67 @@ class IncompleteBankCoordinatesFundingTests(APITestCase):
             any("missing" in blocker.lower() for blocker in readiness["blockers"]),
             readiness["blockers"],
         )
+
+
+@override_settings(ZUMRAILS_DRY_RUN=True)
+class TrusteeStatementTests(APITestCase):
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            email="trustee-agent@example.com",
+            password="password123",
+            full_name="Trustee Agent",
+            user_type="staff",
+            is_staff=True,
+            permission_level=4,
+        )
+        self.customer = Customer.objects.create(
+            first_name="Tessa",
+            lender=self.staff.effective_lender,
+            last_name="Trustee",
+            email="tessa@example.com",
+            phone="4165550123",
+            province="ON",
+            status="active",
+        )
+        self.loan = Loan.objects.create(
+            customer=self.customer,
+            principal=Decimal("500.00"),
+            fee=Decimal("100.00"),
+            total_amount=Decimal("600.00"),
+            balance=Decimal("420.00"),
+            status="defaulted",
+            is_active=True,
+        )
+        Payment.objects.create(
+            loan=self.loan,
+            amount=Decimal("120.00"),
+            scheduled_date=timezone.localdate(),
+            status="scheduled",
+            notes="Regular installment",
+        )
+        self.client.force_authenticate(user=self.staff)
+
+    def test_trustee_statement_pdf_includes_added_fees(self):
+        response = self.client.post(
+            f"/api/loans/{self.loan.id}/trustee-statement/",
+            {
+                "fees": [
+                    {
+                        "name": "Trustee filing fee",
+                        "amount": "75.50",
+                        "date": "2026-09-24",
+                    }
+                ]
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response["Content-Type"], "application/pdf")
+        self.assertIn("attachment", response["Content-Disposition"])
+
+        self.assertTrue(response.content.startswith(b"%PDF"))
+        self.assertIn(b"Trustee Statement", response.content)
+        self.assertIn(b"Trustee filing fee", response.content)
+        self.assertIn(b"2026-09-24", response.content)
+        self.assertIn(b"$75.50", response.content)
