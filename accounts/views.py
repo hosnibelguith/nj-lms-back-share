@@ -308,11 +308,18 @@ class CustomerViewSet(viewsets.ModelViewSet):
 
         search = self.request.query_params.get('search')
         if search:
+            raw = search.strip()
             queryset = queryset.filter(
-                Q(first_name__icontains=search) |
-                Q(last_name__icontains=search) |
-                Q(email__icontains=search) |
-                Q(phone__icontains=search)
+                Q(first_name__icontains=raw) |
+                Q(last_name__icontains=raw) |
+                Q(email__icontains=raw) |
+                Q(portal_user__email__icontains=raw) |
+                Q(portal_user__flinks_email__icontains=raw) |
+                Q(phone__icontains=raw) |
+                Q(phone_normalized__icontains=raw) |
+                Q(arrive_application_id__icontains=raw) |
+                Q(arrive_event_id__icontains=raw) |
+                Q(arrive_zum_user_id__icontains=raw)
             )
 
         status_filter = self.request.query_params.get('status')

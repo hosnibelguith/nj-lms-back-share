@@ -51,7 +51,7 @@ def build_trustee_statement_pdf(loan, fees):
         leftMargin=0.55 * inch,
         topMargin=0.55 * inch,
         bottomMargin=0.55 * inch,
-        title="Trustee Statement",
+        title="Statement",
         pageCompression=0,
     )
     styles = getSampleStyleSheet()
@@ -61,7 +61,7 @@ def build_trustee_statement_pdf(loan, fees):
     lender_name = getattr(lender, "name", None) or "MohawkLoans"
     generated_at = timezone.localtime(timezone.now()).strftime("%Y-%m-%d %H:%M")
 
-    story.append(Paragraph(f"{lender_name} Trustee Statement", styles["Title"]))
+    story.append(Paragraph(f"{lender_name} Statement", styles["Title"]))
     story.append(Paragraph(f"Generated: {generated_at}", styles["Normal"]))
     story.append(Spacer(1, 12))
 
@@ -130,7 +130,7 @@ def build_trustee_statement_pdf(loan, fees):
     story.append(Spacer(1, 10))
     story.append(
         Paragraph(
-            "This statement is generated for trustee review. Added fees shown here are included "
+            "This statement is generated for review. Added fees shown here are included "
             "for this statement download and do not change the loan ledger unless recorded separately.",
             styles["Italic"],
         )

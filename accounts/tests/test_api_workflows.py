@@ -246,6 +246,28 @@ class BackendApiWorkflowTests(APITestCase):
         self.assertEqual(search_response.data["count"], 1)
         self.assertEqual(search_response.data["results"][0]["email"], "customer@example.com")
 
+        email_response = self.client.get("/api/customers/", {"search": "customer@example.com"})
+        self.assertEqual(email_response.status_code, 200, email_response.data)
+        self.assertEqual(email_response.data["count"], 1)
+        self.assertEqual(email_response.data["results"][0]["email"], "customer@example.com")
+
+        self.customer_user.flinks_email = "banking.sample@example.com"
+        self.customer_user.save(update_fields=["flinks_email", "updated_at"])
+        flinks_email_response = self.client.get("/api/customers/", {"search": "banking.sample"})
+        self.assertEqual(flinks_email_response.status_code, 200, flinks_email_response.data)
+        self.assertEqual(flinks_email_response.data["count"], 1)
+        self.assertEqual(
+            flinks_email_response.data["results"][0]["email"],
+            "customer@example.com",
+        )
+
+        self.customer.arrive_application_id = "bb42x4-sample"
+        self.customer.save(update_fields=["arrive_application_id", "updated_at"])
+        application_response = self.client.get("/api/customers/", {"search": "bb42x4"})
+        self.assertEqual(application_response.status_code, 200, application_response.data)
+        self.assertEqual(application_response.data["count"], 1)
+        self.assertEqual(application_response.data["results"][0]["email"], "customer@example.com")
+
         filtered_response = self.client.get(
             "/api/customers/",
             {"status": "collections", "province": "BC", "has_loans": "false"},
@@ -290,6 +312,40 @@ class BackendApiWorkflowTests(APITestCase):
         self.assertEqual(results[0]["customer_name"], "Customer User")
         self.assertEqual(results[0]["ibv_status"], "pending")
         self.assertFalse(results[0]["contract_signed"])
+
+        email_response = self.client.get("/api/loans/", {"search": "customer@example.com"})
+        self.assertEqual(email_response.status_code, 200, email_response.data)
+        email_results = (
+            email_response.data["results"]
+            if isinstance(email_response.data, dict)
+            else email_response.data
+        )
+        self.assertEqual(len(email_results), 1)
+        self.assertEqual(email_results[0]["customer_email"], "customer@example.com")
+
+        self.customer_user.flinks_email = "banking.sample@example.com"
+        self.customer_user.save(update_fields=["flinks_email", "updated_at"])
+        flinks_email_response = self.client.get("/api/loans/", {"search": "banking.sample"})
+        self.assertEqual(flinks_email_response.status_code, 200, flinks_email_response.data)
+        flinks_email_results = (
+            flinks_email_response.data["results"]
+            if isinstance(flinks_email_response.data, dict)
+            else flinks_email_response.data
+        )
+        self.assertEqual(len(flinks_email_results), 1)
+        self.assertEqual(flinks_email_results[0]["customer_email"], "customer@example.com")
+
+        self.customer.arrive_application_id = "bb42x4-sample"
+        self.customer.save(update_fields=["arrive_application_id", "updated_at"])
+        application_response = self.client.get("/api/loans/", {"search": "bb42x4"})
+        self.assertEqual(application_response.status_code, 200, application_response.data)
+        application_results = (
+            application_response.data["results"]
+            if isinstance(application_response.data, dict)
+            else application_response.data
+        )
+        self.assertEqual(len(application_results), 1)
+        self.assertEqual(application_results[0]["customer_email"], "customer@example.com")
 
         self.loan.ai_decision = "approved"
         self.loan.contract_signed_at = timezone.now()

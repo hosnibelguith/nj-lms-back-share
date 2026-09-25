@@ -370,6 +370,7 @@ class CollectionExportTests(APITestCase):
             permission_level=4,
         )
         self.customer = Customer.objects.create(
+            lender=self.staff.effective_lender,
             first_name="Riley",
             last_name="Cole",
             email="riley.cole@example.com",
@@ -469,6 +470,7 @@ class CollectionExportTests(APITestCase):
             returned_at=inside,
         )
         arrive_customer = Customer.objects.create(
+            lender=self.staff.effective_lender,
             first_name="Marvin",
             last_name="Bade",
             email="marvinbade125@gmail.com",
@@ -508,6 +510,14 @@ class CollectionExportTests(APITestCase):
         self.assertFalse(by_email["riley.cole@example.com"]["is_arrive"])
         self.assertEqual(by_email["marvinbade125@gmail.com"]["customer_source"], "arrive")
         self.assertTrue(by_email["marvinbade125@gmail.com"]["is_arrive"])
+
+        searched = self.client.get(
+            "/api/loans/returned-collections/",
+            {"export": "1", "search": "arrive-marvin-1"},
+        )
+        self.assertEqual(searched.status_code, 200, searched.data)
+        self.assertEqual(len(searched.data), 1)
+        self.assertEqual(searched.data[0]["customer_email"], "marvinbade125@gmail.com")
 
     def test_returned_collections_applies_nsf_fees_for_arrive_like_landing(self):
         """Arrive In Collections files get the same $50 NSF extras as Landing."""
@@ -6769,7 +6779,7 @@ class TrusteeStatementTests(APITestCase):
         self.assertIn("attachment", response["Content-Disposition"])
 
         self.assertTrue(response.content.startswith(b"%PDF"))
-        self.assertIn(b"Trustee Statement", response.content)
+        self.assertIn(b"Statement", response.content)
         self.assertIn(b"Trustee filing fee", response.content)
         self.assertIn(b"2026-09-24", response.content)
         self.assertIn(b"$75.50", response.content)

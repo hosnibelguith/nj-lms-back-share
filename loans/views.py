@@ -212,6 +212,23 @@ class LoanViewSet(viewsets.ModelViewSet):
             parsed_to = parse_date(date_to)
             if parsed_to:
                 qs = qs.filter(effective_returned_at__date__lte=parsed_to)
+        search = request.query_params.get('search')
+        if search:
+            raw = search.strip()
+            if raw:
+                qs = qs.filter(
+                    Q(loan__id__icontains=raw) |
+                    Q(loan__customer__first_name__icontains=raw) |
+                    Q(loan__customer__last_name__icontains=raw) |
+                    Q(loan__customer__email__icontains=raw) |
+                    Q(loan__customer__portal_user__email__icontains=raw) |
+                    Q(loan__customer__portal_user__flinks_email__icontains=raw) |
+                    Q(loan__customer__phone__icontains=raw) |
+                    Q(loan__customer__phone_normalized__icontains=raw) |
+                    Q(loan__customer__arrive_application_id__icontains=raw) |
+                    Q(loan__customer__arrive_event_id__icontains=raw) |
+                    Q(loan__customer__arrive_zum_user_id__icontains=raw)
+                )
         return qs.order_by('-effective_returned_at', '-created_at')
 
     @staticmethod
@@ -353,8 +370,13 @@ class LoanViewSet(viewsets.ModelViewSet):
                     Q(customer__first_name__icontains=raw) |
                     Q(customer__last_name__icontains=raw) |
                     Q(customer__email__icontains=raw) |
+                    Q(customer__portal_user__email__icontains=raw) |
+                    Q(customer__portal_user__flinks_email__icontains=raw) |
                     Q(customer__phone__icontains=raw) |
                     Q(customer__phone_normalized__icontains=raw) |
+                    Q(customer__arrive_application_id__icontains=raw) |
+                    Q(customer__arrive_event_id__icontains=raw) |
+                    Q(customer__arrive_zum_user_id__icontains=raw) |
                     Q(_customer_full_name__icontains=raw)
                 )
 
@@ -1252,7 +1274,7 @@ class LoanViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         fees = serializer.validated_data.get('fees') or []
         pdf = build_trustee_statement_pdf(loan, fees)
-        filename = f"trustee-statement-{str(loan.id)[:8]}.pdf"
+        filename = f"statement-{str(loan.id)[:8]}.pdf"
         response = HttpResponse(pdf.getvalue(), content_type='application/pdf')
         response['Content-Disposition'] = f'attachment; filename="{filename}"'
         return response
