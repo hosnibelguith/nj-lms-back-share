@@ -44,19 +44,25 @@ class AlphaloansSourceTests(APITestCase):
         return Customer.objects.get(email=payload['email'])
 
     def test_alphaloans_survives_phone_verification_and_is_visible_to_staff(self):
-        customer = self.signup('alphaloans')
-        self.assertEqual(customer.source, 'alphaloans')
+        self.assert_campaign_signup('alphaloans')
+
+    def test_list_survives_phone_verification_and_is_visible_to_staff(self):
+        self.assert_campaign_signup('list')
+
+    def assert_campaign_signup(self, source):
+        customer = self.signup(source)
+        self.assertEqual(customer.source, source)
         self.assertEqual(customer.lender, self.lender)
         self.assertEqual(customer.loans.count(), 1)
         self.assertEqual(customer.loans.get().status, 'ibv_pending')
         self.assertFalse(customer.arrive_application_id)
         self.client.force_authenticate(self.staff)
         detail = self.client.get(f'/api/customers/{customer.pk}/')
-        self.assertEqual(detail.data['source'], 'alphaloans')
-        loans = self.client.get('/api/loans/', {'source': 'alphaloans'})
+        self.assertEqual(detail.data['source'], source)
+        loans = self.client.get('/api/loans/', {'source': source})
         self.assertEqual(loans.status_code, 200, loans.data)
         self.assertEqual(loans.data['count'], 1)
-        self.assertEqual(loans.data['results'][0]['customer_source'], 'alphaloans')
+        self.assertEqual(loans.data['results'][0]['customer_source'], source)
         self.assertFalse(loans.data['results'][0]['is_arrive'])
 
     def test_normal_signup_remains_landing(self):
@@ -80,17 +86,31 @@ class AlphaloansSourceTests(APITestCase):
         customer = self.signup()
         loan_id = customer.loans.get().pk
         self.client.logout()
+        for source in ('alphaloans', 'list'):
+            with self.subTest(source=source):
+                response = self.client.post('/api/portal/signup/start/', {
+                    **self.payload, 'source': source,
+                }, format='json')
+                self.assertEqual(response.status_code, 200, response.data)
+                self.assertTrue(response.data['existing_account'])
+                customer.refresh_from_db()
+                self.assertEqual(customer.source, 'organic')
+                self.assertEqual(list(customer.loans.values_list('pk', flat=True)), [loan_id])
+
+    def test_existing_alphaloans_account_is_not_retagged_as_list(self):
+        customer = self.signup('alphaloans')
+        self.client.logout()
         response = self.client.post('/api/portal/signup/start/', {
-            **self.payload, 'source': 'alphaloans',
+            **self.payload, 'source': 'list',
         }, format='json')
-        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.status_code, 200)
         self.assertTrue(response.data['existing_account'])
         customer.refresh_from_db()
-        self.assertEqual(customer.source, 'organic')
-        self.assertEqual(list(customer.loans.values_list('pk', flat=True)), [loan_id])
+        self.assertEqual(customer.source, 'alphaloans')
+        self.assertEqual(customer.loans.count(), 1)
 
-    def test_source_filters_and_dashboard_do_not_mix_alphaloans_with_landing(self):
-        for index, source in enumerate(('organic', 'arrive', 'alphaloans')):
+    def test_source_filters_and_dashboard_keep_all_four_sources_separate(self):
+        for index, source in enumerate(('organic', 'arrive', 'alphaloans', 'list')):
             customer = Customer.objects.create(
                 lender=self.lender, first_name=source, last_name='Test', source=source,
                 email=f'{source}@example.test', phone=f'416555010{index}',
@@ -105,8 +125,8 @@ class AlphaloansSourceTests(APITestCase):
                                        type='manual', status='completed', processed_at=timezone.now())
         self.client.force_authenticate(self.staff)
         totals = self.client.get('/api/loans/dashboard/analytics/').data['totals']
-        self.assertEqual(totals['received_applications_count'], 3)
-        for source in ('organic', 'arrive', 'alphaloans'):
+        self.assertEqual(totals['received_applications_count'], 4)
+        for source in ('organic', 'arrive', 'alphaloans', 'list'):
             with self.subTest(source=source):
                 self.assertEqual(totals[f'received_{source}_count'], 1)
                 analytics = self.client.get('/api/loans/dashboard/analytics/', {'source': source}).data

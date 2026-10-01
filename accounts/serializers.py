@@ -371,7 +371,7 @@ class CustomerApplySerializer(serializers.Serializer):
 class CustomerSignupStartSerializer(serializers.Serializer):
     # Arrive attribution is reserved for its authenticated integration.
     source = serializers.ChoiceField(
-        choices=[Customer.SOURCE_ORGANIC, Customer.SOURCE_ALPHALOANS],
+        choices=[Customer.SOURCE_ORGANIC, Customer.SOURCE_ALPHALOANS, Customer.SOURCE_LIST],
         default=Customer.SOURCE_ORGANIC,
     )
     first_name = serializers.CharField(max_length=100)

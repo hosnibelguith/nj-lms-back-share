@@ -45,7 +45,7 @@ def _customer_name(customer):
 
 def _source_value(source):
     value = (source or '').strip().lower()
-    return value if value in ('arrive', 'organic', 'alphaloans') else None
+    return value if value in ('arrive', 'organic', 'alphaloans', 'list') else None
 
 
 def _filter_datetime(qs, field, date_from, date_to):
@@ -150,12 +150,12 @@ def _apply_loan_staff_filters(qs, extra, *, prefix=''):
             )
         )
     elif source in ('organic', 'landing', 'kyc'):
-        qs = qs.exclude(**{f'{customer}__source__in': ('arrive', 'alphaloans')}).filter(
+        qs = qs.exclude(**{f'{customer}__source__in': ('arrive', 'alphaloans', 'list')}).filter(
             Q(**{f'{customer}__arrive_application_id__isnull': True})
             | Q(**{f'{customer}__arrive_application_id': ''})
         )
-    elif source == 'alphaloans':
-        qs = qs.filter(**{f'{customer}__source': 'alphaloans'})
+    elif source in ('alphaloans', 'list'):
+        qs = qs.filter(**{f'{customer}__source': source})
 
     province = (extra.get('province') or '').strip()
     if province:
@@ -266,11 +266,11 @@ def build_customer_report(date_from, date_to, source, extra=None):
             | (Q(arrive_application_id__isnull=False) & ~Q(arrive_application_id=''))
         )
     elif source_val in ('organic', 'landing', 'kyc'):
-        qs = qs.exclude(source__in=('arrive', 'alphaloans')).filter(
+        qs = qs.exclude(source__in=('arrive', 'alphaloans', 'list')).filter(
             Q(arrive_application_id__isnull=True) | Q(arrive_application_id='')
         )
-    elif source_val == 'alphaloans':
-        qs = qs.filter(source='alphaloans')
+    elif source_val in ('alphaloans', 'list'):
+        qs = qs.filter(source=source_val)
     province = (extra.get('province') or '').strip()
     if province:
         qs = qs.filter(province=province)
