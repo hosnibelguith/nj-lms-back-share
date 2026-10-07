@@ -71,7 +71,8 @@ def _payment_balance_after(obj, context):
             # and remaining open payment rows reduce the displayed balance.
             elif payment.status not in ('failed', 'nsf'):
                 running_balance = money(running_balance - amount)
-            mapping[payment.id] = max(running_balance, Decimal('0.00'))
+            running_balance = max(running_balance, Decimal('0.00'))
+            mapping[payment.id] = running_balance
         cache[loan_key] = mapping
 
     mapped = cache[loan_key].get(obj.id)
