@@ -24,10 +24,9 @@ def _payment_balance_after(obj, context):
     """
     Remaining loan total after this schedule row in display order.
 
-    Failed/NSF collection rows are history only and do not reduce the balance.
-    Completed payments (including Interac/manual) and remaining open rows
-    reduce the displayed running balance in order. Collection-failure extras
-    are charges, so they increase the running balance when they appear.
+    Failed/NSF collection rows are history only and do not reduce the balance,
+    but their NSF fee is applied on that failed row so following rows count
+    down from the corrected returned-payment balance.
     """
     from .services import LoanService
 
@@ -62,14 +61,54 @@ def _payment_balance_after(obj, context):
             + completed_sum
             - collection_failure_extra_sum
         )
+        nsf_charge_by_payment_id = {}
+        unlinked_nsf_charges = []
+        for payment in payments:
+            if not LoanService.is_collection_failure_extra_payment(payment):
+                continue
+            nsf_charge = LoanService.collection_failure_nsf_fee_amount(payment)
+            if nsf_charge <= 0 and LoanService.is_collection_failure_fee_payment(payment):
+                nsf_charge = LoanService.collection_failure_fee_amount(loan)
+            if nsf_charge <= 0:
+                continue
+            collection_ids = LoanService._collection_failure_ids_from_payment(payment)
+            if not collection_ids:
+                unlinked_nsf_charges.append(nsf_charge)
+                continue
+            for collection in loan.collection_payments.all():
+                if str(collection.id) not in collection_ids or not collection.payment_id:
+                    continue
+                if collection.status in ('failed', 'returned', 'rejected') or (
+                    collection.payment and collection.payment.status in ('failed', 'nsf')
+                ):
+                    nsf_charge_by_payment_id[collection.payment_id] = money(
+                        nsf_charge_by_payment_id.get(
+                            collection.payment_id,
+                            Decimal('0.00'),
+                        )
+                        + nsf_charge
+                    )
+
+        unlinked_index = 0
+        for payment in payments:
+            if payment.status not in ('failed', 'nsf'):
+                continue
+            if payment.id in nsf_charge_by_payment_id:
+                continue
+            if unlinked_index >= len(unlinked_nsf_charges):
+                continue
+            nsf_charge_by_payment_id[payment.id] = unlinked_nsf_charges[unlinked_index]
+            unlinked_index += 1
+
         mapping = {}
         for payment in payments:
             amount = money(payment.amount or Decimal('0.00'))
-            if LoanService.is_collection_failure_extra_payment(payment):
-                running_balance = money(running_balance + amount)
-            # Failed/NSF rows are history only. Completed (including Interac)
-            # and remaining open payment rows reduce the displayed balance.
-            elif payment.status not in ('failed', 'nsf'):
+            if payment.status in ('failed', 'nsf'):
+                running_balance = money(
+                    running_balance
+                    + nsf_charge_by_payment_id.get(payment.id, Decimal('0.00'))
+                )
+            else:
                 running_balance = money(running_balance - amount)
             running_balance = max(running_balance, Decimal('0.00'))
             mapping[payment.id] = running_balance

@@ -88,7 +88,9 @@ class PermanentFailedPaymentScheduleTests(APITestCase):
         self.assertTrue(rows[str(self.fee.id)]["is_collection_failure_extra"])
         self.assertFalse(rows[str(self.pad.id)]["is_collection_failure_extra"])
         self.assertFalse(rows[str(self.missed.id)]["is_collection_failure_extra"])
-        self.assertEqual(rows[str(self.fee.id)]["balance_after"], Decimal("50.00"))
+        self.assertEqual(rows[str(self.missed.id)]["balance_after"], Decimal("933.09"))
+        self.assertEqual(rows[str(self.pad.id)]["balance_after"], Decimal("50.00"))
+        self.assertEqual(rows[str(self.fee.id)]["balance_after"], Decimal("0.00"))
 
     def test_edit_and_defer_reject_collection_failure_fee(self):
         with self.assertRaises(ValueError):
