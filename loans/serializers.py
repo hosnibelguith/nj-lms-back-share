@@ -26,7 +26,8 @@ def _payment_balance_after(obj, context):
 
     Failed/NSF collection rows are history only and do not reduce the balance.
     Completed payments (including Interac/manual) and remaining open rows
-    reduce the displayed running balance in order.
+    reduce the displayed running balance in order. Collection-failure extras
+    are charges, so they increase the running balance when they appear.
     """
     from .services import LoanService
 
@@ -48,15 +49,27 @@ def _payment_balance_after(obj, context):
             ),
             Decimal('0.00'),
         )
+        collection_failure_extra_sum = sum(
+            (
+                money(payment.amount or Decimal('0.00'))
+                for payment in payments
+                if LoanService.is_collection_failure_extra_payment(payment)
+            ),
+            Decimal('0.00'),
+        )
         running_balance = money(
-            (loan.balance or loan.total_amount or Decimal('0.00')) + completed_sum
+            (loan.balance or loan.total_amount or Decimal('0.00'))
+            + completed_sum
+            - collection_failure_extra_sum
         )
         mapping = {}
         for payment in payments:
             amount = money(payment.amount or Decimal('0.00'))
+            if LoanService.is_collection_failure_extra_payment(payment):
+                running_balance = money(running_balance + amount)
             # Failed/NSF rows are history only. Completed (including Interac)
-            # and remaining open rows reduce the displayed running balance.
-            if payment.status not in ('failed', 'nsf'):
+            # and remaining open payment rows reduce the displayed balance.
+            elif payment.status not in ('failed', 'nsf'):
                 running_balance = money(running_balance - amount)
             mapping[payment.id] = max(running_balance, Decimal('0.00'))
         cache[loan_key] = mapping

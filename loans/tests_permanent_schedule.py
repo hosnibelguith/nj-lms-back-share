@@ -4,7 +4,7 @@ from decimal import Decimal
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
-from accounts.models import Customer, User
+from accounts.models import Customer, Lender, User
 from loans.models import Loan, LoanFormula, Payment
 from loans.services import LoanService
 
@@ -19,7 +19,9 @@ class PermanentFailedPaymentScheduleTests(APITestCase):
             is_staff=True,
             permission_level=4,
         )
+        self.lender = Lender.default()
         self.customer = Customer.objects.create(
+            lender=self.lender,
             first_name="Permanent",
             last_name="Client",
             email="permanent.client@example.com",
@@ -86,6 +88,7 @@ class PermanentFailedPaymentScheduleTests(APITestCase):
         self.assertTrue(rows[str(self.fee.id)]["is_collection_failure_extra"])
         self.assertFalse(rows[str(self.pad.id)]["is_collection_failure_extra"])
         self.assertFalse(rows[str(self.missed.id)]["is_collection_failure_extra"])
+        self.assertEqual(rows[str(self.fee.id)]["balance_after"], Decimal("50.00"))
 
     def test_edit_and_defer_reject_collection_failure_fee(self):
         with self.assertRaises(ValueError):
