@@ -20,17 +20,18 @@ from accounts.serializers import CustomerSerializer
 from banking.serializers import BankAccountSerializer
 
 
-def _payment_balance_after(obj, context):
+def _payment_schedule_ledger(loan, context):
     """
-    Remaining loan total after this schedule row in display order.
+    Display ledger by payment id in schedule order.
 
     Failed/NSF collection rows are history only and do not reduce the balance,
     but their NSF fee is applied on that failed row so following rows count
-    down from the corrected returned-payment balance.
+    down from the corrected returned-payment balance. Open payment amounts are
+    capped to the remaining displayed balance so trailing rows cannot show a
+    collectible amount after Balance After has reached zero.
     """
     from .services import LoanService
 
-    loan = obj.loan
     cache = context.setdefault('_balance_after_by_loan', {})
     loan_key = str(loan.id)
     if loan_key not in cache:
@@ -103,21 +104,40 @@ def _payment_balance_after(obj, context):
         mapping = {}
         for payment in payments:
             amount = money(payment.amount or Decimal('0.00'))
+            display_amount = amount
             if payment.status in ('failed', 'nsf'):
                 running_balance = money(
                     running_balance
                     + nsf_charge_by_payment_id.get(payment.id, Decimal('0.00'))
                 )
+            elif payment.status != 'completed':
+                display_amount = min(amount, running_balance)
+                running_balance = money(running_balance - display_amount)
             else:
                 running_balance = money(running_balance - amount)
             running_balance = max(running_balance, Decimal('0.00'))
-            mapping[payment.id] = running_balance
+            mapping[payment.id] = {
+                'amount': max(display_amount, Decimal('0.00')),
+                'balance_after': running_balance,
+            }
         cache[loan_key] = mapping
 
-    mapped = cache[loan_key].get(obj.id)
+    return cache[loan_key]
+
+
+def _payment_balance_after(obj, context):
+    mapped = _payment_schedule_ledger(obj.loan, context).get(obj.id)
     if mapped is not None:
-        return mapped
-    return max(LoanService.money(loan.balance or Decimal('0.00')), Decimal('0.00'))
+        return mapped['balance_after']
+    from .services import LoanService
+    return max(LoanService.money(obj.loan.balance or Decimal('0.00')), Decimal('0.00'))
+
+
+def _payment_display_amount(obj, context):
+    mapped = _payment_schedule_ledger(obj.loan, context).get(obj.id)
+    if mapped is not None:
+        return mapped['amount']
+    return obj.amount
 
 
 def _loan_holiday_warnings(obj):
@@ -226,6 +246,7 @@ class FundingMethodRecommendationSerializer(serializers.ModelSerializer):
 
 class PaymentSerializer(serializers.ModelSerializer):
     """Payment serializer."""
+    amount = serializers.SerializerMethodField()
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     type_display = serializers.CharField(source='get_type_display', read_only=True)
     balance_after = serializers.SerializerMethodField()
@@ -252,6 +273,9 @@ class PaymentSerializer(serializers.ModelSerializer):
     def get_balance_after(self, obj):
         return _payment_balance_after(obj, self.context)
 
+    def get_amount(self, obj):
+        return _payment_display_amount(obj, self.context)
+
 
 class PaymentCreateSerializer(serializers.ModelSerializer):
     """Create payment."""
@@ -271,6 +295,7 @@ class TrusteeStatementSerializer(serializers.Serializer):
 
 
 class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
+    amount = serializers.SerializerMethodField()
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     method = serializers.CharField(source='get_type_display', read_only=True)
     balance_after = serializers.SerializerMethodField()
@@ -304,6 +329,9 @@ class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
     def get_original_amount(self, obj):
         """Installment amount before the current edit session (defaults to amount)."""
         return obj.amount
+
+    def get_amount(self, obj):
+        return _payment_display_amount(obj, self.context)
 
     def get_is_deferral_fee(self, obj):
         from .services import LoanService
