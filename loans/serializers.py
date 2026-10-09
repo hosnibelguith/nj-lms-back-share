@@ -20,18 +20,17 @@ from accounts.serializers import CustomerSerializer
 from banking.serializers import BankAccountSerializer
 
 
-def _payment_schedule_ledger(loan, context):
+def _payment_balance_after(obj, context):
     """
-    Display ledger by payment id in schedule order.
+    Remaining loan total after this schedule row in display order.
 
-    Failed/NSF collection rows are history only and do not reduce the balance,
-    but their NSF fee is applied on that failed row so following rows count
-    down from the corrected returned-payment balance. Open payment amounts are
-    capped to the remaining displayed balance so trailing rows cannot show a
-    collectible amount after Balance After has reached zero.
+    Failed/NSF collection rows are history only and do not reduce the balance.
+    Completed payments (including Interac/manual) and remaining open rows
+    reduce the displayed running balance in order.
     """
     from .services import LoanService
 
+    loan = obj.loan
     cache = context.setdefault('_balance_after_by_loan', {})
     loan_key = str(loan.id)
     if loan_key not in cache:
@@ -49,95 +48,23 @@ def _payment_schedule_ledger(loan, context):
             ),
             Decimal('0.00'),
         )
-        collection_failure_extra_sum = sum(
-            (
-                money(payment.amount or Decimal('0.00'))
-                for payment in payments
-                if LoanService.is_collection_failure_extra_payment(payment)
-            ),
-            Decimal('0.00'),
-        )
         running_balance = money(
-            (loan.balance or loan.total_amount or Decimal('0.00'))
-            + completed_sum
-            - collection_failure_extra_sum
+            (loan.balance or loan.total_amount or Decimal('0.00')) + completed_sum
         )
-        nsf_charge_by_payment_id = {}
-        unlinked_nsf_charges = []
-        for payment in payments:
-            if not LoanService.is_collection_failure_extra_payment(payment):
-                continue
-            nsf_charge = LoanService.collection_failure_nsf_fee_amount(payment)
-            if nsf_charge <= 0 and LoanService.is_collection_failure_fee_payment(payment):
-                nsf_charge = LoanService.collection_failure_fee_amount(loan)
-            if nsf_charge <= 0:
-                continue
-            collection_ids = LoanService._collection_failure_ids_from_payment(payment)
-            if not collection_ids:
-                unlinked_nsf_charges.append(nsf_charge)
-                continue
-            for collection in loan.collection_payments.all():
-                if str(collection.id) not in collection_ids or not collection.payment_id:
-                    continue
-                if collection.status in ('failed', 'returned', 'rejected') or (
-                    collection.payment and collection.payment.status in ('failed', 'nsf')
-                ):
-                    nsf_charge_by_payment_id[collection.payment_id] = money(
-                        nsf_charge_by_payment_id.get(
-                            collection.payment_id,
-                            Decimal('0.00'),
-                        )
-                        + nsf_charge
-                    )
-
-        unlinked_index = 0
-        for payment in payments:
-            if payment.status not in ('failed', 'nsf'):
-                continue
-            if payment.id in nsf_charge_by_payment_id:
-                continue
-            if unlinked_index >= len(unlinked_nsf_charges):
-                continue
-            nsf_charge_by_payment_id[payment.id] = unlinked_nsf_charges[unlinked_index]
-            unlinked_index += 1
-
         mapping = {}
         for payment in payments:
             amount = money(payment.amount or Decimal('0.00'))
-            display_amount = amount
-            if payment.status in ('failed', 'nsf'):
-                running_balance = money(
-                    running_balance
-                    + nsf_charge_by_payment_id.get(payment.id, Decimal('0.00'))
-                )
-            elif payment.status != 'completed':
-                display_amount = min(amount, running_balance)
-                running_balance = money(running_balance - display_amount)
-            else:
+            # Failed/NSF rows are history only. Completed (including Interac)
+            # and remaining open rows reduce the displayed running balance.
+            if payment.status not in ('failed', 'nsf'):
                 running_balance = money(running_balance - amount)
-            running_balance = max(running_balance, Decimal('0.00'))
-            mapping[payment.id] = {
-                'amount': max(display_amount, Decimal('0.00')),
-                'balance_after': running_balance,
-            }
+            mapping[payment.id] = max(running_balance, Decimal('0.00'))
         cache[loan_key] = mapping
 
-    return cache[loan_key]
-
-
-def _payment_balance_after(obj, context):
-    mapped = _payment_schedule_ledger(obj.loan, context).get(obj.id)
+    mapped = cache[loan_key].get(obj.id)
     if mapped is not None:
-        return mapped['balance_after']
-    from .services import LoanService
-    return max(LoanService.money(obj.loan.balance or Decimal('0.00')), Decimal('0.00'))
-
-
-def _payment_display_amount(obj, context):
-    mapped = _payment_schedule_ledger(obj.loan, context).get(obj.id)
-    if mapped is not None:
-        return mapped['amount']
-    return obj.amount
+        return mapped
+    return max(LoanService.money(loan.balance or Decimal('0.00')), Decimal('0.00'))
 
 
 def _loan_holiday_warnings(obj):
@@ -246,7 +173,6 @@ class FundingMethodRecommendationSerializer(serializers.ModelSerializer):
 
 class PaymentSerializer(serializers.ModelSerializer):
     """Payment serializer."""
-    amount = serializers.SerializerMethodField()
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     type_display = serializers.CharField(source='get_type_display', read_only=True)
     balance_after = serializers.SerializerMethodField()
@@ -273,9 +199,6 @@ class PaymentSerializer(serializers.ModelSerializer):
     def get_balance_after(self, obj):
         return _payment_balance_after(obj, self.context)
 
-    def get_amount(self, obj):
-        return _payment_display_amount(obj, self.context)
-
 
 class PaymentCreateSerializer(serializers.ModelSerializer):
     """Create payment."""
@@ -295,7 +218,6 @@ class TrusteeStatementSerializer(serializers.Serializer):
 
 
 class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
-    amount = serializers.SerializerMethodField()
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     method = serializers.CharField(source='get_type_display', read_only=True)
     balance_after = serializers.SerializerMethodField()
@@ -329,9 +251,6 @@ class CustomerLoanPaymentSerializer(serializers.ModelSerializer):
     def get_original_amount(self, obj):
         """Installment amount before the current edit session (defaults to amount)."""
         return obj.amount
-
-    def get_amount(self, obj):
-        return _payment_display_amount(obj, self.context)
 
     def get_is_deferral_fee(self, obj):
         from .services import LoanService
