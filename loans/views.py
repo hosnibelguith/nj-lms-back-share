@@ -309,6 +309,12 @@ class LoanViewSet(viewsets.ModelViewSet):
         ai_decision_param = self.request.query_params.get('ai_decision')
         if ai_decision_param:
             qs = qs.filter(ai_decision=ai_decision_param)
+        decline_reason_param = (self.request.query_params.get('decline_reason') or '').strip()
+        if decline_reason_param:
+            qs = qs.filter(status='human_declined').filter(
+                Q(decline_reason=decline_reason_param)
+                | Q(decline_reason__startswith=f'{decline_reason_param}\n')
+            )
 
         ibv_status_param = self.request.query_params.get('ibv_status')
         if ibv_status_param == 'pending':
@@ -438,7 +444,9 @@ class LoanViewSet(viewsets.ModelViewSet):
             'customer_name': 'customer__first_name',
             '-customer_name': '-customer__first_name',
         }
-        if ordering in allowed_ordering:
+        if decline_reason_param:
+            qs = qs.order_by('-declined_at', '-created_at')
+        elif ordering in allowed_ordering:
             qs = qs.order_by(allowed_ordering[ordering])
 
         return qs

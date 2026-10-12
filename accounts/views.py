@@ -472,7 +472,11 @@ class CustomerViewSet(viewsets.ModelViewSet):
 
         customer = self.get_object()
         try:
-            payload = request_ibv(customer, user=request.user)
+            payload = request_ibv(
+                customer,
+                user=request.user,
+                loan_id=request.data.get('loan_id') if isinstance(request.data, dict) else None,
+            )
         except ValueError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(payload)

@@ -21,6 +21,15 @@ IBV_REQUEST_TEMPLATE_NAME = 'Complete IBV Request'
 # Unverify only while the file is still waiting on IBV or signature. Funded /
 # collecting loans stay verified so the portal loan view is unchanged.
 PRE_SIGNATURE_LOAN_STATUSES = ('ibv_pending', 'pending_signature')
+IBV_REVERTIBLE_LOAN_STATUSES = (
+    'ibv_pending',
+    'pending',
+    'pending_signature',
+    'pending_id',
+    'pending_funding',
+    'human_declined',
+    'expired',
+)
 
 
 def ibv_portal_url() -> str:
@@ -37,10 +46,45 @@ def clear_ibv_refill_requested(customer: Customer) -> bool:
     return True
 
 
-def _open_ibv_refill(customer: Customer) -> dict:
+def _loan_for_ibv_request(customer: Customer, loan_id=None):
+    if loan_id:
+        loan = customer.loans.filter(id=loan_id).first()
+        if loan is None:
+            raise ValueError('Selected loan was not found for this customer.')
+        return loan
+    return customer.loans.order_by('-created_at').first()
+
+
+def _revert_loan_to_ibv_pending(loan, *, user=None) -> bool:
+    if loan is None or loan.status not in IBV_REVERTIBLE_LOAN_STATUSES:
+        return False
+    previous_status = loan.status
+    update_fields = ['status', 'is_active', 'updated_at']
+    loan.status = 'ibv_pending'
+    loan.is_active = True
+    if loan.declined_at is not None:
+        loan.declined_at = None
+        update_fields.append('declined_at')
+    if loan.decline_reason:
+        loan.decline_reason = ''
+        update_fields.append('decline_reason')
+    loan.save(update_fields=update_fields)
+    if previous_status != loan.status:
+        loan.log_state_event(
+            event_type='ibv_pending',
+            previous_status=previous_status,
+            new_status=loan.status,
+            user=user,
+            notes='Staff requested a new IBV.',
+        )
+    return previous_status != loan.status
+
+
+def _open_ibv_refill(customer: Customer, *, loan=None, user=None) -> dict:
     from banking.models import BankConnection
 
-    loan = customer.loans.order_by('-created_at').first()
+    loan = loan or customer.loans.order_by('-created_at').first()
+    loan_reverted = _revert_loan_to_ibv_pending(loan, user=user)
     reopen_onboarding = loan is None or loan.status in PRE_SIGNATURE_LOAN_STATUSES
 
     BankConnection.objects.filter(
@@ -67,10 +111,11 @@ def _open_ibv_refill(customer: Customer) -> dict:
         'ibv_refill_requested': True,
         'banking_verified': customer.banking_verified,
         'onboarding_reopened': reopen_onboarding,
+        'loan_reverted_to_ibv_pending': loan_reverted,
     }
 
 
-def request_ibv(customer: Customer, *, user=None) -> dict:
+def request_ibv(customer: Customer, *, user=None, loan_id=None) -> dict:
     from activity.services import log_staff_action
     from communications.models import CommunicationTemplate
     from communications.tasks import send_template_message
@@ -88,8 +133,8 @@ def request_ibv(customer: Customer, *, user=None) -> dict:
             f'Email template "{IBV_REQUEST_TEMPLATE_NAME}" is missing or inactive.'
         )
 
-    loan = customer.loans.order_by('-created_at').first()
-    refill = _open_ibv_refill(customer)
+    loan = _loan_for_ibv_request(customer, loan_id=loan_id)
+    refill = _open_ibv_refill(customer, loan=loan, user=user)
     url = ibv_portal_url()
     send_template_message.delay(
         str(customer.id),
@@ -117,6 +162,7 @@ def request_ibv(customer: Customer, *, user=None) -> dict:
             'ibv_url': url,
             'ibv_refill_requested': True,
             'onboarding_reopened': refill['onboarding_reopened'],
+            'loan_reverted_to_ibv_pending': refill['loan_reverted_to_ibv_pending'],
         },
     )
     return {
@@ -127,6 +173,8 @@ def request_ibv(customer: Customer, *, user=None) -> dict:
         'template_name': template.name,
         'ibv_refill_requested': True,
         'banking_verified': refill['banking_verified'],
+        'loan_id': str(loan.id) if loan else None,
+        'loan_reverted_to_ibv_pending': refill['loan_reverted_to_ibv_pending'],
     }
 
 

@@ -667,6 +667,7 @@ class LoanListSerializer(serializers.ModelSerializer):
             'contract_signed_at',
             'has_government_id',
             'is_active',
+            'decline_reason',
             'has_funding_failure',
             'funding_failure_reason',
             'created_at',
