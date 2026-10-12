@@ -92,7 +92,11 @@ urlpatterns = [
 ]
 
 from django.conf import settings
+from django.apps import apps
 from django.conf.urls.static import static
+
+if apps.is_installed('payment_processor'):
+    urlpatterns += [path('api/payment-processor/', include('payment_processor.urls'))]
 
 urlpatterns += [path('api/icollector/', include('icollector.urls'))]
 

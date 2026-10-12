@@ -108,7 +108,6 @@ for alias in sorted(settings.TENANT_DATABASE_ALIASES - {"default"}):
         tenant_entry["kwargs"] = tenant_kwargs
         app.conf.beat_schedule[f"{name}-{alias}"] = tenant_entry
 
-
 # This integration belongs exclusively to Mohawk in the default database.
 app.conf.beat_schedule['icollector-deliver-and-poll'] = {
     'task': 'icollector.tasks.tick', 'schedule': 30.0,

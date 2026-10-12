@@ -131,13 +131,18 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
 
+# Optional, isolated owner-only payment processor plugin.
+PAYMENT_PROCESSOR_INSTALLED = os.environ.get('PAYMENT_PROCESSOR_INSTALLED', 'True').lower() == 'true'
+PAYMENT_PROCESSOR_ALLOW_WRITES = os.environ.get('PAYMENT_PROCESSOR_ALLOW_WRITES', 'False').lower() == 'true'
+if PAYMENT_PROCESSOR_INSTALLED:
+    INSTALLED_APPS += ['payment_processor.apps.PaymentProcessorConfig']
+
 # The database switch controls Mohawk reject delivery and dashboard polling.
 INSTALLED_APPS += ['icollector.apps.ICollectorConfig']
 ICOLLECTOR_BASE_URL = os.environ.get('ICOLLECTOR_BASE_URL', '').rstrip('/')
 ICOLLECTOR_API_KEY = os.environ.get('ICOLLECTOR_API_KEY', '')
 ICOLLECTOR_HMAC_SECRET = os.environ.get('ICOLLECTOR_HMAC_SECRET', '')
 ICOLLECTOR_PROXY_URL = os.environ.get('ICOLLECTOR_PROXY_URL', os.environ.get('FIXIE_URL', ''))
-
 
 # -------------------------------------------------------------------
 # Database

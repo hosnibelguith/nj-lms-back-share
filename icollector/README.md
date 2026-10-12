@@ -64,6 +64,7 @@ existing deliveries. The existing Daily Rejects route remains
 
 ```sh
 python manage.py test icollector accounts.tests.test_arrive_integration accounts.tests.test_api_workflows loans.tests_pending_id --settings=config.settings_icollector_test --noinput
+python manage.py test icollector payment_processor --settings=config.settings_icollector_test --noinput
 python manage.py makemigrations icollector --check --dry-run --settings=config.settings_icollector_test
 ```
 

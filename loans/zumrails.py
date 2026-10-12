@@ -807,6 +807,11 @@ def apply_collection_failure(collection: CollectionPayment, *, reason: str, stat
         },
     )
 
+    # Capture the final balance in the same transaction; delivery runs after commit.
+    if collection._state.db == 'default':
+        from icollector.services import capture_final_failure
+        capture_final_failure(collection.pk)
+
 
     # Capture the final balance in the same transaction; delivery runs after commit.
     if collection._state.db == 'default':
